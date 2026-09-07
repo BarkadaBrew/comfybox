@@ -34,14 +34,25 @@
 //     32-multiples that are NOT 64-multiples (e.g. 480) exhibit progressive
 //     haze/ghosting (#219) — every clean render in the 07-13 bisect used /64
 //     dims, every hazy one used 480.
-//  4. An upper safety clamp (max long edge, max pixels — the engine's
-//     existing `imageMemoryCaps`, PR #363) so a degenerate source cannot hand
-//     the pipeline an absurd allocation.
+//  4. An upper safety clamp (`maxVideoLongEdge`/`maxVideoPixels`) so a
+//     degenerate source cannot hand the pipeline an absurd allocation. It is
+//     applied to the generator dims AND to the predicted output dims.
 //
 // NOTHING MAY SHRINK. The first cut of this file tightened the fit's area cap
 // from 1.25x to 1.0x; a replay over all 474 `I2V: adjusted` lines in the
 // production log showed 62 renders (13%) losing 17-35% of their pixels. The
 // cap is back at 1.25x and the search is the original one, verbatim.
+// `scripts/replay-i2v-dims.py` re-checks that over the log on demand.
+//
+// PREDICTIONS ARE LABELLED AS PREDICTIONS. The output size of a two-stage
+// render is not `dims x 2`: `refine_scale`'s builtin is 1.5 (the production
+// plist sets 1.35), the refine upsamples the LATENT grid so the pixel result
+// is quantised by `spatialCompression`, and `LTX2RefineGate` can skip the
+// refine outright. `predictedOutputDims` models all three; the authoritative
+// number is the one the ENCODER measured
+// (`LTX2VideoResult.outputWidth/outputHeight`), carried on the terminal trace
+// event as `output_width`/`output_height`. Assuming x2 here is what made
+// comfybox#409 look like a bug in the file rather than in the log line.
 //
 // Why a neighbourhood SEARCH and not per-axis rounding: rounding each axis to
 // /64 independently compounds error in opposite directions. A 1664x896 source
@@ -80,8 +91,8 @@ public struct ResolvedVideoDimensions: Equatable, Sendable {
   public let sourceWidth: Int?
   public let sourceHeight: Int?
   /// The dims actually handed to the generator when two-stage is on — the
-  /// refine doubles them back to `width`x`height`. nil for a single-scale
-  /// render, where the generator and the output agree.
+  /// refine upsamples them by the resolved `refine_scale` to `width`x`height`.
+  /// nil for a single-scale render, where generator and output agree.
   public let stage1Width: Int?
   public let stage1Height: Int?
 
@@ -112,6 +123,32 @@ public enum VideoDimensionResolver {
   /// The LTX-2 engine default when nothing else names a size.
   public static let defaultWidth = 704
   public static let defaultHeight = 448
+
+  /// Upper ceiling for a VIDEO render, in pixels per spatial axis.
+  ///
+  /// The first cut used `imageMemoryCaps` (4096 / 4096², PR #363) — the IMAGE
+  /// path's cap. No LTX-2 render survives 4096×4096, so it was not a ceiling
+  /// in any useful sense.
+  ///
+  /// The numeral comes from the LTX-2 transformer's own spatial position
+  /// ceiling, `positionalEmbeddingMaxPos: [20, 2048, 2048]`
+  /// (`LTX2Transformer.swift`) — the only hard architectural limit the video
+  /// stack states about spatial extent. **Read here in PIXEL space, not latent
+  /// space, which is deliberately conservative**: in latent units 2048 would
+  /// be 65 536 px, a ceiling that bounds nothing. 2048 px is 1.5× the largest
+  /// render in 474 logged production lines (1344×768), so it is a verified
+  /// no-op on real traffic while still rejecting a degenerate 256×17792.
+  ///
+  /// This is a judgement call and is flagged as one: the engine has NO
+  /// video max-dims constant to inherit. The two existing LTX volume gates
+  /// (`plain_decode_max_vol` 4500, `refine_max_vol` 12000) are frame-count-
+  /// dependent decode/refine PATH-SELECTION gates, not admission caps — a
+  /// logged 1344×768×289f render is 37 296 latent units, far past both, and
+  /// renders fine via the streamed decode. Using either as a dimension clamp
+  /// would shrink shapes that ship today.
+  public static let maxVideoLongEdge = 2048
+  /// Companion area ceiling — `maxVideoLongEdge²`, i.e. the square case.
+  public static let maxVideoPixels = 2048 * 2048
 
   /// Snap a render dimension to the nearest multiple of 64 (floor 256), the
   /// /64 rule the pipeline enforces (#219).
@@ -205,11 +242,11 @@ public enum VideoDimensionResolver {
   }
 
   /// Upper safety clamp: no render may exceed `maxLongEdge` on its longer axis
-  /// or `maxPixels` in total. Defaults are the engine's existing
-  /// `imageMemoryCaps` (PR #363) — 4096 / 4096^2 — which no video render has
-  /// ever approached, so this never touches a real request; it exists so a
-  /// degenerate source (a 10x9999 strip, a corrupt EXIF size) cannot hand the
-  /// pipeline a 256x17792 allocation.
+  /// or `maxPixels` in total. Defaults are the VIDEO ceiling above (see
+  /// `maxVideoLongEdge` for where the number comes from and why it is not the
+  /// image path's 4096). It exists so a degenerate source (a 10x9999 strip, a
+  /// corrupt EXIF size) cannot hand the pipeline a 256x17792 allocation, and
+  /// is a verified no-op at every shape in the production log.
   ///
   /// Aspect is preserved by scaling BOTH axes by one factor and flooring each
   /// to /64 (flooring, not rounding, so the result cannot land back above the
@@ -217,7 +254,7 @@ public enum VideoDimensionResolver {
   /// sane configuration.
   public static func clamp(
     width: Int, height: Int,
-    maxLongEdge: Int = 4096, maxPixels: Int = 16_777_216
+    maxLongEdge: Int = maxVideoLongEdge, maxPixels: Int = maxVideoPixels
   ) -> (width: Int, height: Int) {
     let edgeCap = max(256, maxLongEdge)
     let pixelCap = max(256 * 256, maxPixels)
@@ -262,6 +299,12 @@ public enum VideoDimensionResolver {
   ///     t2v (or an unreadable image — in which case the budget's own shape is
   ///     kept, exactly as before #405).
   ///   - aspectRatio: the caller's `aspect_ratio` label.
+  ///   - hasInitImage: whether the request supplied an init image AT ALL —
+  ///     distinct from whether its size could be READ. A request with an
+  ///     unreadable init image is still i2v: swapping its budget axes on an
+  ///     `aspect_ratio` label would override a source image the resolver
+  ///     simply failed to measure (review round 2, item 4). Such a request
+  ///     keeps the budget's shape and the server warns.
   ///   - maxLongEdge/maxPixels: the upper safety clamp (see `clamp`).
   ///
   /// Why `aspectRatio` does NOT override the source image on i2v: real
@@ -272,8 +315,8 @@ public enum VideoDimensionResolver {
   /// render landscape — which is exactly the bug #405 is about, not a fix for
   /// it. The source image is ground truth for i2v; the label sizes the budget.
   ///
-  /// Where the label DOES decide the shape is a t2v request whose budget came
-  /// from neither explicit dims nor a named resolution — i.e. it fell through
+  /// Where the label DOES decide the shape is a request with NO init image at
+  /// all whose budget came from neither explicit dims nor a named resolution — i.e. it fell through
   /// to a preset / server default / the 704x448 engine default, which is
   /// landscape. That request renders landscape today no matter what
   /// orientation it asked for. It is corrected by ORIENTING the budget (the
@@ -290,7 +333,8 @@ public enum VideoDimensionResolver {
     configWidth: Int? = nil, configHeight: Int? = nil,
     sourceWidth: Int? = nil, sourceHeight: Int? = nil,
     aspectRatio: String? = nil,
-    maxLongEdge: Int = 4096, maxPixels: Int = 16_777_216
+    hasInitImage: Bool = false,
+    maxLongEdge: Int = maxVideoLongEdge, maxPixels: Int = maxVideoPixels
   ) -> ResolvedVideoDimensions {
     let budgetDims = budget(
       requestWidth: requestWidth, requestHeight: requestHeight,
@@ -325,10 +369,13 @@ public enum VideoDimensionResolver {
         .sourceAspect)
     }
 
-    // t2v with an orientation the budget does not already carry: orient the
-    // budget rather than render the landscape default sideways. Axis swap
-    // only — the pixel count is preserved exactly.
-    if !budgetAlreadyOriented, let target = aspect(fromLabel: aspectRatio) {
+    // t2v BY CONSTRUCTION (no init image was supplied at all) with an
+    // orientation the budget does not already carry: orient the budget rather
+    // than render the landscape default sideways. Axis swap only — the pixel
+    // count is preserved exactly. Gated on `hasInitImage`, not on whether the
+    // source size parsed: an i2v whose init image could not be measured must
+    // NOT have its shape decided by a (usually defaulted) aspect_ratio label.
+    if !hasInitImage, !budgetAlreadyOriented, let target = aspect(fromLabel: aspectRatio) {
       let budgetIsPortrait = budgetDims.height > budgetDims.width
       let wantPortrait = target < 1.0
       if budgetIsPortrait != wantPortrait, target != 1.0 {
@@ -343,20 +390,80 @@ public enum VideoDimensionResolver {
       callerSizedBudget ? .explicit : .default)
   }
 
-  /// The FINAL output dims for a render, after the two-stage convention has
-  /// mutated the request dims (`WarmServer.prepareLocalVideo`).
+  /// PREDICTED output dims for a render, given the dims the generator will be
+  /// handed and the resolved refine configuration.
   ///
-  /// With two-stage on, the request dims handed to the generator are the
-  /// STAGE-1 dims and the refine doubles them back — in both branches: when
-  /// the request halved, and when it was below the stage-1 floor and was
-  /// therefore treated as stage-1 dims outright ("output will be 1408x896").
-  /// So what a caller receives is always 2x what the generator was handed.
-  /// Pure so the reported `resolved_width`/`resolved_height` can be tested
-  /// with two-stage ON, which is the configuration that actually ships
-  /// (comfybox#405 review ruling 2).
-  public static func outputDims(
-    generatorWidth: Int, generatorHeight: Int, twoStage: Bool
+  /// This is a prediction and is named as one. The first cut of #405 hardcoded
+  /// x2 — the two-stage halving convention's own assumption — but that is
+  /// wrong at the shipping configuration in two independent ways:
+  ///
+  ///  * `refine_scale`'s builtin is **1.5**, not 2 (`LTX2ConfigResolver`), and
+  ///    the pipeline clamps it to [1, 2] (`LTX2Pipeline`). The refine upsamples
+  ///    the LATENT grid by that factor and the VAE decodes at
+  ///    `spatialCompression` per latent unit, so the pixel result is
+  ///    `round(dim / spatialCompression * scale) * spatialCompression` — NOT
+  ///    `dim * scale`, because the latent rounding quantises it.
+  ///  * `LTX2RefineGate` can skip the refine entirely (volume gate, missing
+  ///    upsampler), in which case the output is the generator dims unchanged.
+  ///
+  /// So a two-stage render's real output is one of three sizes, and only the
+  /// encoder knows which. `LTX2VideoResult.outputWidth/outputHeight` carry the
+  /// MEASURED pair; this function exists for the submitted event, which has to
+  /// commit to a number before the render runs.
+  ///
+  /// - Parameters:
+  ///   - refineScale: the RESOLVED scale (`LTX2ResolvedVideoConfig.refineScale`),
+  ///     clamped here exactly as `LTX2Pipeline` clamps it.
+  ///   - refineWillSkip: pass true when the refine is already known not to run.
+  /// Reduce the GENERATOR dims until their predicted output fits the ceiling.
+  ///
+  /// Review round 2, item 2: the clamp has to bound the FINAL output, not only
+  /// the dims handed to the pipeline — a two-stage render can predict past the
+  /// ceiling from generator dims that are themselves under it. Clamping the
+  /// prediction alone would only make the REPORTED number wrong (the file
+  /// would still be whatever the encoder wrote), so the reduction is applied
+  /// where it actually binds: the generator dims. One pass suffices — the /64
+  /// floor only ever reduces further.
+  ///
+  /// Returns the generator dims unchanged when the prediction already fits,
+  /// which is every shape in the production log (largest predicted output:
+  /// 2016x1152 from a 1344x768 two-stage render).
+  public static func generatorDimsFittingOutputCeiling(
+    generatorWidth: Int, generatorHeight: Int,
+    twoStage: Bool, refineScale: Float,
+    spatialCompression: Int = 32, refineWillSkip: Bool = false,
+    maxLongEdge: Int = maxVideoLongEdge, maxPixels: Int = maxVideoPixels
   ) -> (width: Int, height: Int) {
-    twoStage ? (generatorWidth * 2, generatorHeight * 2) : (generatorWidth, generatorHeight)
+    let predicted = predictedOutputDims(
+      generatorWidth: generatorWidth, generatorHeight: generatorHeight,
+      twoStage: twoStage, refineScale: refineScale,
+      spatialCompression: spatialCompression, refineWillSkip: refineWillSkip)
+    let edgeCap = max(256, maxLongEdge)
+    let pixelCap = max(256 * 256, maxPixels)
+    guard max(predicted.width, predicted.height) > edgeCap
+      || predicted.width * predicted.height > pixelCap
+    else { return (generatorWidth, generatorHeight) }
+    let scale = min(
+      Double(edgeCap) / Double(max(predicted.width, predicted.height)),
+      (Double(pixelCap) / Double(predicted.width * predicted.height)).squareRoot())
+    func floor64(_ v: Double) -> Int { max(256, Int(v / 64.0) * 64) }
+    return (
+      floor64(Double(generatorWidth) * scale),
+      floor64(Double(generatorHeight) * scale))
+  }
+
+  public static func predictedOutputDims(
+    generatorWidth: Int, generatorHeight: Int,
+    twoStage: Bool, refineScale: Float,
+    spatialCompression: Int = 32, refineWillSkip: Bool = false
+  ) -> (width: Int, height: Int) {
+    guard twoStage, !refineWillSkip else { return (generatorWidth, generatorHeight) }
+    let scale = max(1.0, min(2.0, refineScale))
+    let comp = max(1, spatialCompression)
+    func scaled(_ dim: Int) -> Int {
+      let lat = max(1, dim / comp)
+      return max(1, Int((Float(lat) * scale).rounded())) * comp
+    }
+    return (scaled(generatorWidth), scaled(generatorHeight))
   }
 }

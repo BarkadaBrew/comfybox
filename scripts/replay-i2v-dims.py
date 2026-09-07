@@ -61,8 +61,8 @@ def fit(aspect, bw, bh, area_cap_primary, relax_trigger, window, area_weight):
 def old_algo(sw, sh, bw, bh):
     return fit(sw / sh, bw, bh, 1.25, 0.03, 1, 0.0)
 
-# NEW = PR #408 after the review fix (VideoDimensionResolver.fit + clamp)
-def clamp(w, h, max_long=4096, max_px=16_777_216):
+# NEW = PR #408 after review rounds 1+2 (VideoDimensionResolver.fit + video clamp)
+def clamp(w, h, max_long=2048, max_px=2048 * 2048):
     if max(w, h) <= max_long and w * h <= max_px:
         return (w, h)
     scale = min(max_long / max(w, h), math.sqrt(max_px / (w * h)))
@@ -151,8 +151,36 @@ for bw, bh in budgets[::7]:
         if old_algo(sw, sh, bw, bh) != new_algo(sw, sh, bw, bh):
             # the ONLY legitimate difference is the >4096 safety clamp
             o = old_algo(sw, sh, bw, bh)
-            if max(o) <= 4096 and o[0]*o[1] <= 16_777_216:
+            if max(o) <= 2048 and o[0]*o[1] <= 2048 * 2048:
                 bad += 1
                 if bad < 10:
                     print("   UNEXPECTED", (bw, bh), (sw, sh), o, new_algo(sw, sh, bw, bh))
 print(f"  checked {checked} pairs; unexpected differences (outside the safety clamp): {bad}")
+
+print("\n=== CLAMP no-op check over the log (review round 2, item 2)")
+touched = 0
+for bw, bh, sw, sh, ow, oh in rows:
+    d = old_algo(sw, sh, bw, bh)
+    if clamp(*d) != d:
+        touched += 1
+        print("   CLAMPED", (bw, bh), (sw, sh), d, clamp(*d))
+print(f"  logged shapes the 2048px video clamp touches: {touched} / {len(rows)}")
+# and the predicted OUTPUT dims (generator dims x refine_scale 1.5, latent-quantised)
+def predicted(w, h, two_stage=True, scale=1.5, comp=32):
+    if not two_stage:
+        return (w, h)
+    f = lambda d: max(1, round(max(1, d // comp) * scale)) * comp
+    return (f(w), f(h))
+touched_out = 0
+worst = None
+for bw, bh, sw, sh, ow, oh in rows:
+    d = old_algo(sw, sh, bw, bh)
+    p_ = predicted(*d)
+    if clamp(*p_) != p_:
+        touched_out += 1
+    if worst is None or p_[0] * p_[1] > worst[0] * worst[1]:
+        worst = p_
+print(f"  logged PREDICTED outputs the clamp touches: {touched_out} / {len(rows)}"
+      f" (largest predicted output {worst[0]}x{worst[1]})")
+print(f"  degenerate 10x9999 @ 704x448 -> {clamp(*old_algo(10, 9999, 704, 448))}"
+      f" (unclamped {old_algo(10, 9999, 704, 448)})")

@@ -2207,14 +2207,22 @@ public final class WarmServer {
     /// (`source_aspect` | `explicit` | `default`). Additive — an older client
     /// ignores the extra keys, and the unknown-field-ignored convention means
     /// an older engine simply never sends them.
-    /// The FINAL output dims — after the two-stage convention (the refine
-    /// doubles stage-1 back), so these name the size the file actually has.
-    let resolvedWidth: Int
-    let resolvedHeight: Int
+    /// comfybox#405: the PREDICTED output dims — the generator dims put
+    /// through the RESOLVED `refine_scale`. A prediction, because the refine
+    /// can still be gate-skipped.
+    let predictedWidth: Int
+    let predictedHeight: Int
     let dimensionReason: String
     /// Non-nil only for a two-stage render: the dims stage 1 painted at.
     let stage1Width: Int?
     let stage1Height: Int?
+    /// The MEASURED encoded dims — what this file actually is. Always present
+    /// on a successful sync render (the sync route has the result in hand),
+    /// and authoritative over `predicted_*` whenever the two disagree.
+    let outputWidth: Int?
+    let outputHeight: Int?
+    let refineApplied: Bool
+    let refineScale: Float
   }
 
   /// Submit a video render to the paid Replicate cloud proxy and return its 202
@@ -2262,7 +2270,9 @@ public final class WarmServer {
   /// A LTX-2 generator + validated request, ready to enqueue. Shared by the
   /// synchronous (`/v1/video/generate`) and async (`/v1/video/generate/async`)
   /// local video paths so they build the render identically.
-  private struct PreparedLocalVideo {
+  /// comfybox#405 (review round 2, item 3): `internal`, not `private`, so the
+  /// trace-recording seams above can name it and a unit test can build one.
+  struct PreparedLocalVideo {
     let generator: LTX2VideoGenerator
     let request: LTX2VideoRequest
     /// t2v when there's no init image, i2v otherwise.
@@ -2348,12 +2358,20 @@ public final class WarmServer {
   /// comfybox#405: the arithmetic now lives in `VideoDimensionResolver` — the
   /// ONE resolver every video caller shares. This shim keeps the name the
   /// existing call sites and tests use.
+  ///
+  /// Review round 2, item 5: the caps are parameters with the VIDEO ceiling as
+  /// the default, so this shim can never silently apply a different clamp from
+  /// the real path.
   static func deriveVideoDims(
-    sourceWidth: Int, sourceHeight: Int, budgetWidth: Int, budgetHeight: Int
+    sourceWidth: Int, sourceHeight: Int, budgetWidth: Int, budgetHeight: Int,
+    maxLongEdge: Int = VideoDimensionResolver.maxVideoLongEdge,
+    maxPixels: Int = VideoDimensionResolver.maxVideoPixels
   ) -> (width: Int, height: Int) {
     let resolved = VideoDimensionResolver.resolve(
       requestWidth: budgetWidth, requestHeight: budgetHeight,
-      sourceWidth: sourceWidth, sourceHeight: sourceHeight)
+      sourceWidth: sourceWidth, sourceHeight: sourceHeight,
+      hasInitImage: true,
+      maxLongEdge: maxLongEdge, maxPixels: maxPixels)
     return (resolved.width, resolved.height)
   }
 
@@ -2770,7 +2788,6 @@ public final class WarmServer {
     // the fix — see the resolver's `resolve` doc comment).
     let namedDims = Self.videoDims(resolution: req.resolution, aspectRatio: req.aspectRatio)
     let videoConfigDefaults = ServerConfigStore.shared.videoDefaults()
-    let imageMemoryCaps = ServerConfigStore.shared.imageMemoryCaps()
     let sourceSize = effectiveInitImage.flatMap { Self.imagePixelSize(atPath: $0) }
     let resolvedDims = VideoDimensionResolver.resolve(
       requestWidth: req.width, requestHeight: req.height,
@@ -2779,11 +2796,9 @@ public final class WarmServer {
       configWidth: videoConfigDefaults.width, configHeight: videoConfigDefaults.height,
       sourceWidth: sourceSize?.width, sourceHeight: sourceSize?.height,
       aspectRatio: req.aspectRatio,
-      // comfybox#405 review ruling 3: the engine's existing resolution caps
-      // (#363) are the upper clamp. No video render has ever approached them
-      // (the largest in the log is 1344x768), so this never touches a real
-      // request — it stops a degenerate source from sizing an allocation.
-      maxLongEdge: imageMemoryCaps.maxLongEdge, maxPixels: imageMemoryCaps.maxPixels)
+      // Review round 2, item 4: "is this i2v" is whether an init image was
+      // SUPPLIED, not whether its size could be read.
+      hasInitImage: effectiveInitImage != nil)
     var renderWidth = resolvedDims.width
     var renderHeight = resolvedDims.height
     if req.width == nil, let nd = namedDims {
@@ -2807,13 +2822,28 @@ public final class WarmServer {
     // and matches all validated two-stage renders (stage 1 at 448x256 etc.).
     // Typed resolution honors request/preset tuning overrides (finding #18):
     // a request can enable two-stage without the plist knowing.
-    let resolvedTwoStage = LTX2ConfigResolver.resolveTyped(
-      request: effectiveTuning, preset: videoPreset?.videoTuning).twoStage
+    let resolvedVideoConfig = LTX2ConfigResolver.resolveTyped(
+      request: effectiveTuning, preset: videoPreset?.videoTuning)
+    let resolvedTwoStage = resolvedVideoConfig.twoStage
     if resolvedTwoStage {
       let s1 = Self.stageOneDims(finalWidth: renderWidth, finalHeight: renderHeight)
+      // comfybox#405 (review round 2) / comfybox#409: these messages used to
+      // say "doubles to WxH" / "output will be WxH" computed as 2x. The
+      // deployed `refine_scale` is NOT 2 (builtin 1.5; the production plist
+      // sets 1.35), and the refine upsamples the LATENT grid, so the real
+      // output is `round(dim/32 * scale) * 32`. The old text was the source of
+      // comfybox#409 — a 512x320 render logged "output will be 1024x640" and
+      // delivered 704x448, which is exactly 1.35x latent-quantised, i.e. the
+      // FILE was right and the LOG was wrong.
+      let refineOut = { (w: Int, h: Int) -> String in
+        let p = VideoDimensionResolver.predictedOutputDims(
+          generatorWidth: w, generatorHeight: h,
+          twoStage: true, refineScale: resolvedVideoConfig.refineScale)
+        return "\(p.width)x\(p.height)"
+      }
       if s1.halved {
         logger.info(
-          "LTX-2 two-stage: request dims \(renderWidth)x\(renderHeight) = FINAL; stage 1 paints \(s1.width)x\(s1.height), refine doubles to \(s1.width * 2)x\(s1.height * 2)")
+          "LTX-2 two-stage: request dims \(renderWidth)x\(renderHeight) = FINAL; stage 1 paints \(s1.width)x\(s1.height), refine (scale \(resolvedVideoConfig.refineScale)) outputs \(refineOut(s1.width, s1.height))")
         renderWidth = s1.width
         renderHeight = s1.height
       } else {
@@ -2822,20 +2852,39 @@ public final class WarmServer {
           \(Self.snapDim64(renderWidth / 2))x\(Self.snapDim64(renderHeight / 2)) — below the \
           stage-1 floor, which renders SOFT (the refine sharpens, it cannot invent detail). \
           Treating the request as stage-1 dims instead; output will be \
-          \(renderWidth * 2)x\(renderHeight * 2). Send ~2x larger dims for the intended size.
+          \(refineOut(renderWidth, renderHeight)) at refine scale \
+          \(resolvedVideoConfig.refineScale). Send ~2x larger dims for the intended size.
           """)
       }
     }
-    // comfybox#405 review ruling 2: what the CALLER receives is not what the
-    // generator is handed. With two-stage on, `renderWidth`/`renderHeight` are
-    // now the STAGE-1 dims and the refine doubles them back, so the reported
-    // `resolved_width`/`resolved_height` must be computed HERE, after the
-    // mutation above — otherwise they name a size no file ever has.
-    let outputDims = VideoDimensionResolver.outputDims(
+    // comfybox#405 review round 2, item 1: what the CALLER receives is not what
+    // the generator is handed, and it is NOT simply 2x either. With two-stage
+    // on, `renderWidth`/`renderHeight` are the STAGE-1 dims and the refine
+    // upsamples the LATENT grid by the RESOLVED `refine_scale` — whose builtin
+    // is 1.5, not 2 — and `LTX2RefineGate` can skip the refine entirely. So
+    // this is a PREDICTION and is named one: `predicted_width`/
+    // `predicted_height` on the submitted event. The terminal event carries
+    // `output_width`/`output_height` MEASURED by the encoder.
+    // The ceiling binds the FINAL output, not only the generator dims (review
+    // round 2, item 2): a two-stage render can predict past it from dims that
+    // are themselves under it. Clamping the PREDICTION alone would only make
+    // the reported number wrong — the encoder would still write whatever it
+    // wrote — so the reduction lands on the generator dims, where it binds.
+    let fitted = VideoDimensionResolver.generatorDimsFittingOutputCeiling(
       generatorWidth: renderWidth, generatorHeight: renderHeight,
-      twoStage: resolvedTwoStage)
+      twoStage: resolvedTwoStage, refineScale: resolvedVideoConfig.refineScale)
+    if fitted.width != renderWidth || fitted.height != renderHeight {
+      logger.warning(
+        "LTX-2 dims: \(renderWidth)x\(renderHeight) would refine past the \(VideoDimensionResolver.maxVideoLongEdge)px video ceiling — painting \(fitted.width)x\(fitted.height) instead (#405)")
+      renderWidth = fitted.width
+      renderHeight = fitted.height
+    }
+    let predicted = VideoDimensionResolver.predictedOutputDims(
+      generatorWidth: renderWidth, generatorHeight: renderHeight,
+      twoStage: resolvedTwoStage,
+      refineScale: resolvedVideoConfig.refineScale)
     let renderDimensions = ResolvedVideoDimensions(
-      width: outputDims.width, height: outputDims.height,
+      width: predicted.width, height: predicted.height,
       reason: resolvedDims.reason,
       budgetWidth: resolvedDims.budgetWidth, budgetHeight: resolvedDims.budgetHeight,
       sourceWidth: resolvedDims.sourceWidth, sourceHeight: resolvedDims.sourceHeight,
@@ -2989,10 +3038,11 @@ public final class WarmServer {
   ///
   /// comfybox#405 (review ruling 5): pulled out of the async route so the
   /// SYNC `/v1/video/generate` path writes the identical set of fields. Two
-  /// hand-maintained copies of a payload dictionary drift — `resolved_width`
+  /// hand-maintained copies of a payload dictionary drift — `predicted_width`
   /// existing on one route and not the other is exactly the invisibility this
-  /// ticket is about.
-  private static func videoTracePayload(
+  /// ticket is about. `internal`, not `private`, so a unit test can call the
+  /// one builder both routes use (review round 2, item 3).
+  static func videoTracePayload(
     prep: PreparedLocalVideo, body: Data
   ) -> [String: String] {
     var tracePayload: [String: String] = ["prompt": prep.request.prompt]
@@ -3025,13 +3075,14 @@ public final class WarmServer {
     tracePayload["height"] = String(prep.request.height)
     tracePayload["frames"] = String(prep.request.framesPerChunk)
     tracePayload["fps"] = String(prep.request.fps)
-    // comfybox#405: the FINAL output dims and WHY. `width`/`height` above are
-    // the dims handed to the generator (the STAGE-1 half when two-stage is
-    // on); `resolved_*` is what the caller actually receives, alongside the
-    // budget the shape was fitted into and the reason it was chosen — so a
-    // wrong-shaped clip can be diagnosed from the trace alone.
-    tracePayload["resolved_width"] = String(prep.resolvedDimensions.width)
-    tracePayload["resolved_height"] = String(prep.resolvedDimensions.height)
+    // comfybox#405: the PREDICTED output dims and WHY. `width`/`height` above
+    // are the dims handed to the generator (the STAGE-1 half when two-stage is
+    // on); `predicted_*` is the size the caller should expect, derived from
+    // the RESOLVED refine scale — a prediction, because `LTX2RefineGate` can
+    // still skip the refine. The terminal event carries `output_width`/
+    // `output_height` MEASURED at encode time; prefer those when present.
+    tracePayload["predicted_width"] = String(prep.resolvedDimensions.width)
+    tracePayload["predicted_height"] = String(prep.resolvedDimensions.height)
     tracePayload["dimension_reason"] = prep.resolvedDimensions.reason.rawValue
     tracePayload["dimension_budget"] =
       "\(prep.resolvedDimensions.budgetWidth)x\(prep.resolvedDimensions.budgetHeight)"
@@ -3047,6 +3098,73 @@ public final class WarmServer {
       tracePayload["image_path"] = initImage
     }
     return tracePayload
+  }
+
+  // MARK: - comfybox#405: the sync route's trace bookkeeping
+  //
+  // Review round 2, item 3: the sync `/v1/video/generate` route used to write
+  // NO trace at all. These three are the EXACT calls that route makes, pulled
+  // out as internal statics taking the store so a unit test can drive them
+  // against a temp-directory `RenderTraceStore` and assert the submitted +
+  // terminal pair on BOTH the success and the failure path. Testing the route
+  // itself would need a live `WarmServer` (and its ~40GB admission gate);
+  // this is the closest seam that still exercises the production code rather
+  // than a re-implementation of it.
+
+  static func recordSyncVideoSubmitted(
+    _ store: RenderTraceStore, renderId: String, prep: PreparedLocalVideo, body: Data
+  ) {
+    store.append(RenderTraceEvent(
+      renderId: renderId, event: .submitted, taskKind: .videoRender,
+      payload: videoTracePayload(prep: prep, body: body)))
+  }
+
+  static func recordSyncVideoSucceeded(
+    _ store: RenderTraceStore, renderId: String, result: LTX2VideoResult
+  ) {
+    var payload = [
+      "status": "succeeded",
+      "output_path": result.outputPath,
+      "frames": String(result.frameCount),
+      "elapsed_ms": String(Int(result.elapsedSeconds * 1000)),
+    ]
+    if let reason = result.refineSkippedReason { payload["refine_skipped"] = reason }
+    payload.merge(videoMeasuredOutputPayload(result: result)) { a, _ in a }
+    store.append(RenderTraceEvent(
+      renderId: renderId, event: .terminal, taskKind: .videoRender, payload: payload))
+  }
+
+  static func recordSyncVideoFailed(
+    _ store: RenderTraceStore, renderId: String, error: Error
+  ) {
+    store.append(RenderTraceEvent(
+      renderId: renderId, event: .terminal, taskKind: .videoRender,
+      payload: ["status": "failed", "error": "\(error)"]))
+  }
+
+  /// comfybox#405 (review round 2, item 1): the MEASURED half of the dims
+  /// record — the dims the encoder actually wrote, and the refine facts that
+  /// explain any gap from the submitted event's prediction.
+  ///
+  /// The prediction cannot be trusted on its own: the two-stage convention
+  /// assumes the refine DOUBLES, but `refine_scale`'s builtin is 1.5 and
+  /// `LTX2RefineGate` can skip the refine entirely, so a two-stage render has
+  /// three possible output sizes and only the encoder knows which. Nothing
+  /// here re-probes the file — `LTX2VideoResult.outputWidth/outputHeight` are
+  /// computed inside the generator with the same `LTX2PostProcess.deliveryDims`
+  /// call `writeMP4` itself applies.
+  ///
+  /// `internal` so both routes and a unit test can call the one builder.
+  static func videoMeasuredOutputPayload(result: LTX2VideoResult) -> [String: String] {
+    var payload: [String: String] = [
+      "refine_applied": result.refineApplied ? "true" : "false",
+      "refine_scale": String(format: "%.3f", result.refineScale),
+    ]
+    if result.outputWidth > 0, result.outputHeight > 0 {
+      payload["output_width"] = String(result.outputWidth)
+      payload["output_height"] = String(result.outputHeight)
+    }
+    return payload
   }
 
   /// If LTX-2 is configured, ASYNC-submit the local render and return 202 + a
@@ -3309,9 +3427,8 @@ public final class WarmServer {
       // SAME submitted payload the async route does (one shared builder), and
       // a terminal event, so both routes are equally diagnosable.
       let syncRenderId = UUID().uuidString
-      renderTraceStore.append(RenderTraceEvent(
-        renderId: syncRenderId, event: .submitted, taskKind: .videoRender,
-        payload: Self.videoTracePayload(prep: prep, body: body)))
+      Self.recordSyncVideoSubmitted(
+        renderTraceStore, renderId: syncRenderId, prep: prep, body: body)
       let result: LTX2VideoResult
       do {
         result = try await coordinator.enqueueLocalVideo(wantsAudio: videoRequest.audio) { report in
@@ -3323,19 +3440,10 @@ public final class WarmServer {
           }
         }
       } catch {
-        renderTraceStore.append(RenderTraceEvent(
-          renderId: syncRenderId, event: .terminal, taskKind: .videoRender,
-          payload: ["status": "failed", "error": "\(error)"]))
+        Self.recordSyncVideoFailed(renderTraceStore, renderId: syncRenderId, error: error)
         throw error
       }
-      renderTraceStore.append(RenderTraceEvent(
-        renderId: syncRenderId, event: .terminal, taskKind: .videoRender,
-        payload: [
-          "status": "succeeded",
-          "output_path": result.outputPath,
-          "frames": String(result.frameCount),
-          "refine_skipped": result.refineSkippedReason ?? "",
-        ].filter { !$0.value.isEmpty }))
+      Self.recordSyncVideoSucceeded(renderTraceStore, renderId: syncRenderId, result: result)
       auditLog.append(kind: "video.local", message: "LTX-2 video \(result.frameCount)f -> \(result.outputPath)")
       return .json(status: 200, payload: LocalVideoResponse(
         success: true,
@@ -3347,11 +3455,15 @@ public final class WarmServer {
         enhancementSkipped: prep.enhancementSkippedReason,
         beatScheduleIgnored: prep.beatScheduleIgnoredReason,
         refineSkipped: result.refineSkippedReason,
-        resolvedWidth: prep.resolvedDimensions.width,
-        resolvedHeight: prep.resolvedDimensions.height,
+        predictedWidth: prep.resolvedDimensions.width,
+        predictedHeight: prep.resolvedDimensions.height,
         dimensionReason: prep.resolvedDimensions.reason.rawValue,
         stage1Width: prep.resolvedDimensions.stage1Width,
-        stage1Height: prep.resolvedDimensions.stage1Height
+        stage1Height: prep.resolvedDimensions.stage1Height,
+        outputWidth: result.outputWidth > 0 ? result.outputWidth : nil,
+        outputHeight: result.outputHeight > 0 ? result.outputHeight : nil,
+        refineApplied: result.refineApplied,
+        refineScale: result.refineScale
       ))
     } catch let error as LTX2VideoError {
       return .error(.error(status: 400, message: error.localizedDescription))
@@ -7935,6 +8047,10 @@ final class VideoJobTracker: @unchecked Sendable {
     if let reason = result.refineSkippedReason {
       payload["refine_skipped"] = reason
     }
+    // comfybox#405 (review round 2): the MEASURED encoded dims, plus whether
+    // the refine actually ran and at what scale. One builder, shared with the
+    // sync route, so the two cannot drift.
+    payload.merge(WarmServer.videoMeasuredOutputPayload(result: result)) { a, _ in a }
     traceStore?.append(RenderTraceEvent(
       renderId: jobId, event: .terminal, taskKind: .videoRender, payload: payload))
   }

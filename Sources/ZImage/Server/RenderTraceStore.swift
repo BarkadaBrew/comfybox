@@ -173,21 +173,36 @@ public final class RenderTraceStore: @unchecked Sendable {
     /// trace event itself carries (the same bug class `enhancementSkipped`
     /// above was added to fix, comfybox#328).
     public let refineSkipped: String?
-    /// comfybox#405: the dims the dimension resolver settled on and WHY
+    /// comfybox#405: the dims this render resolved to and WHY
     /// (`source_aspect` | `explicit` | `default`), plus the budget it fitted
     /// into and the i2v source size it read. `GET /v1/video/traces` returns
     /// THIS type, not the raw payload — a field missing here is invisible to
     /// every caller of that endpoint (the same bug class comfybox#328 fixed
     /// for `enhancementSkipped`), and diagnosing a wrong-shaped clip is the
     /// whole point of recording it.
-    public let resolvedWidth: String?
-    public let resolvedHeight: String?
+    ///
+    /// Review round 2, item 1: `outputWidth`/`outputHeight` are the MEASURED
+    /// pair, read from the terminal event the encoder produced.
+    /// `dimensionSource` says which pair `outputWidth`/`outputHeight` carries
+    /// — `"measured"` once the render has finished, `"predicted"` while it is
+    /// still running or if the engine that wrote the trace predates this
+    /// field. A prediction can be wrong: `refine_scale`'s builtin is 1.5 (not
+    /// the 2 the two-stage convention assumes) and the refine can be
+    /// gate-skipped, so never present a prediction as the file's resolution.
+    public let outputWidth: String?
+    public let outputHeight: String?
+    public let dimensionSource: String?
+    public let predictedWidth: String?
+    public let predictedHeight: String?
     public let dimensionReason: String?
     public let dimensionBudget: String?
     public let sourceSize: String?
-    /// Non-nil only for a two-stage render: the dims stage 1 painted at
-    /// (`resolvedWidth`/`resolvedHeight` are the doubled OUTPUT dims).
+    /// Non-nil only for a two-stage render: the dims stage 1 painted at.
     public let stage1Size: String?
+    /// Whether the two-stage refine actually ran, and the scale it resolved
+    /// to — the two facts that explain a measured/predicted mismatch.
+    public let refineApplied: String?
+    public let refineScale: String?
   }
 
   public func recentSummaries(limit: Int = 50) -> [TraceSummary] {
@@ -216,12 +231,20 @@ public final class RenderTraceStore: @unchecked Sendable {
         enhancementSkipped: submitted?.payload["enhancement_skipped"],
         beatScheduleIgnored: submitted?.payload["beat_schedule_ignored"],
         refineSkipped: terminal?.payload["refine_skipped"],
-        resolvedWidth: submitted?.payload["resolved_width"],
-        resolvedHeight: submitted?.payload["resolved_height"],
+        // comfybox#405 review round 2: the MEASURED pair when the terminal
+        // event has one, else the submitted event's prediction — and say
+        // which, so no caller mistakes a prediction for the file's size.
+        outputWidth: terminal?.payload["output_width"] ?? submitted?.payload["predicted_width"],
+        outputHeight: terminal?.payload["output_height"] ?? submitted?.payload["predicted_height"],
+        dimensionSource: terminal?.payload["output_width"] != nil ? "measured" : "predicted",
+        predictedWidth: submitted?.payload["predicted_width"],
+        predictedHeight: submitted?.payload["predicted_height"],
         dimensionReason: submitted?.payload["dimension_reason"],
         dimensionBudget: submitted?.payload["dimension_budget"],
         sourceSize: submitted?.payload["source_size"],
-        stage1Size: submitted?.payload["stage1_size"]
+        stage1Size: submitted?.payload["stage1_size"],
+        refineApplied: terminal?.payload["refine_applied"],
+        refineScale: terminal?.payload["refine_scale"]
       )
     }
     return summaries

@@ -25,7 +25,7 @@ final class VideoDimensionResolverTests: XCTestCase {
     VideoDimensionResolver.resolve(
       requestWidth: budget.0, requestHeight: budget.1,
       sourceWidth: source.0, sourceHeight: source.1,
-      aspectRatio: aspectRatio)
+      aspectRatio: aspectRatio, hasInitImage: true)
   }
 
   // MARK: - The ticket's shapes at a 480p budget (832x480)
@@ -325,12 +325,16 @@ final class VideoDimensionResolverTests: XCTestCase {
 
   func testDegenerateStripIsClamped() {
     // A 10x9999 source: the fit falls through to its ideal-dims fallback and
-    // would hand the pipeline a 256x17792 allocation.
+    // would hand the pipeline a 256x17728 allocation.
     let r = VideoDimensionResolver.resolve(
       requestWidth: 704, requestHeight: 448,
-      sourceWidth: 10, sourceHeight: 9999)
-    XCTAssertLessThanOrEqual(max(r.width, r.height), 4096, "long edge must be capped")
-    XCTAssertLessThanOrEqual(r.width * r.height, 16_777_216, "pixel count must be capped")
+      sourceWidth: 10, sourceHeight: 9999, hasInitImage: true)
+    XCTAssertLessThanOrEqual(
+      max(r.width, r.height), VideoDimensionResolver.maxVideoLongEdge,
+      "long edge must be capped")
+    XCTAssertLessThanOrEqual(
+      r.width * r.height, VideoDimensionResolver.maxVideoPixels,
+      "pixel count must be capped")
     XCTAssertEqual(r.width % 64, 0)
     XCTAssertEqual(r.height % 64, 0)
     XCTAssertGreaterThanOrEqual(r.width, 256)
@@ -339,12 +343,23 @@ final class VideoDimensionResolverTests: XCTestCase {
   }
 
   func testClampIsANoOpForEveryRealRenderSize() {
-    // The largest dims in the production log are 1344x768 — three times under
-    // the long-edge cap. The clamp must never touch a real request.
-    for dims in [(1344, 768), (1280, 704), (960, 960), (832, 448), (256, 256), (4096, 4096)] {
+    // The largest dims in the production log are 1344x768; the largest
+    // PREDICTED output across all 474 logged renders is 2016x1152. The clamp
+    // must never touch either. (A replay over the log confirms 0/474 for both
+    // — see scripts/replay-i2v-dims.py.)
+    for dims in [(1344, 768), (2016, 1152), (1280, 704), (960, 960), (832, 448), (256, 256)] {
       let c = VideoDimensionResolver.clamp(width: dims.0, height: dims.1)
-      XCTAssertEqual([c.width, c.height], [dims.0, dims.1])
+      XCTAssertEqual([c.width, c.height], [dims.0, dims.1], "\(dims) must not be clamped")
     }
+  }
+
+  func testVideoCeilingIsNotTheImagePathCap() {
+    // Review round 2, item 2: 4096/4096^2 is the IMAGE cap (imageMemoryCaps,
+    // PR #363) and no LTX render survives it, so it was not a ceiling at all.
+    XCTAssertEqual(VideoDimensionResolver.maxVideoLongEdge, 2048)
+    XCTAssertEqual(VideoDimensionResolver.maxVideoPixels, 2048 * 2048)
+    let imageSized = VideoDimensionResolver.clamp(width: 4096, height: 4096)
+    XCTAssertLessThanOrEqual(max(imageSized.width, imageSized.height), 2048)
   }
 
   func testClampHonoursCustomCaps() {
@@ -357,49 +372,161 @@ final class VideoDimensionResolverTests: XCTestCase {
     XCTAssertEqual(Double(c.width) / Double(c.height), 1344.0 / 768.0, accuracy: 0.1)
 
     let byPixels = VideoDimensionResolver.clamp(
-      width: 2048, height: 2048, maxLongEdge: 4096, maxPixels: 1_048_576)
+      width: 2048, height: 2048, maxLongEdge: 2048, maxPixels: 1_048_576)
     XCTAssertLessThanOrEqual(byPixels.width * byPixels.height, 1_048_576)
   }
 
-  // MARK: - Reported dims are the FINAL output dims (review ruling 2)
+  // MARK: - Predicted vs measured output dims (review round 2, item 1)
+  //
+  // The first cut hardcoded x2 — the two-stage convention's own assumption.
+  // Production `refine_scale` is 1.5 (LTX2ConfigResolver's builtin, clamped to
+  // [1, 2] by LTX2Pipeline) and LTX2RefineGate can skip the refine outright,
+  // so x2 named a size no shipping render produces.
 
-  func testOutputDimsAccountForTheTwoStageDoubling() {
-    // Single scale: what the generator gets is what the caller receives.
-    let single = VideoDimensionResolver.outputDims(
-      generatorWidth: 832, generatorHeight: 448, twoStage: false)
+  func testPredictionUsesTheResolvedRefineScaleNotATwoTimesAssumption() {
+    // 512x320 generator dims at the SHIPPING scale: latent 16x10 -> round(x1.5)
+    // = 24x15 -> 768x480. The x2 assumption would have said 1024x640.
+    let shipping = VideoDimensionResolver.predictedOutputDims(
+      generatorWidth: 512, generatorHeight: 320, twoStage: true, refineScale: 1.5)
+    XCTAssertEqual([shipping.width, shipping.height], [768, 480])
+    XCTAssertNotEqual([shipping.width, shipping.height], [1024, 640], "x2 is not the shipping scale")
+
+    // scale 2.0 (the upper clamp) does reproduce the old doubling.
+    let doubled = VideoDimensionResolver.predictedOutputDims(
+      generatorWidth: 512, generatorHeight: 320, twoStage: true, refineScale: 2.0)
+    XCTAssertEqual([doubled.width, doubled.height], [1024, 640])
+
+    // Out-of-range scales are clamped exactly as LTX2Pipeline clamps them.
+    XCTAssertEqual(
+      [VideoDimensionResolver.predictedOutputDims(
+        generatorWidth: 512, generatorHeight: 320, twoStage: true, refineScale: 9.0).width],
+      [1024])
+    XCTAssertEqual(
+      [VideoDimensionResolver.predictedOutputDims(
+        generatorWidth: 512, generatorHeight: 320, twoStage: true, refineScale: 0.1).width],
+      [512])
+  }
+
+  /// comfybox#409, solved. The report: a t2v probe submitted at 512x320 with
+  /// two-stage produced a 704x448 mp4 while the engine logged "output will be
+  /// 1024x640". The FILE was right and the LOG was wrong — the deployed
+  /// `LTX2_REFINE_SCALE` is 1.35 (production launchd plist; the builtin is
+  /// 1.5, and only the two-stage log message ever assumed 2), and the refine
+  /// upsamples the LATENT grid:
+  ///
+  ///   512/32 = 16 -> round(16 x 1.35) = 22 -> 704
+  ///   320/32 = 10 -> round(10 x 1.35) = 14 -> 448
+  ///
+  /// `deliveryShortEdge` is 480 and the short edge is 448, so no delivery
+  /// downscale applies. 704x448 is exactly correct.
+  func testIssue409ProductionScaleReproducesTheDeliveredFile() {
+    let p = VideoDimensionResolver.predictedOutputDims(
+      generatorWidth: 512, generatorHeight: 320, twoStage: true, refineScale: 1.35)
+    XCTAssertEqual([p.width, p.height], [704, 448], "the mp4 comfybox#409 reported")
+    XCTAssertNotEqual(
+      [p.width, p.height], [1024, 640],
+      "1024x640 was the x2 assumption in the log message, not a real output size")
+  }
+
+  func testRefineSkippedOrSingleScaleOutputsTheGeneratorDims() {
+    let skipped = VideoDimensionResolver.predictedOutputDims(
+      generatorWidth: 832, generatorHeight: 448, twoStage: true, refineScale: 1.5,
+      refineWillSkip: true)
+    XCTAssertEqual([skipped.width, skipped.height], [832, 448])
+
+    let single = VideoDimensionResolver.predictedOutputDims(
+      generatorWidth: 832, generatorHeight: 448, twoStage: false, refineScale: 1.5)
     XCTAssertEqual([single.width, single.height], [832, 448])
+  }
 
-    // Two-stage, halved branch: 960x576 request -> stage 1 paints 512x320 ->
-    // the refine doubles back to 1024x640, which is what the file has.
+  func testPredictionAtTheRealTwoStageWorkingPoints() {
+    // Halved branch: a 960x576 request paints stage 1 at 512x320, and at the
+    // shipping 1.5x the file comes back 768x480 — NOT the 1024x640 the
+    // convention's x2 assumption predicts.
     let s1 = WarmServer.stageOneDims(finalWidth: 960, finalHeight: 576)
     XCTAssertTrue(s1.halved)
-    let halved = VideoDimensionResolver.outputDims(
-      generatorWidth: s1.width, generatorHeight: s1.height, twoStage: true)
-    XCTAssertEqual([halved.width, halved.height], [1024, 640])
+    XCTAssertEqual([s1.width, s1.height], [512, 320])
+    let halved = VideoDimensionResolver.predictedOutputDims(
+      generatorWidth: s1.width, generatorHeight: s1.height, twoStage: true, refineScale: 1.5)
+    XCTAssertEqual([halved.width, halved.height], [768, 480])
 
-    // Two-stage, below-the-floor branch: a 704x448 request is NOT halved and
-    // is treated as stage-1 dims, so the output is 1408x896 — the size the
-    // engine's own warning names, and the one `resolved_*` must report.
+    // Below-the-floor branch: 704x448 is NOT halved and is painted as-is, so
+    // the file comes back 1056x672 at 1.5x (the engine's warning says 1408x896
+    // — that warning is computed from the same x2 assumption and is wrong).
     let floored = WarmServer.stageOneDims(finalWidth: 704, finalHeight: 448)
     XCTAssertFalse(floored.halved)
-    let doubled = VideoDimensionResolver.outputDims(
-      generatorWidth: floored.width, generatorHeight: floored.height, twoStage: true)
-    XCTAssertEqual([doubled.width, doubled.height], [1408, 896])
+    let doubledBranch = VideoDimensionResolver.predictedOutputDims(
+      generatorWidth: floored.width, generatorHeight: floored.height,
+      twoStage: true, refineScale: 1.5)
+    XCTAssertEqual([doubledBranch.width, doubledBranch.height], [1056, 672])
+  }
+
+  func testTheOutputCeilingBindsTheGeneratorDimsNotJustTheReport() {
+    // Every logged shape is already under the ceiling — the largest predicted
+    // output in the production log is 2016x1152 from a 1344x768 two-stage
+    // render, so nothing real is touched.
+    let untouched = VideoDimensionResolver.generatorDimsFittingOutputCeiling(
+      generatorWidth: 1344, generatorHeight: 768, twoStage: true, refineScale: 1.5)
+    XCTAssertEqual([untouched.width, untouched.height], [1344, 768])
+    let pred = VideoDimensionResolver.predictedOutputDims(
+      generatorWidth: 1344, generatorHeight: 768, twoStage: true, refineScale: 1.5)
+    XCTAssertEqual([pred.width, pred.height], [2016, 1152])
+    XCTAssertLessThanOrEqual(max(pred.width, pred.height), VideoDimensionResolver.maxVideoLongEdge)
+
+    // A request whose refine would carry it past the ceiling is painted
+    // smaller, so the REPORTED size stays truthful instead of being a clamped
+    // lie about a file the encoder wrote at full size.
+    let bound = VideoDimensionResolver.generatorDimsFittingOutputCeiling(
+      generatorWidth: 1920, generatorHeight: 1088, twoStage: true, refineScale: 2.0)
+    XCTAssertLessThan(bound.width, 1920)
+    XCTAssertEqual(bound.width % 64, 0)
+    XCTAssertEqual(bound.height % 64, 0)
+    let boundPrediction = VideoDimensionResolver.predictedOutputDims(
+      generatorWidth: bound.width, generatorHeight: bound.height,
+      twoStage: true, refineScale: 2.0)
+    XCTAssertLessThanOrEqual(
+      max(boundPrediction.width, boundPrediction.height),
+      VideoDimensionResolver.maxVideoLongEdge)
+    XCTAssertLessThanOrEqual(
+      boundPrediction.width * boundPrediction.height, VideoDimensionResolver.maxVideoPixels)
   }
 
   func testResolvedDimensionsCarryStage1Separately() {
     let d = ResolvedVideoDimensions(
-      width: 1024, height: 640, reason: .sourceAspect,
+      width: 768, height: 480, reason: .sourceAspect,
       budgetWidth: 960, budgetHeight: 576,
       sourceWidth: 1024, sourceHeight: 640,
       stage1Width: 512, stage1Height: 320)
-    XCTAssertEqual(d.width, 1024)          // what the caller receives
-    XCTAssertEqual(d.stage1Width, 512)     // what the generator painted
+    XCTAssertEqual(d.width, 768)           // predicted output at 1.5x
+    XCTAssertEqual(d.stage1Width, 512)     // what the generator paints
     XCTAssertEqual(d.stage1Height, 320)
 
     let single = ResolvedVideoDimensions(
       width: 832, height: 448, reason: .sourceAspect,
       budgetWidth: 832, budgetHeight: 480)
     XCTAssertNil(single.stage1Width)
+  }
+
+  // MARK: - i2v with an unreadable init image (review round 2, item 4)
+
+  func testUnreadableInitImagePlusAspectLabelDoesNotSwapTheBudget() {
+    // The request IS i2v — the resolver just could not measure the source.
+    // A (usually defaulted) "9:16" must not get to decide the shape.
+    let unreadable = VideoDimensionResolver.resolve(
+      requestWidth: nil, requestHeight: nil,
+      sourceWidth: nil, sourceHeight: nil,
+      aspectRatio: "9:16", hasInitImage: true)
+    XCTAssertEqual(unreadable.width, 704)
+    XCTAssertEqual(unreadable.height, 448, "an i2v budget must not be swapped by a label")
+    XCTAssertEqual(unreadable.reason, .default)
+
+    // Same request with NO init image at all IS t2v, and does swap.
+    let t2v = VideoDimensionResolver.resolve(
+      requestWidth: nil, requestHeight: nil,
+      sourceWidth: nil, sourceHeight: nil,
+      aspectRatio: "9:16", hasInitImage: false)
+    XCTAssertEqual(t2v.width, 448)
+    XCTAssertEqual(t2v.height, 704)
+    XCTAssertEqual(t2v.reason, .explicit)
   }
 }
