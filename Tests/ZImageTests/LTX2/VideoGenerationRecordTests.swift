@@ -28,9 +28,12 @@ final class VideoGenerationRecordTests: XCTestCase {
       framesPerChunk: 97,
       steps: 8,
       seed: 12345,
+      guidance: 3.5,
       loras: [LTX2LoRAReference(path: "/loras/motion_v2.safetensors", scale: 0.8)],
       outputPath: "/tmp/out.mp4",
-      audio: false)
+      audio: false,
+      source: "bree",
+      contentMode: "apple")
 
     let record = VideoGenerationRecord.build(
       request: request,
@@ -45,6 +48,7 @@ final class VideoGenerationRecordTests: XCTestCase {
     XCTAssertEqual(record.negativePrompt, request.negativePrompt)
     XCTAssertEqual(record.seed, request.seed)
     XCTAssertEqual(record.steps, request.steps)
+    XCTAssertEqual(record.guidance, request.guidance)
     XCTAssertEqual(record.model, "transformer-distilled")
     XCTAssertEqual(record.width, request.width)
     XCTAssertEqual(record.height, request.height)
@@ -52,12 +56,14 @@ final class VideoGenerationRecordTests: XCTestCase {
     XCTAssertEqual(record.fps, request.fps)
     XCTAssertEqual(record.resolvedWidth, 704)
     XCTAssertEqual(record.resolvedHeight, 448)
-    XCTAssertNil(record.dimensionReason, "not populated until #405/#408 lands — see file header")
+    XCTAssertNil(record.dimensionReason, "not populated until #405/#408 lands — see VideoGenerationRecord.build's doc comment")
     XCTAssertFalse(record.twoPass)
     XCTAssertFalse(record.refine)
     XCTAssertNil(record.refineSkippedReason)
     XCTAssertFalse(record.audio)
     XCTAssertEqual(record.kind, "t2v")
+    XCTAssertEqual(record.source, "bree")
+    XCTAssertEqual(record.contentMode, "apple")
     XCTAssertEqual(record.loras, [.init(name: "motion_v2", scale: 0.8)])
   }
 
@@ -220,5 +226,74 @@ final class VideoGenerationRecordTests: XCTestCase {
     let loras = json["loras"] as? [[String: Any]]
     XCTAssertEqual(loras?.first?["name"] as? String, "motion_v2")
     XCTAssertEqual(loras?.first?["scale"] as? Double ?? -1, 0.8, accuracy: 0.0001)
+  }
+
+  /// Review round 2, ruling 4: a seed above Int32.max must not silently drop
+  /// when it goes through the same `as? Int` read `AssetIngestor.readSidecar`
+  /// uses (`json["seed"] as? Int`, line ~647). `Int` on this platform is
+  /// 64-bit, same range as the `UInt64` this record stores a seed as, so a
+  /// seed of this magnitude survives — this pins that fact so a future
+  /// change (e.g. a narrower `Int32`-backed field somewhere in the chain)
+  /// fails loudly instead of quietly truncating a real render's seed.
+  func testSeedAboveInt32MaxSurvivesTheJSONSerializationIntCastReadSidecarUses() throws {
+    let bigSeed: UInt64 = 5_000_000_123  // > Int32.max (2_147_483_647)
+    let record = VideoGenerationRecord(
+      prompt: "p", seed: bigSeed, steps: 8, model: "m", width: 1, height: 1,
+      frames: 1, fps: 1, resolvedWidth: 1, resolvedHeight: 1,
+      twoPass: false, refine: false, audio: false, kind: "t2v")
+    let json = try JSONSerialization.jsonObject(with: record.encodeJSON()) as! [String: Any]
+    XCTAssertEqual(json["seed"] as? Int, Int(bigSeed), "readSidecar's exact cast must not return nil for a real production-magnitude seed")
+  }
+
+  // MARK: - Atom size cap (ruling 5)
+
+  func testAtomJSONReturnsTheFullRecordWhenUnderTheCap() throws {
+    let record = VideoGenerationRecord(
+      prompt: "a fox", seed: 42, steps: 8, model: "m", width: 1, height: 1,
+      frames: 1, fps: 1, resolvedWidth: 1, resolvedHeight: 1,
+      twoPass: false, refine: false, audio: false, kind: "t2v")
+    let atom = try XCTUnwrap(record.atomJSON())
+    XCTAssertLessThan(atom.count, VideoGenerationRecord.atomSizeCap)
+    let decoded = try VideoGenerationRecord.decodeJSON(atom)
+    XCTAssertEqual(decoded, record)
+    XCTAssertFalse(decoded.truncated)
+  }
+
+  func testAtomJSONTruncatesAnOversizedRecordButTheSidecarStaysFull() throws {
+    // A single absurdly long field is enough to blow the 64KB cap.
+    let hugePrompt = String(repeating: "a very long scene description. ", count: 4000)
+    let record = VideoGenerationRecord(
+      prompt: hugePrompt, seed: 42, steps: 8, model: "m", width: 1, height: 1,
+      frames: 1, fps: 1, resolvedWidth: 1, resolvedHeight: 1,
+      twoPass: false, refine: false, audio: false, kind: "t2v")
+    XCTAssertGreaterThan(try record.encodeJSON().count, VideoGenerationRecord.atomSizeCap,
+                          "the fixture must actually exceed the cap or this test proves nothing")
+
+    let atom = try XCTUnwrap(record.atomJSON())
+    XCTAssertLessThanOrEqual(atom.count, VideoGenerationRecord.atomSizeCap)
+    let decodedAtom = try VideoGenerationRecord.decodeJSON(atom)
+    XCTAssertTrue(decodedAtom.truncated)
+    XCTAssertLessThanOrEqual(decodedAtom.prompt.count, 200)
+    XCTAssertEqual(decodedAtom.seed, 42, "cheap identifying fields survive truncation")
+    XCTAssertEqual(decodedAtom.model, "m")
+
+    // The sidecar path is untouched by truncation — it always writes the
+    // FULL record via `encodeJSON()`, never `atomJSON()`.
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let mediaPath = dir.appendingPathComponent("clip.mp4").path
+    XCTAssertTrue(VideoSidecar.write(record, forMediaAt: mediaPath))
+    let fromSidecar = try XCTUnwrap(VideoSidecar.read(forMediaAt: mediaPath))
+    XCTAssertEqual(fromSidecar.prompt, hugePrompt, "sidecar keeps the untruncated prompt")
+    XCTAssertFalse(fromSidecar.truncated)
+  }
+
+  func testAtomJSONStringMatchesAtomJSON() throws {
+    let record = VideoGenerationRecord(
+      prompt: "p", model: "m", width: 1, height: 1, frames: 1, fps: 1,
+      resolvedWidth: 1, resolvedHeight: 1, twoPass: false, refine: false, audio: false, kind: "t2v")
+    let expected = String(data: try XCTUnwrap(record.atomJSON()), encoding: .utf8)
+    XCTAssertEqual(record.atomJSONString, expected)
   }
 }

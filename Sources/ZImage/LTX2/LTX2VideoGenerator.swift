@@ -89,6 +89,23 @@ public struct LTX2VideoRequest: Sendable {
     /// byte-identical to today's flat (joined) behavior.
     public var beatSchedule: [BeatSegment]?
 
+    /// comfybox#401 (review round 2, ruling 1): which app/persona submitted
+    /// this render (desktop/bree/kira/api…) — carried through to the
+    /// generation record so the mp4's provenance matches the PNG side's
+    /// `source` field. Not used by the render itself.
+    public var source: String?
+    /// comfybox#401 (review round 2, ruling 1): content mode
+    /// (neutral/apple/banana/avocado) at submit time — carried through to
+    /// the generation record. Not used by the render itself.
+    public var contentMode: String?
+    /// comfybox#401 (review round 2, ruling 6): `"source_aspect" |
+    /// "explicit" | "default"` from `VideoDimensionResolver` (#405/#408).
+    /// That resolver runs in `WarmServer.prepareLocalVideo`, one layer above
+    /// this request — the field exists here so #408 has one property to set
+    /// rather than a schema change; nothing populates it yet (#408 owns the
+    /// wire-up). Not used by the render itself.
+    public var dimensionReason: String?
+
     /// `loras`, with the deprecated single `loraPath`/`loraStrength` (if set)
     /// prepended — the single field always applied first, matching the old
     /// single-LoRA behavior when only it is set.
@@ -124,10 +141,16 @@ public struct LTX2VideoRequest: Sendable {
         tuning: LTX2VideoTuning? = nil,
         presetTuning: LTX2VideoTuning? = nil,
         audio: Bool = false,
-        beatSchedule: [BeatSegment]? = nil
+        beatSchedule: [BeatSegment]? = nil,
+        source: String? = nil,
+        contentMode: String? = nil,
+        dimensionReason: String? = nil
     ) {
         self.audio = audio
         self.beatSchedule = beatSchedule
+        self.source = source
+        self.contentMode = contentMode
+        self.dimensionReason = dimensionReason
         self.prompt = prompt
         self.negativePrompt = negativePrompt
         self.initImagePath = initImagePath
@@ -1757,7 +1780,6 @@ public final class LTX2VideoGenerator {
             twoStageRequested: pipeline.resolvedConfig.twoStage,
             refineSkippedReason: refineSkippedReason,
             audioWritten: audioTrack != nil)
-        let generationRecordJSON = try? generationRecord.encodeJSON()
 
         // comfybox#322: last boundary before anything is written to disk, so a
         // cancelled render never leaves a file at `outputPath` (the `defer`
@@ -1771,7 +1793,10 @@ public final class LTX2VideoGenerator {
             bitsPerPixelOverride: pipeline.resolvedConfig.videoBitsPerPx,
             audio: audioTrack,
             deliveryShortEdge: pipeline.resolvedConfig.deliveryShortEdge,
-            generationRecordJSON: generationRecordJSON.flatMap { String(data: $0, encoding: .utf8) })
+            // Bounded per ruling 5 — `atomJSONString` never exceeds
+            // `VideoGenerationRecord.atomSizeCap`; the sidecar below always
+            // carries the full record regardless.
+            generationRecordJSON: generationRecord.atomJSONString)
         wroteOutput = true
         telemetry?.end(.postProcess)
 

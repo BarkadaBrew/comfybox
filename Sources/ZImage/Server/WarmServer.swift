@@ -2661,7 +2661,15 @@ public final class WarmServer {
       tuning: Self.effectiveVideoTuning(for: req),
       presetTuning: videoPreset?.videoTuning,
       audio: req.audio ?? false,
-      beatSchedule: effectiveBeatSchedule
+      beatSchedule: effectiveBeatSchedule,
+      // comfybox#401 (review round 2, ruling 1): carried through only for
+      // the generation record — same values (and same absence-means-unset
+      // convention) as the PNG side's `source`/`content_mode`. `source`
+      // mirrors the `req.source ?? "api"` default `PreparedLocalVideo`
+      // resolves for the mode/audit fields, so the record and the job
+      // status agree on who submitted this render.
+      source: req.source ?? "api",
+      contentMode: req.contentMode
     )
   }
 
@@ -5286,7 +5294,10 @@ public final class WarmServer {
       model: "ltx2-storyboard",
       width: spec.output.width, height: spec.output.height,
       frames: montage.frameCount, fps: spec.output.fps,
-      resolvedWidth: spec.output.width, resolvedHeight: spec.output.height,
+      // comfybox#401 (review round 2, ruling 3): the COMPOSED output's
+      // actual dims, not the requested budget — `MontageResult` reports
+      // what it encoded.
+      resolvedWidth: montage.width, resolvedHeight: montage.height,
       twoPass: false, refine: false, audio: false,
       kind: "storyboard",
       loras: spec.loras.map {
@@ -5434,6 +5445,23 @@ public final class WarmServer {
     let elapsed = Int(Date().timeIntervalSince(start) * 1000)
     logger.info("Montage: wrote \(result.outputPath) (\(String(format: "%.2f", result.durationS))s, \(result.frameCount) frames) in \(elapsed)ms")
     auditLog.append(kind: "montage.compose", message: "\(segments.count) segments -> \(result.outputPath)", metadata: [:])
+
+    // comfybox#401 (review round 2, ruling 2): the plain `/v1/montage/compose`
+    // route is a different writer (`MontageComposer`, not
+    // `LTX2PostProcess.writeMP4`) and composites pre-rendered segments rather
+    // than running a model, so — like the storyboard assembly — it gets a
+    // sidecar-only aggregate record. `resolvedWidth`/`resolvedHeight` come
+    // from `result` (what the composer actually encoded), per ruling 3,
+    // though for this route they are always the same values as the request.
+    let montageRecord = VideoGenerationRecord(
+      prompt: "montage of \(segments.count) segment(s): "
+        + segments.map { ($0.path as NSString).lastPathComponent }.joined(separator: ", "),
+      model: "montage-composer",
+      width: width, height: height, frames: result.frameCount, fps: fps,
+      resolvedWidth: result.width, resolvedHeight: result.height,
+      twoPass: false, refine: false, audio: false, kind: "montage")
+    VideoSidecar.write(montageRecord, forMediaAt: result.outputPath)
+
     return result
   }
 
