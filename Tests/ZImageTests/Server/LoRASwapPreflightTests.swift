@@ -370,4 +370,91 @@ final class LoRASwapPreflightTests: XCTestCase {
     XCTAssertTrue(body.contains("\"lora_count\":1"), body)
     XCTAssertFalse(body.contains("unresolved"), "a 200 means every entry applied: \(body)")
   }
+
+  // MARK: - PR #418 re-review round 1
+
+  /// ~/.comfybox/loras is 87 symlinked LoRA files, 85 to LOCAL paths. A link
+  /// whose (lexical) chain ends at a real file resolves by bare name; one
+  /// into /Volumes does not — and neither is ever followed by the kernel.
+  func testSymlinkedLocalFileResolvesByBareNameButVolumesLinkDoesNot() throws {
+    let outside = FileManager.default.temporaryDirectory
+      .appendingPathComponent("lora-swap-outside-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: outside) }
+    try Data("x".utf8).write(to: outside.appendingPathComponent("plugin_lora.safetensors"))
+    let localLink = tempRoot.appendingPathComponent("plugin_lora.safetensors").path
+    try FileManager.default.createSymbolicLink(atPath: localLink, withDestinationPath: outside.path + "/plugin_lora.safetensors")
+    try FileManager.default.createSymbolicLink(
+      atPath: tempRoot.appendingPathComponent("bolt_lora.safetensors").path,
+      withDestinationPath: "/Volumes/Nope/loras/bolt_lora.safetensors")
+
+    let index = LoRAEntry.buildLocalIndex(roots: [tempRoot.path])
+    XCTAssertEqual(index["plugin_lora.safetensors"], localLink, "indexed under the link's own path")
+    XCTAssertNil(index["bolt_lora.safetensors"])
+
+    let preflight = try run([
+      LoRAEntry(path: "plugin_lora.safetensors", scale: nil),
+      LoRAEntry(path: "bolt_lora.safetensors", scale: nil),
+    ])
+    XCTAssertEqual(preflight.resolved.map(\.path), [localLink])
+    XCTAssertEqual(preflight.unresolved.map(\.path), ["bolt_lora.safetensors"])
+  }
+
+  /// `loRASourceExists` runs on the request task AND on queue recovery: a
+  /// /Volumes path is "not there" without a stat.
+  func testLoRASourceExistsIsFalseForRemovableVolumeWithoutStat() throws {
+    let start = Date()
+    XCTAssertFalse(WarmServer.loRASourceExists(LoRAEntry(path: "/Volumes/Nope/loras/x.safetensors", scale: nil)))
+    let link = tempRoot.appendingPathComponent("linked.safetensors").path
+    try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: "/Volumes/Nope/linked.safetensors")
+    XCTAssertFalse(WarmServer.loRASourceExists(LoRAEntry(path: link, scale: nil)))
+    XCTAssertLessThan(Date().timeIntervalSince(start), 1.0)
+    XCTAssertTrue(WarmServer.loRASourceExists(LoRAEntry(path: try touch("vault/real.safetensors"), scale: nil)))
+  }
+
+  private func makeStore() throws -> PresetStore {
+    let dir = tempRoot.appendingPathComponent("presets", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return PresetStore(path: dir.appendingPathComponent("presets.json"), seedDefaults: false)
+  }
+
+  /// The shared generate decode (`/v1/generate`, `/v1/generate/async` and
+  /// persisted-queue replay) refuses an explicit removable-volume LoRA
+  /// before anything is enqueued; a local one passes.
+  func testGenerateDecodeRefusesExplicitRemovableVolumeLoRA() throws {
+    let configuration = WarmServerConfiguration(allowedOutputDirectory: NSTemporaryDirectory())
+    let bad = Data(#"{"prompt":"x","loras":[{"path":"/Volumes/Nope/loras/x.safetensors","scale":0.5}]}"#.utf8)
+    XCTAssertThrowsError(
+      try WarmServer.decodedGeneratePayload(from: bad, store: try makeStore(), configuration: configuration)
+    ) { error in
+      guard case WarmServerError.invalidRequest(let message) = error else { return XCTFail("\(error)") }
+      XCTAssertTrue(message.hasPrefix(LoRAEntry.removableVolumeRefusalPrefix), message)
+      XCTAssertEqual(WarmServer.errorResponse(for: error).status, 400)
+    }
+    let local = try touch("vault/ok.safetensors")
+    let good = Data(#"{"prompt":"x","loras":[{"path":"\#(local)","scale":0.5}]}"#.utf8)
+    let accepted = try WarmServer.decodedGeneratePayload(from: good, store: try makeStore(), configuration: configuration)
+    XCTAssertEqual(accepted.loras?.map(\.path), [local])
+  }
+
+  /// A persisted generate job whose stack names a /Volumes path is dropped
+  /// at recovery — the decode throws, the failure is recorded on the job's
+  /// id (never enqueued, never stat'd), and the message carries the poison
+  /// prefix the recovery loop logs on.
+  func testPersistedGenerateJobWithRemovableVolumeLoRAIsDroppedAtReplay() throws {
+    let rawBody = Data(#"{"prompt":"x","loras":[{"path":"/Volumes/Nope/loras/x.safetensors"}]}"#.utf8)
+    let job = PersistedQueueJob(id: "poison-gen-1", kind: "generate", source: "api", enqueuedAt: Date(), rawBody: rawBody)
+    var failure: Error?
+    do {
+      _ = try WarmServer.decodedGeneratePayload(
+        from: job.rawBody, store: try makeStore(),
+        configuration: WarmServerConfiguration(allowedOutputDirectory: NSTemporaryDirectory()),
+        gateSubmission: false)
+    } catch { failure = error }
+    let error = try XCTUnwrap(failure)
+    XCTAssertTrue(error.localizedDescription.hasPrefix(LoRAEntry.removableVolumeRefusalPrefix))
+    let tracker = ImageJobTracker()
+    tracker.recordFailedReplay(jobId: job.id, source: job.source, error: error)
+    XCTAssertEqual(try XCTUnwrap(tracker.status(jobId: "poison-gen-1")).status, .failed)
+  }
 }

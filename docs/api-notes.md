@@ -138,8 +138,10 @@ the family guard and before anything is enqueued:
   first, then a recursive walk of `COMFYBOX_MODELS` and `~/.comfybox/loras`
   (nested subdirectories are fine). No external volumes, no HuggingFace, no
   downloads; a repo-id-shaped string is reported unresolved;
-- the walk never follows a symlink, never descends a symlinked directory,
-  never touches `/Volumes` (a candidate on or linking into a removable volume
+- the walk never follows a symlink with the kernel: a symlinked `.safetensors`
+  whose (lexical) link chain ends at a local file still resolves by bare name,
+  a symlinked directory is never descended, and the walk never touches
+  `/Volumes` (a candidate on or linking into a removable volume
   is reported `unresolved` with reason `removable-volume`, without a stat), and
   is bounded (depth 6, 20 000 entries, 2 s) with its result cached until the
   next `POST /v1/loras/scan` (or 60 s);
@@ -153,6 +155,12 @@ the family guard and before anything is enqueued:
 
 A persisted `lora_swap` job whose entries fail this preflight at crash
 recovery is dropped with a log line instead of being replayed.
+
+The generate path applies the same removable-volume rule: an explicit `loras`
+entry that is an absolute path on `/Volumes` is a 400 on `/v1/generate` and
+`/v1/generate/async` (never stat'd), a preset stack naming one falls back as an
+unresolvable preset as before, and a persisted generate job carrying one is
+dropped and recorded at crash recovery.
 
 ## Per-request LoRA stacks and the warm default (#282)
 

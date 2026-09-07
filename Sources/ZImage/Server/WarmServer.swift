@@ -2081,7 +2081,8 @@ public final class WarmServer {
       logger.warning("Nearline: refusing to stage \(name) — \(nearlineStagesInFlight.count) copies already parked (cap \(Self.nearlineStageMaxParkedThreads))")
       return .failed("nearline staging refused: \(Self.nearlineStageMaxParkedThreads) copies already in flight — is the nearline volume responding?")
     }
-    nearlineStagesInFlight[name] = now
+    let mark = now
+    nearlineStagesInFlight[name] = mark
     nearlineStageLock.unlock()
 
     let box = NearlineStageResultBox()
@@ -2090,7 +2091,10 @@ public final class WarmServer {
       let result = Result { try library.stage(name: name) }
       if let self {
         self.nearlineStageLock.lock()
-        self.nearlineStagesInFlight[name] = nil
+        // PR #418 re-review (item 3): only clear OUR mark — a thread that
+        // finishes late (after its mark expired and a newer attempt for
+        // the same name was started) must not erase the newer mark.
+        if self.nearlineStagesInFlight[name] == mark { self.nearlineStagesInFlight[name] = nil }
         self.nearlineStageLock.unlock()
       }
       box.finish(result)
@@ -5937,6 +5941,13 @@ public final class WarmServer {
     // warm pipeline happened to hold, on whatever base was active.
     var expanded = try expandGeneratePayload(
       payload, store: store, stageNearline: stageNearline, loraExists: loraExists, log: log)
+    // PR #418 re-review (item 2): an EXPLICIT `loras` entry that is an
+    // absolute path on a removable volume is refused here — a 400 on the
+    // live routes, a dropped-and-recorded job on queue recovery — without a
+    // stat (a preset stack naming one already fell back above via
+    // `loraExists`). Left alone, `resolveSource` would take the path at its
+    // word and the loader would stat a hung mount on the actor at dequeue.
+    try LoRAEntry.refuseRemovableVolumeEntries(expanded.loras ?? [])
     // Todd 2026-08-24 ("I prefer style pack"): collapse the request's and the
     // preset's look declarations onto ONE resolved `style` name.
     //
@@ -6109,6 +6120,11 @@ public final class WarmServer {
     guard let configuration = try? entry.makeConfiguration() else { return false }
     switch configuration.source {
     case .local(let url):
+      // PR #418 re-review (item 2): this runs on the request task AND on
+      // queue recovery, where a `fileExists` on a hung /Volumes mount stalls
+      // the replay of every remaining job. A path on (or linking into) a
+      // removable volume is "not there" without a stat.
+      if LoRAEntry.classifyWithoutFollowing(url.path) == .removableVolume { return false }
       return FileManager.default.fileExists(atPath: url.path)
     case .huggingFace:
       return true
@@ -6360,6 +6376,12 @@ public final class WarmServer {
           // WP-E4 (D22, AC-18): a persisted job that fails replay is marked
           // FAILED with the reason on its own id (GET /v1/generate/status/{id})
           // and in the audit log — never rendered, never silently dropped.
+          // PR #418 re-review (item 2): a persisted job whose LoRA stack names
+          // a removable-volume path is a poison job — say so explicitly (the
+          // swap case above logs its own line before throwing).
+          if error.localizedDescription.hasPrefix(LoRAEntry.removableVolumeRefusalPrefix) {
+            logger.warning("Queue recovery: dropping poison \(job.kind) job \(job.id) — \(error.localizedDescription)")
+          }
           logger.error("Queue recovery: job \(job.id) (\(job.kind)) failed — \(error.localizedDescription)")
           // #339 review r4, item 3: a failed lora_swap replay is recorded
           // here too, not just generate — there is no dedicated swap-job
@@ -14688,6 +14710,25 @@ struct LoRAEntry: Codable, Sendable {
     }
   }
 
+  private static let walkLogger = Logger(label: "z-image.lora-walk")
+
+  /// Message prefix of the refusal thrown for a removable-volume LoRA, so the
+  /// recovery loop can recognise a poison job without a dedicated error case.
+  static let removableVolumeRefusalPrefix = "removable-volume:"
+
+  /// PR #418 re-review (item 2): refuse any EXPLICIT direct-path entry that
+  /// is on (or links into) `/Volumes` — classified without a stat.
+  static func refuseRemovableVolumeEntries(_ entries: [LoRAEntry]) throws {
+    for entry in entries where looksLikeDirectPath(entry.path) {
+      let expanded = (entry.path as NSString).expandingTildeInPath
+      if classifyWithoutFollowing(expanded) == .removableVolume {
+        throw WarmServerError.invalidRequest(
+          message: "\(removableVolumeRefusalPrefix) LoRA '\(entry.path)' is on /Volumes, which is never read on a "
+            + "request or recovery path (a hung mount would park the engine) — copy the file into the LoRA library")
+      }
+    }
+  }
+
   /// Bounds on the bare-name walk (PR #418 review, Critical 1).
   static let walkMaxDepth = 6
   static let walkMaxEntries = 20_000
@@ -14739,12 +14780,17 @@ struct LoRAEntry: Codable, Sendable {
       ) else { continue }
       for case let url as URL in enumerator {
         entries += 1
-        if entries > walkMaxEntries || Date() > deadline { return byName }
-        // The entry ITSELF, by lstat: a symlink (to anything — a directory
-        // on Bolt, a file outside the roots) is never a candidate and is
-        // never descended. `skipDescendants()` is only ever called for a
-        // real directory: Foundation applies it to the NEXT directory when
-        // the current item is a leaf, which silently skipped a sibling tree.
+        if entries > walkMaxEntries || Date() > deadline {
+          let cutShort = "LoRA walk under \(roots.joined(separator: ", ")) cut short at \(entries) entries "
+            + "(bounds: \(walkMaxEntries) entries / \(Int(walkMaxSeconds))s) — partial index cached "
+            + "for \(Int(localIndexTTL))s or until POST /v1/loras/scan; a name it missed reads as unresolved"
+          walkLogger.warning("\(cutShort)")
+          return byName
+        }
+        // The entry ITSELF, by lstat. `skipDescendants()` is only ever
+        // called for a real directory: Foundation applies it to the NEXT
+        // directory when the current item is a leaf, which silently skipped
+        // a sibling tree.
         var info = stat()
         guard lstat(url.path, &info) == 0 else { continue }
         switch info.st_mode & S_IFMT {
@@ -14757,6 +14803,16 @@ struct LoRAEntry: Codable, Sendable {
                 !url.path.hasPrefix(removableVolumePrefix)
           else { continue }
           if byName[url.lastPathComponent] == nil { byName[url.lastPathComponent] = url.path }
+        case S_IFLNK:
+          // PR #418 re-review (item 1): ~/.comfybox/loras is 87 symlinked
+          // LoRA files, 85 of them to LOCAL paths — those must keep
+          // resolving by bare name. Classified lexically (readlink chain,
+          // no kernel follow): a link whose chain ends at a regular file is
+          // indexed under the LINK's path; a chain into /Volumes stays
+          // excluded; a link to a directory is never descended.
+          if classifyWithoutFollowing(url.path) == .file, byName[url.lastPathComponent] == nil {
+            byName[url.lastPathComponent] = url.path
+          }
         default:
           continue
         }
