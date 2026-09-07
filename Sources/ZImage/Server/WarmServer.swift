@@ -2207,9 +2207,14 @@ public final class WarmServer {
     /// (`source_aspect` | `explicit` | `default`). Additive — an older client
     /// ignores the extra keys, and the unknown-field-ignored convention means
     /// an older engine simply never sends them.
+    /// The FINAL output dims — after the two-stage convention (the refine
+    /// doubles stage-1 back), so these name the size the file actually has.
     let resolvedWidth: Int
     let resolvedHeight: Int
     let dimensionReason: String
+    /// Non-nil only for a two-stage render: the dims stage 1 painted at.
+    let stage1Width: Int?
+    let stage1Height: Int?
   }
 
   /// Submit a video render to the paid Replicate cloud proxy and return its 202
@@ -2765,6 +2770,7 @@ public final class WarmServer {
     // the fix — see the resolver's `resolve` doc comment).
     let namedDims = Self.videoDims(resolution: req.resolution, aspectRatio: req.aspectRatio)
     let videoConfigDefaults = ServerConfigStore.shared.videoDefaults()
+    let imageMemoryCaps = ServerConfigStore.shared.imageMemoryCaps()
     let sourceSize = effectiveInitImage.flatMap { Self.imagePixelSize(atPath: $0) }
     let resolvedDims = VideoDimensionResolver.resolve(
       requestWidth: req.width, requestHeight: req.height,
@@ -2772,7 +2778,12 @@ public final class WarmServer {
       presetWidth: videoPreset?.width, presetHeight: videoPreset?.height,
       configWidth: videoConfigDefaults.width, configHeight: videoConfigDefaults.height,
       sourceWidth: sourceSize?.width, sourceHeight: sourceSize?.height,
-      aspectRatio: req.aspectRatio)
+      aspectRatio: req.aspectRatio,
+      // comfybox#405 review ruling 3: the engine's existing resolution caps
+      // (#363) are the upper clamp. No video render has ever approached them
+      // (the largest in the log is 1344x768), so this never touches a real
+      // request — it stops a degenerate source from sizing an allocation.
+      maxLongEdge: imageMemoryCaps.maxLongEdge, maxPixels: imageMemoryCaps.maxPixels)
     var renderWidth = resolvedDims.width
     var renderHeight = resolvedDims.height
     if req.width == nil, let nd = namedDims {
@@ -2796,7 +2807,9 @@ public final class WarmServer {
     // and matches all validated two-stage renders (stage 1 at 448x256 etc.).
     // Typed resolution honors request/preset tuning overrides (finding #18):
     // a request can enable two-stage without the plist knowing.
-    if LTX2ConfigResolver.resolveTyped(request: effectiveTuning, preset: videoPreset?.videoTuning).twoStage {
+    let resolvedTwoStage = LTX2ConfigResolver.resolveTyped(
+      request: effectiveTuning, preset: videoPreset?.videoTuning).twoStage
+    if resolvedTwoStage {
       let s1 = Self.stageOneDims(finalWidth: renderWidth, finalHeight: renderHeight)
       if s1.halved {
         logger.info(
@@ -2813,6 +2826,21 @@ public final class WarmServer {
           """)
       }
     }
+    // comfybox#405 review ruling 2: what the CALLER receives is not what the
+    // generator is handed. With two-stage on, `renderWidth`/`renderHeight` are
+    // now the STAGE-1 dims and the refine doubles them back, so the reported
+    // `resolved_width`/`resolved_height` must be computed HERE, after the
+    // mutation above — otherwise they name a size no file ever has.
+    let outputDims = VideoDimensionResolver.outputDims(
+      generatorWidth: renderWidth, generatorHeight: renderHeight,
+      twoStage: resolvedTwoStage)
+    let renderDimensions = ResolvedVideoDimensions(
+      width: outputDims.width, height: outputDims.height,
+      reason: resolvedDims.reason,
+      budgetWidth: resolvedDims.budgetWidth, budgetHeight: resolvedDims.budgetHeight,
+      sourceWidth: resolvedDims.sourceWidth, sourceHeight: resolvedDims.sourceHeight,
+      stage1Width: resolvedTwoStage ? renderWidth : nil,
+      stage1Height: resolvedTwoStage ? renderHeight : nil)
     if let requestedSteps = req.steps, requestedSteps != 8 {
       logger.warning(
         "LTX-2: steps=\(requestedSteps) requested, but the distilled pipeline uses a fixed 8-step sigma schedule — the value is currently ignored (#219)")
@@ -2954,7 +2982,71 @@ public final class WarmServer {
       optimizationAttemptId: req.optimizationAttemptId,
       enhancementSkippedReason: enhancementSkippedReason,
       beatScheduleIgnoredReason: beatScheduleIgnoredReason,
-      resolvedDimensions: resolvedDims)
+      resolvedDimensions: renderDimensions)
+  }
+
+  /// The submitted-event trace payload for a local video render.
+  ///
+  /// comfybox#405 (review ruling 5): pulled out of the async route so the
+  /// SYNC `/v1/video/generate` path writes the identical set of fields. Two
+  /// hand-maintained copies of a payload dictionary drift — `resolved_width`
+  /// existing on one route and not the other is exactly the invisibility this
+  /// ticket is about.
+  private static func videoTracePayload(
+    prep: PreparedLocalVideo, body: Data
+  ) -> [String: String] {
+    var tracePayload: [String: String] = ["prompt": prep.request.prompt]
+    if prep.request.audio {
+      tracePayload["has_audio"] = "true"
+      tracePayload["audio_seconds"] = String(format: "%.2f",
+        Float(prep.request.framesPerChunk) / Float(prep.request.fps))
+    }
+    if let attemptId = prep.optimizationAttemptId {
+      tracePayload["optimization_attempt_id"] = attemptId
+    }
+    // comfybox#328: visible on GET /v1/video/traces (RenderTraceStore.
+    // TraceSummary carries both fields explicitly — see finding 2) —
+    // confirms a beat_schedule request actually skipped enhancement
+    // instead of silently losing its beats to the rewrite.
+    if let reason = prep.enhancementSkippedReason {
+      tracePayload["enhancement_skipped"] = reason
+    }
+    if let reason = prep.beatScheduleIgnoredReason {
+      tracePayload["beat_schedule_ignored"] = reason
+    }
+    // Winner actions (2026-08-10): store the sanitized request + the
+    // resolved seed/dims so this render_id is replayable — /v1/video/rerender
+    // replays it at 720p, /v1/video/extend chains a continuation.
+    if let requestJSON = VideoWinnerActions.sanitizedRequestJSON(fromBody: body) {
+      tracePayload["request_json"] = requestJSON
+    }
+    tracePayload["seed"] = String(prep.request.seed)
+    tracePayload["width"] = String(prep.request.width)
+    tracePayload["height"] = String(prep.request.height)
+    tracePayload["frames"] = String(prep.request.framesPerChunk)
+    tracePayload["fps"] = String(prep.request.fps)
+    // comfybox#405: the FINAL output dims and WHY. `width`/`height` above are
+    // the dims handed to the generator (the STAGE-1 half when two-stage is
+    // on); `resolved_*` is what the caller actually receives, alongside the
+    // budget the shape was fitted into and the reason it was chosen — so a
+    // wrong-shaped clip can be diagnosed from the trace alone.
+    tracePayload["resolved_width"] = String(prep.resolvedDimensions.width)
+    tracePayload["resolved_height"] = String(prep.resolvedDimensions.height)
+    tracePayload["dimension_reason"] = prep.resolvedDimensions.reason.rawValue
+    tracePayload["dimension_budget"] =
+      "\(prep.resolvedDimensions.budgetWidth)x\(prep.resolvedDimensions.budgetHeight)"
+    if let sw = prep.resolvedDimensions.sourceWidth,
+       let sh = prep.resolvedDimensions.sourceHeight {
+      tracePayload["source_size"] = "\(sw)x\(sh)"
+    }
+    if let s1w = prep.resolvedDimensions.stage1Width,
+       let s1h = prep.resolvedDimensions.stage1Height {
+      tracePayload["stage1_size"] = "\(s1w)x\(s1h)"
+    }
+    if let initImage = prep.request.initImagePath {
+      tracePayload["image_path"] = initImage
+    }
+    return tracePayload
   }
 
   /// If LTX-2 is configured, ASYNC-submit the local render and return 202 + a
@@ -2978,53 +3070,7 @@ public final class WarmServer {
     do {
       guard let prep = try await prepareLocalVideo(body: body) else { return nil }
       logger.info("LTX-2: local video job submitted (\(prep.request.width)x\(prep.request.height), \(prep.request.framesPerChunk)f, dims \(prep.resolvedDimensions.reason.rawValue))")
-      var tracePayload: [String: String] = ["prompt": prep.request.prompt]
-      if prep.request.audio {
-        tracePayload["has_audio"] = "true"
-        tracePayload["audio_seconds"] = String(format: "%.2f",
-          Float(prep.request.framesPerChunk) / Float(prep.request.fps))
-      }
-      if let attemptId = prep.optimizationAttemptId {
-        tracePayload["optimization_attempt_id"] = attemptId
-      }
-      // comfybox#328: visible on GET /v1/video/traces (RenderTraceStore.
-      // TraceSummary carries both fields explicitly — see finding 2) —
-      // confirms a beat_schedule request actually skipped enhancement
-      // instead of silently losing its beats to the rewrite.
-      if let reason = prep.enhancementSkippedReason {
-        tracePayload["enhancement_skipped"] = reason
-      }
-      if let reason = prep.beatScheduleIgnoredReason {
-        tracePayload["beat_schedule_ignored"] = reason
-      }
-      // Winner actions (2026-08-10): store the sanitized request + the
-      // resolved seed/dims so this render_id is replayable — /v1/video/rerender
-      // replays it at 720p, /v1/video/extend chains a continuation.
-      if let requestJSON = VideoWinnerActions.sanitizedRequestJSON(fromBody: body) {
-        tracePayload["request_json"] = requestJSON
-      }
-      tracePayload["seed"] = String(prep.request.seed)
-      tracePayload["width"] = String(prep.request.width)
-      tracePayload["height"] = String(prep.request.height)
-      tracePayload["frames"] = String(prep.request.framesPerChunk)
-      tracePayload["fps"] = String(prep.request.fps)
-      // comfybox#405: the resolver's answer and WHY. `width`/`height` above
-      // are the dims handed to the generator (already halved when two-stage
-      // is on); these are the OUTPUT dims the resolver settled on, the budget
-      // it fitted into, and the reason it chose that shape — so a
-      // wrong-shaped clip can be diagnosed from the trace alone.
-      tracePayload["resolved_width"] = String(prep.resolvedDimensions.width)
-      tracePayload["resolved_height"] = String(prep.resolvedDimensions.height)
-      tracePayload["dimension_reason"] = prep.resolvedDimensions.reason.rawValue
-      tracePayload["dimension_budget"] =
-        "\(prep.resolvedDimensions.budgetWidth)x\(prep.resolvedDimensions.budgetHeight)"
-      if let sw = prep.resolvedDimensions.sourceWidth,
-         let sh = prep.resolvedDimensions.sourceHeight {
-        tracePayload["source_size"] = "\(sw)x\(sh)"
-      }
-      if let initImage = prep.request.initImagePath {
-        tracePayload["image_path"] = initImage
-      }
+      let tracePayload = Self.videoTracePayload(prep: prep, body: body)
       let status = videoJobTracker.submit(
         source: prep.source, mode: prep.mode, coordinator: coordinator,
         // Snapshot at SUBMIT time (finding #15): the authoritative resolution
@@ -3256,15 +3302,40 @@ public final class WarmServer {
       let generator = prep.generator
       let videoRequest = prep.request
 
-      logger.info("LTX-2: local video request queued (\(videoRequest.width)x\(videoRequest.height), \(videoRequest.framesPerChunk)f)")
-      let result = try await coordinator.enqueueLocalVideo(wantsAudio: videoRequest.audio) { report in
-        // #1479: preemptible entry — see the async path's doc comment above.
-        try generator.generatePreemptible(videoRequest) { chunk, totalChunks, step, totalSteps in
-          report(Self.localVideoProgressPercent(
-            chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps))
-          self.ltx2StepPosition.update(chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps)
+      logger.info("LTX-2: local video request queued (\(videoRequest.width)x\(videoRequest.height), \(videoRequest.framesPerChunk)f, dims \(prep.resolvedDimensions.reason.rawValue))")
+      // comfybox#405 (review ruling 5): the sync route used to write NO trace
+      // at all — a `/v1/video/generate` render was invisible to
+      // GET /v1/video/traces and to every winner action. It now writes the
+      // SAME submitted payload the async route does (one shared builder), and
+      // a terminal event, so both routes are equally diagnosable.
+      let syncRenderId = UUID().uuidString
+      renderTraceStore.append(RenderTraceEvent(
+        renderId: syncRenderId, event: .submitted, taskKind: .videoRender,
+        payload: Self.videoTracePayload(prep: prep, body: body)))
+      let result: LTX2VideoResult
+      do {
+        result = try await coordinator.enqueueLocalVideo(wantsAudio: videoRequest.audio) { report in
+          // #1479: preemptible entry — see the async path's doc comment above.
+          try generator.generatePreemptible(videoRequest) { chunk, totalChunks, step, totalSteps in
+            report(Self.localVideoProgressPercent(
+              chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps))
+            self.ltx2StepPosition.update(chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps)
+          }
         }
+      } catch {
+        renderTraceStore.append(RenderTraceEvent(
+          renderId: syncRenderId, event: .terminal, taskKind: .videoRender,
+          payload: ["status": "failed", "error": "\(error)"]))
+        throw error
       }
+      renderTraceStore.append(RenderTraceEvent(
+        renderId: syncRenderId, event: .terminal, taskKind: .videoRender,
+        payload: [
+          "status": "succeeded",
+          "output_path": result.outputPath,
+          "frames": String(result.frameCount),
+          "refine_skipped": result.refineSkippedReason ?? "",
+        ].filter { !$0.value.isEmpty }))
       auditLog.append(kind: "video.local", message: "LTX-2 video \(result.frameCount)f -> \(result.outputPath)")
       return .json(status: 200, payload: LocalVideoResponse(
         success: true,
@@ -3278,7 +3349,9 @@ public final class WarmServer {
         refineSkipped: result.refineSkippedReason,
         resolvedWidth: prep.resolvedDimensions.width,
         resolvedHeight: prep.resolvedDimensions.height,
-        dimensionReason: prep.resolvedDimensions.reason.rawValue
+        dimensionReason: prep.resolvedDimensions.reason.rawValue,
+        stage1Width: prep.resolvedDimensions.stage1Width,
+        stage1Height: prep.resolvedDimensions.stage1Height
       ))
     } catch let error as LTX2VideoError {
       return .error(.error(status: 400, message: error.localizedDescription))
