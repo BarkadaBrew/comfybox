@@ -147,13 +147,55 @@ final class StylePackFamilyGateTests: XCTestCase {
 
   /// `PresetStore.lookup` returns `(preset, invalidReason)`. A preset flagged
   /// invalid at load contributes nothing — not its stack, not its model, and
-  /// not its look. Reading only `.0` (the first cut of this merge) adopted a
-  /// look off a document the engine had already refused to trust.
-  func testInvalidPresetDoesNotContributeItsStyle() throws {
+  /// not its look: the document itself is what the engine refused to trust.
+  ///
+  /// But it must not be DROPPED either (review r2, ruling 1). `PresetLoRAStack`'s
+  /// "an unexpandable preset is a label, never a 400" rule is about the
+  /// RECIPE — an unknown preset id was harmless provenance for the daemon's
+  /// whole life. A `style` is the caller asking for a visible change to the
+  /// pixels, so when the ONLY look on the request came off a preset the
+  /// engine will not use, it is a 400 naming the preset, the look and why.
+  func testAStyleDeclaredOnlyByAnInvalidPresetIsA400() throws {
     let store = try storeWithInvalidStyledPreset(style: "trix-bw")
+    XCTAssertThrowsError(try decode(#"{"prompt":"x","preset":"broken"}"#, store: store)) { error in
+      guard case WarmServerError.styleFromUnusablePreset(
+        let preset, let style, let code, let reason) = error
+      else { return XCTFail("expected .styleFromUnusablePreset, got \(error)") }
+      XCTAssertEqual(preset, "broken")
+      XCTAssertEqual(style, "trix-bw")
+      XCTAssertEqual(code, "invalid_preset")
+      XCTAssertFalse(reason.isEmpty, "the refusal must carry the store's own reason")
+      let response = WarmServer.errorResponse(for: error)
+      XCTAssertEqual(response.status, 400)
+      let body = String(data: response.body, encoding: .utf8) ?? ""
+      XCTAssertTrue(body.contains("trix-bw"), "the 400 must name the look")
+      XCTAssertTrue(body.contains("broken"), "the 400 must name the preset")
+      XCTAssertTrue(body.contains("invalid_preset"), "the 400 must name the reason")
+    }
+  }
+
+  /// The scope of that rule: an invalid preset that declares NO look is
+  /// untouched — still a label, still never a 400, still reported through
+  /// `preset_unresolved_reason`. The refusal is about a dropped LOOK, not
+  /// about presets.
+  func testAnInvalidPresetWithNoStyleKeepsTheLabelBehaviour() throws {
+    let dir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("comfybox-stylegate-plain-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+    let path = dir.appendingPathComponent("presets.json")
+    let json = """
+    [{"id":"broken","name":"Broken","mediaKind":"image","model":"krea2-raw",
+      "loras":[],"checkpointFamily":"raw-accel","steps":-1}]
+    """
+    try Data(json.utf8).write(to: path)
+    let store = PresetStore(path: path, seedDefaults: false)
+    XCTAssertNotNil(store.lookup("broken").invalidReason, "precondition")
+    XCTAssertNil(store.lookup("broken").preset?.style, "precondition: no look declared")
+
     let payload = try decode(#"{"prompt":"x","preset":"broken"}"#, store: store)
-    XCTAssertEqual(payload.presetUnresolvedReason, "invalid_preset", "precondition")
-    XCTAssertNil(payload.style, "an invalid preset must not lend its look either")
+    XCTAssertEqual(payload.presetUnresolvedReason, "invalid_preset")
+    XCTAssertNil(payload.style)
   }
 
   /// The same preset shape, VALID: the look is adopted — so the test above
@@ -179,9 +221,9 @@ final class StylePackFamilyGateTests: XCTestCase {
     XCTAssertEqual(payload.style, "hp5-soft")
   }
 
-  /// The invalid preset's own `phone_look` alias is refused for the same
-  /// reason — the shim must not be a way around the validity flag.
-  func testInvalidPresetPhoneLookAliasIsAlsoIgnored() throws {
+  /// The invalid preset's own `phone_look` alias takes the same route — the
+  /// shim must not be a way around either the validity flag or the refusal.
+  func testInvalidPresetPhoneLookAliasIsRefusedToo() throws {
     let dir = FileManager.default.temporaryDirectory
       .appendingPathComponent("comfybox-stylegate-invalid-alias-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -196,8 +238,12 @@ final class StylePackFamilyGateTests: XCTestCase {
     XCTAssertNotNil(store.lookup("broken").invalidReason, "precondition")
     XCTAssertEqual(store.lookup("broken").preset?.phoneLook, true, "precondition")
 
-    let payload = try decode(#"{"prompt":"x","preset":"broken"}"#, store: store)
-    XCTAssertNil(payload.style)
+    XCTAssertThrowsError(try decode(#"{"prompt":"x","preset":"broken"}"#, store: store)) { error in
+      guard case WarmServerError.styleFromUnusablePreset(_, let style, let code, _) = error
+      else { return XCTFail("expected .styleFromUnusablePreset, got \(error)") }
+      XCTAssertEqual(style, StylePack.phone.rawValue, "the alias resolves before it is refused")
+      XCTAssertEqual(code, "invalid_preset")
+    }
   }
 
   // MARK: 3 — provenance (ruling 3)
@@ -257,18 +303,116 @@ final class StylePackFamilyGateTests: XCTestCase {
     XCTAssertTrue(json.contains("\"style\":\"trix-bw\""))
   }
 
-  /// …and the no-look case is unchanged end to end: passing `style: nil`
-  /// produces the exact bytes the pre-#399 call site produced.
-  func testUnstyledMetadataIsByteIdenticalToThePre399Call() {
+  /// Unstyled metadata carries NO `style` key, and its top-level key set is
+  /// exactly the pre-#399 one.
+  ///
+  /// (Review r2, ruling 4: this test used to compare `generation(…)` to
+  /// `generation(…, style: nil)` and call the result "byte-identical to the
+  /// pre-#399 call" — a comparison of the new API with itself, which pins the
+  /// default-argument behaviour and nothing more. The checked-in key list
+  /// below is the actual fixture: `style` is the only key #399 can add, so a
+  /// set that matches this literal is the set main produced for these
+  /// inputs.)
+  func testUnstyledMetadataCarriesNoStyleKeyAndThePre399KeySet() throws {
     let record = RenderRecipeFixture.recipe(steps: 8)
-    let before = QwenImageIO.ImageMetadata.generation(
+    let unstyled = QwenImageIO.ImageMetadata.generation(
       prompt: "a portrait", seed: 44821, steps: 8, guidance: 1.0,
       width: 1024, height: 1024, model: "krea2-raw",
       appliedSlot: AppliedRecordSlot(record: record))
-    let after = QwenImageIO.ImageMetadata.generation(
+    let json = try XCTUnwrap(unstyled.parametersJSON)
+    let object = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+    XCTAssertEqual(
+      Set(object.keys),
+      ["applied", "guidance", "height", "model", "prompt", "seed", "steps", "width"],
+      "an unstyled render's metadata keys must be the pre-#399 set")
+    XCTAssertNil(object["style"])
+
+    // The default argument is the no-look path — deleting `style: nil` from a
+    // call site must not change what it writes.
+    let explicitNil = QwenImageIO.ImageMetadata.generation(
       prompt: "a portrait", seed: 44821, steps: 8, guidance: 1.0,
       width: 1024, height: 1024, model: "krea2-raw",
       appliedSlot: AppliedRecordSlot(record: record), style: nil)
-    XCTAssertEqual(before.parametersJSON, after.parametersJSON)
+    XCTAssertEqual(unstyled.parametersJSON, explicitNil.parametersJSON)
+  }
+
+  // MARK: 4 — one shared resolution, and the bridge's batch loop (r2, 2 & 3)
+
+  /// The gate and the save-path apply must read the SAME resolution. They did
+  /// not: `styleGate` resolved the `phone_look` alias while the apply site
+  /// read `style` alone, so a payload carrying `phone_look: true` and no
+  /// `style` was refused on chroma/fibo/flux and rendered UNSTYLED on krea2.
+  /// `effectiveStyleName` is now the one answer both ask for.
+  func testGateAndApplyReadTheSameResolution() throws {
+    let store = try makeStore()
+    var aliasOnly = try decode(#"{"prompt":"x"}"#, store: store)
+    aliasOnly.phoneLook = true
+    aliasOnly.style = nil
+
+    // What the save path resolves — the same call `runKrea2Generate` makes.
+    XCTAssertEqual(StylePack.resolved(aliasOnly.effectiveStyleName), .phone)
+    // What the gate resolves.
+    XCTAssertNil(GeneratePayload.styleGate(aliasOnly, family: .krea2))
+    XCTAssertNotNil(GeneratePayload.styleGate(aliasOnly, family: .fibo))
+
+    // …and every shape agrees between the two.
+    for (styleField, alias) in [
+      (String?.none, Bool?.none), (nil, true), (nil, false),
+      ("trix-bw", nil), ("trix-bw", true), ("hp5-soft", false),
+    ] as [(String?, Bool?)] {
+      var p = try decode(#"{"prompt":"x"}"#, store: store)
+      p.style = styleField
+      p.phoneLook = alias
+      let applied = StylePack.resolved(p.effectiveStyleName)?.rawValue
+      let gated = GeneratePayload.styleGate(p, family: .fibo) != nil
+      XCTAssertEqual(
+        applied != nil, gated,
+        "gate and apply disagree for style=\(styleField as Any) phone_look=\(alias as Any)")
+    }
+  }
+
+  /// The ComfyUI bridge's batch loop derives a per-item payload. It used to
+  /// REBUILD `GeneratePayload` field by field and silently dropped every
+  /// field the rebuild did not mention — `style`/`phone_look` were the third
+  /// instance of that bug in this feature alone. `batchItem` copies and
+  /// overrides ONE field, so there is nothing left to forget.
+  func testBridgeBatchItemCarriesEveryFieldAndOverridesOnlyTheSeed() throws {
+    let store = try makeStore()
+    var preset = ImagePreset(
+      id: "krea-kira", name: "Kira", mediaKind: "image", model: "krea2-raw", steps: 12,
+      loras: [LoraReference(filename: "krea2_turbo_distill_r256.safetensors", scale: 0.6, role: "accel")],
+      checkpointFamily: "raw-accel")
+    preset.style = "hp5-soft"
+    try store.upsert(preset)
+    var payload = try decode(#"""
+      {"prompt":"a portrait","negative_prompt":"blurry","preset":"krea-kira",
+       "width":1024,"height":1536,"seed":1,"content_mode":"apple","source":"comfyui",
+       "scheduler":"res_2s","sigma_schedule":"beta57","shift":1.15}
+      """#, store: store)
+    payload.phoneLook = true
+
+    let item = GeneratePayload.batchItem(payload, seed: 99)
+
+    XCTAssertEqual(item.seed, 99, "the seed is the one thing that changes")
+    XCTAssertEqual(item.style, "hp5-soft", "the resolved look must survive the batch loop")
+    XCTAssertEqual(item.phoneLook, true)
+    XCTAssertEqual(item.effectiveStyleName, payload.effectiveStyleName)
+    // …and the rest of the accepted request, which the old rebuild also lost.
+    XCTAssertEqual(item.prompt, payload.prompt)
+    XCTAssertEqual(item.negativePrompt, payload.negativePrompt)
+    XCTAssertEqual(item.preset, payload.preset)
+    XCTAssertEqual(item.model, payload.model)
+    XCTAssertEqual(item.steps, payload.steps)
+    XCTAssertEqual(item.guidance, payload.guidance)
+    XCTAssertEqual(item.shift, payload.shift)
+    XCTAssertEqual(item.scheduler, payload.scheduler)
+    XCTAssertEqual(item.sigmaSchedule, payload.sigmaSchedule)
+    XCTAssertEqual(item.contentMode, payload.contentMode)
+    XCTAssertEqual(item.source, payload.source)
+    XCTAssertEqual(item.width, payload.width)
+    XCTAssertEqual(item.height, payload.height)
+    XCTAssertEqual(item.loras?.map(\.path), payload.loras?.map(\.path))
+    XCTAssertEqual(item.presetStackApplied, payload.presetStackApplied)
   }
 }

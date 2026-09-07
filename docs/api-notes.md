@@ -475,9 +475,20 @@ landing on the wrong base; a post-process has no base to land on.
 
 **Read from the DECLARED preset, never from `ResolvedPreset`** — the same rule
 as `steps`/`guidance`/`vae`/`shift` — so `PresetDefaults` can never manufacture
-a look nobody asked for. A preset the store flagged **invalid** (WP-E20,
-AC-44c) contributes nothing, its look included: `PresetStore.lookup` returns
-the preset *and* its validity flag, and both are read.
+a look nobody asked for.
+
+**A preset the store flagged invalid lends nothing — and says so.** WP-E20 /
+AC-44c: `PresetStore.lookup` returns the preset *and* its validity flag, and
+both are read. An invalid document is not trusted for its look any more than
+for its stack. But the look is not silently dropped either: when the **only**
+look on the request came from an invalid preset, that is a **400** naming the
+preset, the look and the reason (`invalid_preset` plus the store's own
+message). `PresetLoRAStack`'s "an unexpandable preset is a label, never a 400"
+rule is about the *recipe* — an unknown preset id was harmless provenance for
+the daemon's whole life. A `style` is the caller asking for a visible change to
+the pixels, and not making it silently is the failure mode this feature is not
+allowed to have. An invalid preset that declares **no** look keeps the old
+behaviour exactly: a label, no 400, `preset_unresolved_reason` in the response.
 
 **Provenance.** A styled render records the look it applied in two places, both
 read back after the pass rather than echoed from the request:
