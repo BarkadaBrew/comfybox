@@ -108,15 +108,43 @@ final class LocalVideoRequestDecodeTests: XCTestCase {
   // the single, non-bypassable path from a decoded request to the
   // constructed request's `.tuning`.
 
-  private func buildRequest(_ json: String, preset: ImagePreset? = nil) throws -> LTX2VideoRequest {
+  private func buildRequest(
+    _ json: String, preset: ImagePreset? = nil,
+    initImage: String? = nil, dimensionReason: String? = nil
+  ) throws -> LTX2VideoRequest {
     let req = try decodeLocalVideoRequest(json)
     return WarmServer.buildLocalVideoRequest(
       req: req, videoPreset: preset,
-      effectivePrompt: req.prompt, effectiveInitImage: nil,
+      effectivePrompt: req.prompt, effectiveInitImage: initImage,
       renderWidth: 704, renderHeight: 448,
       foldedFramesPerChunk: 97, foldedExtendSeconds: 0,
       resolvedLoRAs: [], effectiveBeatSchedule: nil,
-      resolvedOutput: "/tmp/o.mp4")
+      resolvedOutput: "/tmp/o.mp4",
+      dimensionReason: dimensionReason)
+  }
+
+  // MARK: - comfybox#405: the dimension_reason wire-up reaches the request
+  //
+  // comfybox#401 shipped `dimensionReason` on `LTX2VideoRequest` and on the
+  // generation record, always nil, with the wire-up left to this ticket. The
+  // record is built from `request.dimensionReason`, so if it does not survive
+  // THIS construction the sidecar goes on writing null. This is the same
+  // non-bypassable path the `tuning:` tests above pin.
+
+  func testBuildLocalVideoRequestCarriesTheDimensionReason() throws {
+    let i2v = try buildRequest(
+      #"{"prompt":"x"}"#, initImage: "/tmp/kira.png",
+      dimensionReason: VideoDimensionReason.sourceAspect.rawValue)
+    XCTAssertEqual(i2v.dimensionReason, "source_aspect")
+
+    let t2v = try buildRequest(
+      #"{"prompt":"x"}"#, dimensionReason: VideoDimensionReason.default.rawValue)
+    XCTAssertEqual(t2v.dimensionReason, "default")
+  }
+
+  func testAnUnwiredCallerStillProducesAValidRequest() throws {
+    // The parameter defaults to nil, so an older/other call site is unaffected.
+    XCTAssertNil(try buildRequest(#"{"prompt":"x"}"#).dimensionReason)
   }
 
   func testBuildLocalVideoRequestCarriesTopLevelTwoPassIntoTuning() throws {

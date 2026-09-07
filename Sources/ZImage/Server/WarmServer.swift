@@ -2650,7 +2650,8 @@ public final class WarmServer {
     renderWidth: Int, renderHeight: Int,
     foldedFramesPerChunk: Int, foldedExtendSeconds: Float,
     resolvedLoRAs: [LTX2LoRAReference], effectiveBeatSchedule: [BeatSegment]?,
-    resolvedOutput: String
+    resolvedOutput: String,
+    dimensionReason: String? = nil
   ) -> LTX2VideoRequest {
     LTX2VideoRequest(
       prompt: effectivePrompt,
@@ -2707,7 +2708,13 @@ public final class WarmServer {
       // resolves for the mode/audit fields, so the record and the job
       // status agree on who submitted this render.
       source: req.source ?? "api",
-      contentMode: req.contentMode
+      contentMode: req.contentMode,
+      // comfybox#405: the wire-up comfybox#401 left for this PR. The record
+      // used to write `dimension_reason: null` because the resolver runs a
+      // layer up, in `prepareLocalVideo`. It now travels with the request:
+      // `"source_aspect"` when the i2v source image decided the shape,
+      // `"explicit"` when the caller did, `"default"` for the fall-through.
+      dimensionReason: dimensionReason
     )
   }
 
@@ -3121,7 +3128,8 @@ public final class WarmServer {
       renderWidth: renderWidth, renderHeight: renderHeight,
       foldedFramesPerChunk: foldedFramesPerChunk, foldedExtendSeconds: foldedExtendSeconds,
       resolvedLoRAs: resolvedLoRAs, effectiveBeatSchedule: effectiveBeatSchedule,
-      resolvedOutput: resolvedOutput)
+      resolvedOutput: resolvedOutput,
+      dimensionReason: renderDimensions.reason.rawValue)
     // Validate before enqueuing so bad frames/dims fail fast.
     try generator.validate(videoRequest)
 

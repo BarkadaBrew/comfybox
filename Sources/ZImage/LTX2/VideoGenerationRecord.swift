@@ -20,11 +20,15 @@
 // makes the gallery/DAM ingest path (ruling 3) work with no changes there.
 //
 // `dimensionReason` mirrors the `dimension_reason` field #405/#408
-// (`VideoDimensionResolver`) adds to the async render trace and
-// `/v1/video/generate` response. That work was not merged into `main` as of
-// this ticket (see the PR body) — the field exists here, additive and
-// currently always `nil`, so wiring it later is a one-line change at the one
-// call site in `LTX2VideoGenerator.render` rather than a schema change.
+// (`VideoDimensionResolver`) adds to the async render trace and the
+// `/v1/video/generate` response. It was left `nil` here when this ticket
+// landed because that work was still in flight; #408 wired it up:
+// `WarmServer.buildLocalVideoRequest` now sets `LTX2VideoRequest
+// .dimensionReason` from the resolver's `reason.rawValue`, so the sidecar
+// records WHY a clip has the shape it has — `"source_aspect"` when the i2v
+// source image decided it, `"explicit"` when the caller did, `"default"` for
+// the fall-through. Still optional: a caller that supplies no reason records
+// none.
 
 import Foundation
 import Logging
@@ -59,8 +63,9 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
   /// `writeMP4`).
   public let resolvedWidth: Int
   public let resolvedHeight: Int
-  /// `"source_aspect" | "explicit" | "default"` once #405/#408 lands; `nil`
-  /// until then (see file header).
+  /// `"source_aspect" | "explicit" | "default"` — why the render has the
+  /// shape it has (`VideoDimensionResolver`, comfybox#405). `nil` only when
+  /// the caller supplied no reason.
   public let dimensionReason: String?
 
   /// Whether `two_stage` (the 1.5x/2x HQ refine pass) was requested for this
@@ -156,13 +161,11 @@ extension VideoGenerationRecord {
   /// takes only value types, no pipeline/model access — so it's testable
   /// without weights.
   ///
-  /// `dimensionReason` comes from `request.dimensionReason` — review round 2
-  /// ruling 6: this is NOT a one-line wire-up. `#405`/`#408`
-  /// (`VideoDimensionResolver`) runs inside `WarmServer.prepareLocalVideo`,
-  /// a different layer than this generator-level `render()`, and #408 was
-  /// still rewriting that area of `WarmServer.swift` as of this ticket. The
-  /// field exists on `LTX2VideoRequest` now so #408's PR only has to set one
-  /// property when it lands; #408 owns the actual wire-up.
+  /// `dimensionReason` comes from `request.dimensionReason`, which
+  /// `WarmServer.buildLocalVideoRequest` sets from the resolver's
+  /// `reason.rawValue` (comfybox#405). The resolver runs a layer up, in
+  /// `prepareLocalVideo`, which is why the value travels ON the request
+  /// rather than being recomputed at this generator-level `render()`.
   ///
   /// `configGuidance` (review round 3, ruling 1): `request.guidance` is only
   /// an OVERRIDE — `pipeline.generateT2V`/`generateI2V` resolve the CFG scale
