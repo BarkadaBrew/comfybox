@@ -365,66 +365,145 @@ public enum SamplingRecipeCatalog {
     SchedulerKind.euler.rawValue
   }
 
+  public static func defaultSigmaScheduleName(forModelFamily raw: String?) -> String {
+    family(raw) == .krea2 ? SigmaScheduleKind.krea2.rawValue : SigmaScheduleKind.flow.rawValue
+  }
+
   // MARK: - Family-aware field gates (#419)
   //
-  // The desktop preset editor and the Generate panel enable/disable the
-  // RES4LYF and stage-2 knobs from THESE answers, so the gating logic lives
-  // beside the capability matrix the warm server validates against, not in a
-  // second table inside the UI. Every rule mirrors a specific engine gate
-  // (named on each function); an UNKNOWN family (nil / unrecognised) answers
-  // permissively, like `samplerNames(forModelFamily:)` returning the union,
-  // so a disconnected or path-only preset stays editable and the engine's
-  // own validation remains the authority on save.
+  // The desktop preset editor and the Generate panel enable/disable/label
+  // the RES4LYF and stage-2 knobs from THESE answers, so the gating logic
+  // lives beside the capability matrix the warm server validates against,
+  // not in a second table inside the UI. Each answer names the engine gate
+  // it mirrors; the tests pin every one of them to that gate's actual
+  // behaviour. An UNKNOWN family (nil / unrecognised / the engine has not
+  // answered yet) is `.honoured` everywhere — the same "editable while
+  // disconnected" rule `samplerNames(forModelFamily:)` follows — and the
+  // engine's own validation remains the authority on save.
+
+  /// What a family does with a recipe field: reads it, accepts-and-ignores
+  /// it (no gate, no effect — the UI labels it), or 400s on it (the UI
+  /// greys the control, offers Clear, and blocks Save).
+  public enum RecipeFieldStatus: Equatable, Sendable {
+    case honoured
+    case inert(String)
+    case refused(String)
+
+    public var isRefused: Bool { if case .refused = self { return true }; return false }
+    public var isHonoured: Bool { self == .honoured }
+    /// The label / message text, nil when honoured.
+    public var note: String? {
+      switch self {
+      case .honoured: return nil
+      case .inert(let why), .refused(let why): return why
+      }
+    }
+  }
+
+  /// The RES4LYF ports, as the engine's own refusal lists them.
+  public static let res4lyfSamplerList =
+    "res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / heun_2s / heun_3s / deis_2m / deis_3m / deis_4m"
 
   /// Whether the named sampler (raw value, declared alias, or RES4LYF
-  /// `exponential/`-style prefixed spelling) is one of the RES4LYF ports —
-  /// the only samplers `eta` (SDE, tier T2) and `bongmath` (tier T3) are
-  /// defined for (`WarmServer.validateKrea2TierGates`). `nil`/empty (model
-  /// default = euler) and unknown names answer false.
+  /// `exponential/`-style prefixed spelling) is one of the RES4LYF ports.
+  /// `nil`/empty (model default = euler) and unknown names answer false.
   public static func isRES4LYFSampler(_ name: String?) -> Bool {
-    guard let name = normalized(name),
-      let kind = try? RecipeNameResolver.resolveSchedulerKind(name)
-    else { return false }
-    return kind.isRES4LYFFamily
+    resolvedSampler(name)?.isRES4LYFFamily ?? false
   }
 
-  /// Whether the family reads `eta`/`bongmath` at all. The RES4LYF tier gates
-  /// are Krea 2's (`validateKrea2TierGates` runs on the krea2 path only); on
-  /// every other known family the same wire key is either unread or means a
-  /// different stochasticity parameter, so the desktop does not offer it.
-  public static func supportsRES4LYFTiers(forModelFamily raw: String?) -> Bool {
-    guard let family = family(raw) else { return true }
+  /// `eta` — `WarmServer.validateKrea2TierGates` (run under `family ==
+  /// .krea2` only): on Krea 2 it is RES4LYF's SDE, refused on any other
+  /// sampler. On Z-Image there is no gate: the value is forwarded and read
+  /// by DDIM / DPM++ 2S-A (`SchedulerKind.readsAncestralEta`) and ignored by
+  /// every other sampler. The remaining families forward nothing that reads it.
+  public static func etaStatus(sampler: String?, forModelFamily raw: String?) -> RecipeFieldStatus {
+    guard let family = family(raw) else { return .honoured }
+    let kind = resolvedSampler(sampler) ?? .euler
+    switch family {
+    case .krea2:
+      return kind.isRES4LYFFamily
+        ? .honoured
+        : .refused("eta is RES4LYF's SDE (parity tier T2) and applies to the RES4LYF samplers only; "
+          + "'\(kind.rawValue)' is not one of them. Send eta 0, or a sampler from " + res4lyfSamplerList)
+    case .flux1:
+      return kind.readsAncestralEta
+        ? .honoured
+        : .inert("eta is not read by '\(kind.rawValue)' on Z-Image (only DDIM and DPM++ 2S Ancestral use it); it is accepted and ignored")
+    case .chroma, .flux2, .fibo:
+      return .inert("eta is not read by \(family.rawValue); it is accepted and ignored")
+    }
+  }
+
+  /// `bongmath` — the eta arm's twin in `validateKrea2TierGates`: Krea 2 +
+  /// RES4LYF sampler only. No other family has a gate or a reader for it.
+  public static func bongmathStatus(sampler: String?, forModelFamily raw: String?) -> RecipeFieldStatus {
+    guard let family = family(raw) else { return .honoured }
+    let kind = resolvedSampler(sampler) ?? .euler
+    switch family {
+    case .krea2:
+      return kind.isRES4LYFFamily
+        ? .honoured
+        : .refused("bongmath is RES4LYF's fixed point (parity tier T3) over its own tableau rows "
+          + "and applies to the RES4LYF samplers only; '\(kind.rawValue)' is not one of them. "
+          + "Send bongmath false, or a sampler from " + res4lyfSamplerList)
+    case .flux1, .chroma, .flux2, .fibo:
+      return .inert("bongmath is a Krea 2 RES4LYF setting; \(family.rawValue) accepts and ignores it")
+    }
+  }
+
+  /// The RES4LYF spatial-noise / implicit-RK / substep recipe (`noise_type`,
+  /// `noise_alpha`, `implicit_steps`, `c2`) and the projector-scale gain:
+  /// decoded and range-checked on every family, read by the Krea 2 loop only
+  /// — no family gate exists, so elsewhere they are inert, never refused.
+  public static func noiseRecipeStatus(forModelFamily raw: String?) -> RecipeFieldStatus {
+    guard let family = family(raw) else { return .honoured }
     return family == .krea2
+      ? .honoured
+      : .inert("Noise, implicit steps, C2 and projector scale are Krea 2 settings; \(family.rawValue) accepts and ignores them")
   }
 
-  /// Whether the family runs the RES4LYF spatial-noise / implicit-RK /
-  /// substep recipe (`noise_type`, `noise_alpha`, `implicit_steps`, `c2`)
-  /// and the projector-scale gain — all Krea 2 dispatch-time fields.
-  public static func supportsRES4LYFNoise(forModelFamily raw: String?) -> Bool {
-    guard let family = family(raw) else { return true }
+  /// `stage2` — `GeneratePayload.stage2Gate`: a Krea 2 mechanism (WP-E17),
+  /// refused by name on every other family.
+  public static func stage2Status(forModelFamily raw: String?) -> RecipeFieldStatus {
+    guard let family = family(raw) else { return .honoured }
     return family == .krea2
+      ? .honoured
+      : .refused("a second stage inside one render is a Krea 2 mechanism (WP-E17); "
+        + "\(family.rawValue) has no such seam — load a krea2 model, or remove stage2")
   }
 
-  /// Whether the family honours a second stage inside one render (`stage2`,
-  /// WP-E17) — Krea 2 only (`WarmServer.validateStage2`).
-  public static func supportsStage2(forModelFamily raw: String?) -> Bool {
-    guard let family = family(raw) else { return true }
+  /// `vae` — `GeneratePayload.vaeGate` (WP-E9): a Krea 2 request field,
+  /// refused by name on every other family.
+  public static func vaeStatus(forModelFamily raw: String?) -> RecipeFieldStatus {
+    guard let family = family(raw) else { return .honoured }
     return family == .krea2
+      ? .honoured
+      : .refused("VAE selection is a Krea 2 request field (WP-E9); \(family.rawValue) decodes through its own VAE and does not honour it — remove it")
   }
 
-  /// Whether the family names a VAE override (`vae`, WP-E9 D16 — the Wan 2.1
-  /// decode path is Krea 2's).
-  public static func supportsVAEOverride(forModelFamily raw: String?) -> Bool {
-    guard let family = family(raw) else { return true }
-    return family == .krea2
-  }
-
-  /// Whether the family reads `shift` at all — `GeneratePayload.validateShift`:
-  /// krea2 (where it is `mu`) and flux1 (a linear warp); the fixed-schedule
-  /// families refuse it by name.
-  public static func acceptsShift(forModelFamily raw: String?) -> Bool {
-    guard let family = family(raw) else { return true }
-    return family == .krea2 || family == .flux1
+  /// `shift` — `GeneratePayload.validateShift` (krea2 reads it as `mu`,
+  /// flux1 as a linear warp, the fixed-schedule families refuse it) and, on
+  /// flux1, `validateShiftSchedule` (comfybox#154): the `krea2` and
+  /// `bong_tangent` grids are defined by mu / by construction and would drop
+  /// it, so the pairing is a 400. `nil`/empty schedule = the family default.
+  public static func shiftStatus(sigmaSchedule: String?, forModelFamily raw: String?) -> RecipeFieldStatus {
+    guard let family = family(raw) else { return .honoured }
+    switch family {
+    case .krea2:
+      return .honoured
+    case .flux1:
+      guard let name = normalized(sigmaSchedule),
+        let schedule = try? RecipeNameResolver.resolveSigmaScheduleKind(name)
+      else { return .honoured }
+      return SchedulerFactory.honoursExplicitShift(schedule: schedule, modelSampling: .discreteFlow)
+        ? .honoured
+        : .refused("shift is not read by sigma schedule '\(schedule.rawValue)' (it is defined by mu / by index "
+          + "arithmetic, not by the model's shift) — drop shift, or ask for a schedule that honours it "
+          + "(flow/normal, simple, beta, beta57, karras, exponential)")
+    case .chroma, .flux2, .fibo:
+      return .refused("shift is a schedule field for the krea2 and flux1 (Z-Image) families and is not "
+        + "honoured by model family '\(family.rawValue)'; remove it")
+    }
   }
 
   /// The label the UI shows for `shift`, naming what the number MEANS on
@@ -438,22 +517,9 @@ public enum SamplingRecipeCatalog {
     }
   }
 
-  /// Whether an explicit `shift` would actually be read by the named sigma
-  /// schedule on this family — `GeneratePayload.validateShiftSchedule`, the
-  /// comfybox#154 gate: on flux1 the `krea2` and `bong_tangent` grids are
-  /// defined by mu / by construction and drop the shift on the floor, so a
-  /// shift paired with them is a 400, never a silent no-op. Krea 2 has its
-  /// own `mu` semantics and is left alone; `nil`/empty schedule = the family
-  /// default, which honours it.
-  public static func shiftIsHonoured(sigmaSchedule: String?, forModelFamily raw: String?) -> Bool {
-    guard family(raw) == .flux1 else { return true }
-    guard let name = normalized(sigmaSchedule) else { return true }
-    guard let schedule = try? RecipeNameResolver.resolveSigmaScheduleKind(name) else { return true }
-    return SchedulerFactory.honoursExplicitShift(schedule: schedule, modelSampling: .discreteFlow)
-  }
-
-  public static func defaultSigmaScheduleName(forModelFamily raw: String?) -> String {
-    family(raw) == .krea2 ? SigmaScheduleKind.krea2.rawValue : SigmaScheduleKind.flow.rawValue
+  private static func resolvedSampler(_ name: String?) -> SchedulerKind? {
+    guard let name = normalized(name) else { return nil }
+    return try? RecipeNameResolver.resolveSchedulerKind(name)
   }
 
   private static func normalized(_ value: String?) -> String? {

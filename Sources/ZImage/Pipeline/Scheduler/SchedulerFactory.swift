@@ -72,6 +72,25 @@ public enum SchedulerKind: String, CaseIterable, Sendable {
   /// new sampler would both substitute silently and turn a working Z-Image
   /// sampler into a Krea-2-only one (see `DEISMultistepSchedulerTests`).
   ///
+  /// Whether the Z-Image (`.flux1`) denoise loop reads `eta` for this
+  /// sampler: `SchedulerFactory.make` passes it to `DDIMScheduler` (DDIM η,
+  /// default 0) and `DPMPlusPlus2SAScheduler` (ancestral η, default 1) and to
+  /// nothing else — every other kind receives the value and ignores it. This
+  /// is the desktop's answer to "is eta honoured, inert, or refused here?"
+  /// on flux1, where there is no gate at all (the RES4LYF tier gate runs
+  /// under `family == .krea2` only).
+  ///
+  /// Exhaustive on purpose (no `default`): a new kind must declare itself.
+  public var readsAncestralEta: Bool {
+    switch self {
+    case .ddim, .dpmplusplus2sa:
+      return true
+    case .euler, .heun, .dpmplusplus2m, .deis, .res2s, .res3s, .ralston2s, .ralston3s, .ralston4s,
+      .heun2s, .heun3s, .deis2m, .deis3m, .deis4m:
+      return false
+    }
+  }
+
   /// Exhaustive on purpose (no `default`): a new kind must declare itself.
   public var isRES4LYFFamily: Bool {
     switch self {

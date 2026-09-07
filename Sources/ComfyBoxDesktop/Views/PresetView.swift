@@ -468,25 +468,11 @@ private struct ServerPresetEditor: View {
     @State private var editableLoras: [EditableLora]
     @State private var sampler: String
     @State private var sigmaSchedule: String
-    // #419: the rest of the recipe. Neutral sentinels (eta 0, bongmath off,
-    // gaussian, alpha 0, implicit 0, c2 0.5, projector 1.0, shift nil,
-    // vae "") mean "model default" and are written back as nil — the store
-    // never gets today's default frozen into a preset.
-    @State private var shift: Double?
-    @State private var eta: Double
-    @State private var bongmath: Bool
-    @State private var noiseType: String
-    @State private var noiseAlpha: Double
-    @State private var implicitSteps: Double
-    @State private var c2: Double
-    @State private var projectorScale: Double
-    @State private var vae: String
-    @State private var stage2Enabled: Bool
-    @State private var stage2StepsText: String
-    @State private var stage2DenoiseText: String
-    @State private var stage2Sampler: String
-    @State private var stage2SigmaSchedule: String
-    @State private var stage2Eta: Double
+    // #419: the rest of the recipe — one value type (`PresetSamplingEditorState`)
+    // seeded from `original` and written back verbatim by `buildPreset()`,
+    // so the seed → edit → write cycle is unit-testable without a view.
+    // Neutral sentinels mean "model default" and are written as nil.
+    @State private var sampling: PresetSamplingEditorState
     @State private var saveAsName: String = ""
     @State private var showingSaveAs = false
 
@@ -513,75 +499,41 @@ private struct ServerPresetEditor: View {
             .map { EditableLora(filename: $0.filename, scale: $0.scale, role: $0.role) })
         _sampler = State(initialValue: original.sampler ?? original.scheduler ?? "")
         _sigmaSchedule = State(initialValue: original.sigmaSchedule ?? "")
-        _shift = State(initialValue: original.shift)
-        _eta = State(initialValue: original.eta ?? 0)
-        _bongmath = State(initialValue: original.bongmath ?? false)
-        _noiseType = State(initialValue: original.noiseType ?? "gaussian")
-        _noiseAlpha = State(initialValue: original.noiseAlpha ?? 0)
-        _implicitSteps = State(initialValue: Double(original.implicitSteps ?? 0))
-        _c2 = State(initialValue: original.c2 ?? 0.5)
-        _projectorScale = State(initialValue: original.projectorScale ?? 1.0)
-        _vae = State(initialValue: original.vae ?? "")
-        _stage2Enabled = State(initialValue: original.stage2 != nil)
-        _stage2StepsText = State(initialValue: original.stage2?.steps.map(String.init) ?? "")
-        _stage2DenoiseText = State(initialValue: original.stage2?.denoise.map { String(format: "%g", $0) } ?? "")
-        _stage2Sampler = State(initialValue: original.stage2?.sampler ?? "")
-        _stage2SigmaSchedule = State(initialValue: original.stage2?.sigmaSchedule ?? "")
-        _stage2Eta = State(initialValue: original.stage2?.eta ?? 0)
+        _sampling = State(initialValue: PresetSamplingEditorState(original: original))
     }
 
-    /// The family the sampling gates key on. #419: the engine's own answer
-    /// for the current `model` text (`GET /v1/model/family`, kept fresh by
-    /// `.task(id: model)`) wins when it has one — a bare custom path such as
-    /// `/Models/foo.safetensors` names no family the catalog can read, and
-    /// the gates would otherwise fall back to "unknown = permissive". Until
-    /// the answer arrives (or offline) the text itself is what the catalog
-    /// infers from.
+    /// The family the sampling gates key on (#419, review B2): the ENGINE's
+    /// answer for the current `model` text (`GET /v1/model/family`, kept
+    /// fresh by `.task(id: model)`) and nothing else. A family inferred from
+    /// the text can be WRONG — "/Models/zeta-chroma.safetensors" reads as
+    /// chroma but is Z-Image-based (#154) — and a wrong guess would grey and
+    /// block what the engine actually accepts. nil (pending, offline, or the
+    /// engine has no answer) is permissive: loaded values stay untouched,
+    /// the option lists show the union, and the engine validates on save.
     private var samplingModelFamily: String? {
-        if let family = detectedModelFamily?.family, !family.isEmpty { return family }
-        let edited = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !edited.isEmpty { return edited }
-        return original.customModelPath ?? original.model
+        guard let family = detectedModelFamily?.family, !family.isEmpty else { return nil }
+        return family
     }
 
     /// #419: the whole recipe as the editor currently holds it, with the
     /// neutral sentinels already collapsed to nil. `buildPreset()` writes
     /// exactly this; `samplingValidationError` validates exactly this.
     private var samplingDraft: PresetSamplingDraft {
-        let trimmedVAE = vae.trimmingCharacters(in: .whitespacesAndNewlines)
-        return PresetSamplingDraft(
-            modelFamily: samplingModelFamily,
-            sampler: sampler,
-            sigmaSchedule: sigmaSchedule,
-            shift: shift,
-            eta: eta == 0 ? nil : eta,
-            bongmath: bongmath ? true : nil,
-            noiseType: noiseType == "gaussian" ? nil : noiseType,
-            noiseAlpha: noiseAlpha == 0 ? nil : noiseAlpha,
-            implicitSteps: implicitSteps == 0 ? nil : Int(implicitSteps),
-            c2: c2 == 0.5 ? nil : c2,
-            projectorScale: projectorScale == 1.0 ? nil : projectorScale,
-            vae: trimmedVAE.isEmpty ? nil : trimmedVAE,
-            stage2Enabled: stage2Enabled,
-            stage2Steps: Int(stage2StepsText.trimmingCharacters(in: .whitespaces)),
-            stage2Denoise: Double(stage2DenoiseText.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")),
-            stage2Sampler: stage2Sampler,
-            stage2SigmaSchedule: stage2SigmaSchedule,
-            stage2Eta: stage2Eta == 0 ? nil : stage2Eta
-        )
+        sampling.draft(modelFamily: samplingModelFamily, sampler: sampler, sigmaSchedule: sigmaSchedule)
     }
 
     /// nil = the engine would accept this recipe on the preset's family.
-    /// Non-nil blocks Save (and Save as New). Every rule is an engine gate
-    /// mirrored in `PresetSamplingValidator`, so the store never receives a
-    /// recipe that only fails once Bree renders it.
+    /// Non-nil blocks Save (and Save as New) with the engine's own wording.
+    /// This — not a silent reset — is what happens to a loaded value a
+    /// closed gate refuses: the control is greyed, Clear sits beside it, and
+    /// Save waits for the user to decide.
     private var samplingValidationError: String? {
         PresetSamplingValidator.validationError(samplingDraft)
     }
 
-    private var stage2SDEAllowed: Bool {
-        SamplingGate.stage2SDEAllowed(
-            modelFamily: samplingModelFamily, stage2Sampler: stage2Sampler, stage1Sampler: sampler)
+    private var stage2EtaStatus: SamplingGate.Status {
+        SamplingGate.stage2Eta(
+            modelFamily: samplingModelFamily, stage2Sampler: sampling.stage2Sampler, stage1Sampler: sampler)
     }
 
     var body: some View {
@@ -712,9 +664,9 @@ private struct ServerPresetEditor: View {
     /// Sampler + schedule (the existing family-aware picker), then the shared
     /// RES4LYF knobs — the SAME `SamplingAdvancedControls` the Generate panel
     /// shows, so the eta/bongmath gate exists once — plus the Krea 2 VAE
-    /// override. Each control disables (and resets to neutral) where the
-    /// family or sampler does not honour it; `samplingValidationError` is the
-    /// backstop that blocks Save on anything the engine would refuse.
+    /// override. A refused value is greyed with Clear beside it and blocks
+    /// Save (`samplingValidationError`); nothing is reset except on the
+    /// user's own sampler change.
     @ViewBuilder
     private var samplingSection: some View {
         SamplingRecipePicker(
@@ -723,29 +675,53 @@ private struct ServerPresetEditor: View {
             modelFamily: samplingModelFamily,
             showsExplanation: true
         )
+        .onChange(of: sampler) { _, newSampler in
+            // User-initiated (the picker is the only writer): the one reset.
+            sampling.samplerDidChange(to: newSampler, modelFamily: samplingModelFamily)
+        }
         SamplingAdvancedControls(
-            shift: $shift,
-            projectorScale: $projectorScale,
-            eta: $eta,
-            bongmath: $bongmath,
-            noiseType: $noiseType,
-            noiseAlpha: $noiseAlpha,
-            implicitSteps: $implicitSteps,
-            c2: $c2,
+            shift: $sampling.shift,
+            projectorScale: $sampling.projectorScale,
+            eta: $sampling.eta,
+            bongmath: $sampling.bongmath,
+            noiseType: $sampling.noiseType,
+            noiseAlpha: $sampling.noiseAlpha,
+            implicitSteps: $sampling.implicitSteps,
+            c2: $sampling.c2,
             sampler: sampler,
             sigmaSchedule: sigmaSchedule,
             modelFamily: samplingModelFamily
         )
-        if SamplingGate.vaeAllowed(modelFamily: samplingModelFamily) {
-            TextField("VAE (path; empty = model directory's VAE)", text: $vae)
-                .help("Krea 2 decode VAE override — e.g. the Wan 2.1 VAE. Empty = the model directory's own VAE.")
-        }
+        vaeRow
         // The pair error is the picker's own to show (above); this label
         // covers every OTHER rule so a refusal is never reported twice.
         if let error = samplingValidationError, pairIsSupported {
             Label(error, systemImage: "exclamationmark.triangle.fill")
                 .font(.caption2)
                 .foregroundStyle(.orange)
+        }
+    }
+
+    /// Review B3: rendered whenever the family honours a VAE override OR the
+    /// preset already carries one — a value the family refuses is greyed
+    /// with Clear, never hidden while it blocks Save.
+    @ViewBuilder
+    private var vaeRow: some View {
+        let status = SamplingGate.vae(modelFamily: samplingModelFamily)
+        let hasValue = !sampling.vae.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if status.isHonoured || hasValue {
+            HStack(spacing: 6) {
+                TextField("VAE (path; empty = model directory's VAE)", text: $sampling.vae)
+                    .disabled(status.isRefused)
+                    .help("Krea 2 decode VAE override — e.g. the Wan 2.1 VAE. Empty = the model directory's own VAE.")
+                if status.isRefused, hasValue {
+                    Button("Clear VAE") { sampling.vae = "" }.controlSize(.small)
+                }
+            }
+            if status.isRefused, hasValue, let note = status.note {
+                Label(note, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2).foregroundStyle(.orange)
+            }
         }
     }
 
@@ -759,45 +735,73 @@ private struct ServerPresetEditor: View {
     /// The optional second stage (WP-E17, Krea 2 only): re-noises the latent
     /// to the stretched tail and solves again. Needs steps AND denoise; its
     /// sampler/schedule default to the render's; `stage2.eta` follows the
-    /// RES4LYF rule on whichever sampler the stage actually runs.
-    /// `stage2.bongmath` is deliberately not offered — the engine 400s it as
-    /// unimplemented (tier T3).
+    /// RES4LYF rule on whichever sampler the stage actually runs, with
+    /// `stage2.eta ?? eta` as the effective value (the engine's rule).
+    /// `stage2.bongmath` has no control — the engine 400s it as
+    /// unimplemented — but a stored value is shown with Clear, not dropped.
     @ViewBuilder
     private var stage2Section: some View {
-        let allowed = SamplingGate.stage2Allowed(modelFamily: samplingModelFamily)
-        Toggle("Run a detail pass after the main render", isOn: $stage2Enabled)
-            .disabled(!allowed)
-            .onChange(of: allowed, initial: true) { _, allowed in
-                if !allowed { stage2Enabled = false }
+        let status = SamplingGate.stage2(modelFamily: samplingModelFamily)
+        Toggle("Run a detail pass after the main render", isOn: $sampling.stage2Enabled)
+            // Turning OFF is always possible (it is the Clear for a refused
+            // stage); turning ON is what the family gate withholds.
+            .disabled(status.isRefused && !sampling.stage2Enabled)
+        if status.isRefused, let note = status.note {
+            if sampling.stage2Enabled {
+                Label(note, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2).foregroundStyle(.orange)
+            } else {
+                Text(note).font(.caption2).foregroundStyle(.tertiary)
             }
-        if !allowed {
-            Text("A detail pass is a Krea 2 mechanism; \(SamplingRecipeCatalog.canonicalFamily(samplingModelFamily) ?? "this model") has no such seam.")
-                .font(.caption2).foregroundStyle(.tertiary)
-        } else if stage2Enabled {
-            HStack {
-                TextField("Steps", text: $stage2StepsText).frame(width: 90)
-                TextField("Denoise (0–1]", text: $stage2DenoiseText).frame(width: 110)
-                Spacer()
-            }
-            Text("Steps and denoise are both required. Denoise is the fraction of the schedule the stage re-runs (e.g. 0.2).")
-                .font(.caption2).foregroundStyle(.tertiary)
-            SamplingRecipePicker(
-                sampler: $stage2Sampler,
-                sigmaSchedule: $stage2SigmaSchedule,
-                modelFamily: samplingModelFamily,
-                showsExplanation: false
-            )
-            Text("Model Default here means the main render's sampler / scheduler.")
-                .font(.caption2).foregroundStyle(.tertiary)
-            NumericSliderField(label: "Eta (SDE)", value: $stage2Eta, range: 0...1, step: 0.05, fractionDigits: 2)
-                .disabled(!stage2SDEAllowed)
-                .onChange(of: stage2SDEAllowed, initial: true) { _, allowed in
-                    if !allowed { stage2Eta = 0 }
+        }
+        if sampling.stage2Enabled {
+            Group {
+                HStack {
+                    TextField("Steps", text: $sampling.stage2StepsText).frame(width: 90)
+                    TextField("Denoise (0–1]", text: $sampling.stage2DenoiseText).frame(width: 110)
+                    Spacer()
                 }
-            if !stage2SDEAllowed {
-                Text("Stage 2 eta needs a RES4LYF sampler on the stage (its own, or the main render's when left at Model Default).")
+                Text("Steps and denoise are both required. Denoise is the fraction of the schedule the stage re-runs (e.g. 0.2).")
                     .font(.caption2).foregroundStyle(.tertiary)
+                SamplingRecipePicker(
+                    sampler: $sampling.stage2Sampler,
+                    sigmaSchedule: $sampling.stage2SigmaSchedule,
+                    modelFamily: samplingModelFamily,
+                    showsExplanation: false
+                )
+                .onChange(of: sampling.stage2Sampler) { _, newSampler in
+                    sampling.stage2SamplerDidChange(
+                        to: newSampler, stage1Sampler: sampler, modelFamily: samplingModelFamily)
+                }
+                Text("Model Default here means the main render's sampler / scheduler; an empty eta inherits the main render's eta.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+                NumericSliderField(label: "Eta (SDE)", value: $sampling.stage2Eta, range: 0...1, step: 0.05, fractionDigits: 2)
+                    .disabled(stage2EtaStatus.isRefused)
+                if let note = stage2EtaStatus.note {
+                    HStack(alignment: .top, spacing: 6) {
+                        if stage2EtaStatus.isRefused, (sampling.stage2Eta != 0 || sampling.eta != 0) {
+                            Label(note, systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption2).foregroundStyle(.orange)
+                            Spacer(minLength: 0)
+                            if sampling.stage2Eta != 0 {
+                                Button("Clear stage 2 eta") { sampling.stage2Eta = 0 }.controlSize(.small)
+                            }
+                        } else {
+                            Text(note).font(.caption2).foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+                if sampling.stage2Bongmath == true {
+                    HStack(alignment: .top, spacing: 6) {
+                        Label("This preset declares stage2.bongmath — the engine refuses it (parity tier T3, not implemented yet).",
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption2).foregroundStyle(.orange)
+                        Spacer(minLength: 0)
+                        Button("Clear") { sampling.stage2Bongmath = nil }.controlSize(.small)
+                    }
+                }
             }
+            .disabled(status.isRefused)
         }
     }
 
@@ -1067,30 +1071,10 @@ private struct ServerPresetEditor: View {
         // Keep the legacy sampler spelling synchronized for older preset
         // consumers; modern engine validation and Generate use `sampler`.
         p.scheduler = p.sampler
-        // #419: the rest of the recipe, from the same draft the validator
-        // sees — neutral sentinels are already nil there, so a preset never
-        // has today's default frozen into it.
-        let draft = samplingDraft
-        p.shift = draft.shift
-        p.eta = draft.eta
-        p.bongmath = draft.bongmath
-        p.noiseType = draft.noiseType
-        p.noiseAlpha = draft.noiseAlpha
-        p.implicitSteps = draft.implicitSteps
-        p.c2 = draft.c2
-        p.projectorScale = draft.projectorScale
-        p.vae = draft.vae
-        // `stage2.bongmath` is never written: the engine 400s it as
-        // unimplemented (tier T3), so the editor does not offer it.
-        p.stage2 = draft.stage2Enabled
-            ? ServerPresetStage(
-                sampler: draft.stage2Sampler.isEmpty ? nil : draft.stage2Sampler,
-                sigmaSchedule: draft.stage2SigmaSchedule.isEmpty ? nil : draft.stage2SigmaSchedule,
-                steps: draft.stage2Steps,
-                denoise: draft.stage2Denoise,
-                eta: draft.stage2Eta,
-                bongmath: nil)
-            : nil
+        // #419: the rest of the recipe — what the user sees is what is
+        // saved, no family involved (neutral sentinels are written as nil;
+        // a stored `stage2.bongmath` is preserved until the user clears it).
+        sampling.write(into: &p)
         // Todd 2026-09-04: kroma is a regular LoRA — `loras[]` (editableLoras)
         // is the single source. Review r2, C1 (Critical): `p.kroma` is a
         // DEPRECATED, derived, read-only echo — carrying `original.kroma`

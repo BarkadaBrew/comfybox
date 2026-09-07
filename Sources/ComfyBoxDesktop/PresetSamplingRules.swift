@@ -1,69 +1,74 @@
-// PresetSamplingRules.swift — family-aware gating + validation for the
-// sampler/schedule recipe fields the desktop edits (#419).
+// PresetSamplingRules.swift — family-aware gating, editor state and
+// Save-blocking validation for the sampler/schedule recipe fields the
+// desktop edits (#419).
 //
 // One pure, testable decision surface shared by the preset editor
 // (`ServerPresetEditor`), the Generate panel and the shared
-// `SamplingAdvancedControls` subview, so "may eta be set here?" is answered
-// in exactly one place. Every rule mirrors an engine gate by name (see
-// `SamplingRecipeCatalog`'s family helpers in ZImage) — the desktop refuses
-// to SAVE what the engine would 400 on at render, rather than letting a
-// preset carry a recipe that only fails once Bree renders it.
+// `SamplingAdvancedControls` subview, so "what does this family do with eta
+// here?" is answered in exactly one place. Every answer is a
+// `RecipeFieldStatus` from `SamplingRecipeCatalog` (ZImage), each pinned by
+// test to the engine gate it mirrors — the desktop refuses to SAVE only what
+// the engine would 400 on at render, labels what the engine accepts and
+// ignores, and never invents a stricter rule of its own.
 //
-// Empty string / nil = model default throughout; the editor never persists a
-// default value into the store.
+// Loaded values are never erased by a gate (review B2): a closed gate greys
+// the control, offers Clear, and blocks Save with the engine's own wording.
+// The only automatic reset is on a USER change of a sampler picker.
+//
+// Empty string / nil / the neutral sentinel = model default throughout; the
+// editor never persists a default value into the store.
 
 import Foundation
 import ZImage
 
-/// The gates a UI needs to enable/disable each knob for the current family +
-/// sampler. Pure functions over strings so previews and tests need no engine.
+/// The gates a UI needs to enable/disable/label each knob for the current
+/// family + sampler. Thin names over the catalog so call sites read as the
+/// field they gate.
 enum SamplingGate {
-    /// `eta` / `bongmath` are editable only when the family runs the RES4LYF
-    /// tier gates (krea2) AND the selected sampler is a RES4LYF port —
-    /// `WarmServer.validateKrea2TierGates` refuses either on `euler`.
-    static func sdeAllowed(modelFamily: String?, sampler: String) -> Bool {
-        SamplingRecipeCatalog.supportsRES4LYFTiers(forModelFamily: modelFamily)
-            && SamplingRecipeCatalog.isRES4LYFSampler(sampler)
+    typealias Status = SamplingRecipeCatalog.RecipeFieldStatus
+
+    static func eta(modelFamily: String?, sampler: String) -> Status {
+        SamplingRecipeCatalog.etaStatus(sampler: sampler.isEmpty ? nil : sampler, forModelFamily: modelFamily)
     }
 
-    /// Stage-2 `eta` follows the same rule on the sampler the stage will
-    /// ACTUALLY run: its own when named, else the render's (the engine's
-    /// effective-sampler rule in `validateStage2`).
-    static func stage2SDEAllowed(modelFamily: String?, stage2Sampler: String, stage1Sampler: String) -> Bool {
+    static func bongmath(modelFamily: String?, sampler: String) -> Status {
+        SamplingRecipeCatalog.bongmathStatus(sampler: sampler.isEmpty ? nil : sampler, forModelFamily: modelFamily)
+    }
+
+    static func noise(modelFamily: String?) -> Status {
+        SamplingRecipeCatalog.noiseRecipeStatus(forModelFamily: modelFamily)
+    }
+
+    static func shift(modelFamily: String?, sigmaSchedule: String) -> Status {
+        SamplingRecipeCatalog.shiftStatus(sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule, forModelFamily: modelFamily)
+    }
+
+    static func stage2(modelFamily: String?) -> Status {
+        SamplingRecipeCatalog.stage2Status(forModelFamily: modelFamily)
+    }
+
+    static func vae(modelFamily: String?) -> Status {
+        SamplingRecipeCatalog.vaeStatus(forModelFamily: modelFamily)
+    }
+
+    /// Stage-2 `eta` is gated on the sampler the stage ACTUALLY runs — its
+    /// own when named, else the render's (`WarmServer.stage2Gate`'s
+    /// effective-sampler rule). The refusal wording is the engine's.
+    static func stage2Eta(modelFamily: String?, stage2Sampler: String, stage1Sampler: String) -> Status {
         let effective = stage2Sampler.isEmpty ? stage1Sampler : stage2Sampler
-        return sdeAllowed(modelFamily: modelFamily, sampler: effective)
-    }
-
-    /// The RES4LYF noise / implicit-RK / c2 / projector-scale dials.
-    static func noiseAllowed(modelFamily: String?) -> Bool {
-        SamplingRecipeCatalog.supportsRES4LYFNoise(forModelFamily: modelFamily)
-    }
-
-    static func shiftAllowed(modelFamily: String?) -> Bool {
-        SamplingRecipeCatalog.acceptsShift(forModelFamily: modelFamily)
-    }
-
-    static func stage2Allowed(modelFamily: String?) -> Bool {
-        SamplingRecipeCatalog.supportsStage2(forModelFamily: modelFamily)
-    }
-
-    static func vaeAllowed(modelFamily: String?) -> Bool {
-        SamplingRecipeCatalog.supportsVAEOverride(forModelFamily: modelFamily)
-    }
-
-    /// The one-line reason shown under a disabled eta/bongmath control.
-    static func sdeDisabledReason(modelFamily: String?, sampler: String) -> String {
-        if !SamplingRecipeCatalog.supportsRES4LYFTiers(forModelFamily: modelFamily) {
-            let family = SamplingRecipeCatalog.canonicalFamily(modelFamily) ?? "this model"
-            return "Eta and bongmath are Krea 2 RES4LYF settings; \(family) does not read them."
-        }
-        return "Eta and bongmath need a RES4LYF sampler (res_2s, res_3s, ralston_*, deis_*m)."
+        let status = eta(modelFamily: modelFamily, sampler: effective)
+        guard status.isRefused else { return status }
+        let name = SamplingRecipeCatalog.isRES4LYFSampler(effective) ? effective : (effective.isEmpty ? "euler" : effective)
+        return .refused(
+            "eta is RES4LYF's SDE (parity tier T2) and applies to the RES4LYF samplers only; stage 2 runs "
+            + "'\(name)', which is not one of them. Send stage2.eta 0, or a stage2 sampler from "
+            + SamplingRecipeCatalog.res4lyfSamplerList)
     }
 }
 
-/// The editable recipe as the preset editor holds it — Double/Bool/String
-/// with nil / "" meaning "model default". `Sendable` + `Equatable` so tests
-/// can build one per rule and compare.
+/// The editable recipe with the neutral sentinels already collapsed to nil /
+/// "" (= model default), plus the family to judge it against. What the
+/// validator sees is exactly what `buildPreset()` writes.
 struct PresetSamplingDraft: Equatable, Sendable {
     var modelFamily: String?
     var sampler: String = ""
@@ -83,6 +88,122 @@ struct PresetSamplingDraft: Equatable, Sendable {
     var stage2Sampler: String = ""
     var stage2SigmaSchedule: String = ""
     var stage2Eta: Double?
+    /// Preserved from the store, never written by a control: the engine
+    /// 400s it as unimplemented, so the editor shows it with Clear.
+    var stage2Bongmath: Bool?
+}
+
+/// The preset editor's dials as SwiftUI state — seeded from the stored
+/// preset in `init(original:)`, written back verbatim by `write(into:)`.
+/// Pure value type so the seed → edit → write cycle is unit-testable without
+/// a view: in particular that NO gate ever erases a loaded value (review B2)
+/// and that a preset saved with the engine unreachable is byte-for-byte what
+/// was loaded.
+struct PresetSamplingEditorState: Equatable, Sendable {
+    var shift: Double?
+    var eta: Double
+    var bongmath: Bool
+    var noiseType: String
+    var noiseAlpha: Double
+    var implicitSteps: Double
+    var c2: Double
+    var projectorScale: Double
+    var vae: String
+    var stage2Enabled: Bool
+    var stage2StepsText: String
+    var stage2DenoiseText: String
+    var stage2Sampler: String
+    var stage2SigmaSchedule: String
+    var stage2Eta: Double
+    var stage2Bongmath: Bool?
+
+    init(original: ServerPreset) {
+        shift = original.shift
+        eta = original.eta ?? 0
+        bongmath = original.bongmath ?? false
+        noiseType = original.noiseType ?? "gaussian"
+        noiseAlpha = original.noiseAlpha ?? 0
+        implicitSteps = Double(original.implicitSteps ?? 0)
+        c2 = original.c2 ?? 0.5
+        projectorScale = original.projectorScale ?? 1.0
+        vae = original.vae ?? ""
+        stage2Enabled = original.stage2 != nil
+        stage2StepsText = original.stage2?.steps.map(String.init) ?? ""
+        stage2DenoiseText = original.stage2?.denoise.map { String(format: "%g", $0) } ?? ""
+        stage2Sampler = original.stage2?.sampler ?? ""
+        stage2SigmaSchedule = original.stage2?.sigmaSchedule ?? ""
+        stage2Eta = original.stage2?.eta ?? 0
+        stage2Bongmath = original.stage2?.bongmath
+    }
+
+    /// The draft the validator judges and `write(into:)` persists.
+    func draft(modelFamily: String?, sampler: String, sigmaSchedule: String) -> PresetSamplingDraft {
+        let trimmedVAE = vae.trimmingCharacters(in: .whitespacesAndNewlines)
+        return PresetSamplingDraft(
+            modelFamily: modelFamily,
+            sampler: sampler,
+            sigmaSchedule: sigmaSchedule,
+            shift: shift,
+            eta: eta == 0 ? nil : eta,
+            bongmath: bongmath ? true : nil,
+            noiseType: noiseType == "gaussian" ? nil : noiseType,
+            noiseAlpha: noiseAlpha == 0 ? nil : noiseAlpha,
+            implicitSteps: implicitSteps.rounded() == 0 ? nil : Int(implicitSteps.rounded()),
+            c2: c2 == 0.5 ? nil : c2,
+            projectorScale: projectorScale == 1.0 ? nil : projectorScale,
+            vae: trimmedVAE.isEmpty ? nil : trimmedVAE,
+            stage2Enabled: stage2Enabled,
+            stage2Steps: Int(stage2StepsText.trimmingCharacters(in: .whitespaces)),
+            stage2Denoise: Double(stage2DenoiseText.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")),
+            stage2Sampler: stage2Sampler,
+            stage2SigmaSchedule: stage2SigmaSchedule,
+            stage2Eta: stage2Eta == 0 ? nil : stage2Eta,
+            stage2Bongmath: stage2Enabled ? stage2Bongmath : nil
+        )
+    }
+
+    /// Write the dials onto a preset — every field, nil where neutral, no
+    /// family involved: what the user sees is what is saved. `stage2.bongmath`
+    /// is preserved exactly as loaded (never set by a control; cleared only
+    /// by the explicit Clear button) so a value the engine will refuse is
+    /// surfaced, not silently dropped.
+    func write(into p: inout ServerPreset) {
+        let d = draft(modelFamily: nil, sampler: "", sigmaSchedule: "")
+        p.shift = d.shift
+        p.eta = d.eta
+        p.bongmath = d.bongmath
+        p.noiseType = d.noiseType
+        p.noiseAlpha = d.noiseAlpha
+        p.implicitSteps = d.implicitSteps
+        p.c2 = d.c2
+        p.projectorScale = d.projectorScale
+        p.vae = d.vae
+        p.stage2 = d.stage2Enabled
+            ? ServerPresetStage(
+                sampler: d.stage2Sampler.isEmpty ? nil : d.stage2Sampler,
+                sigmaSchedule: d.stage2SigmaSchedule.isEmpty ? nil : d.stage2SigmaSchedule,
+                steps: d.stage2Steps,
+                denoise: d.stage2Denoise,
+                eta: d.stage2Eta,
+                bongmath: d.stage2Bongmath)
+            : nil
+    }
+
+    /// The ONE automatic reset (review B2): the user just picked a stage-1
+    /// sampler. If the new sampler refuses eta/bongmath on this family, drop
+    /// them — the user made the change that closed the gate. Never called
+    /// on load or on a family answer arriving.
+    mutating func samplerDidChange(to sampler: String, modelFamily: String?) {
+        if SamplingGate.eta(modelFamily: modelFamily, sampler: sampler).isRefused { eta = 0 }
+        if SamplingGate.bongmath(modelFamily: modelFamily, sampler: sampler).isRefused { bongmath = false }
+    }
+
+    /// Same rule for the stage-2 picker.
+    mutating func stage2SamplerDidChange(to stage2Sampler: String, stage1Sampler: String, modelFamily: String?) {
+        if SamplingGate.stage2Eta(modelFamily: modelFamily, stage2Sampler: stage2Sampler, stage1Sampler: stage1Sampler).isRefused {
+            stage2Eta = 0
+        }
+    }
 }
 
 enum PresetSamplingValidator {
@@ -90,9 +211,11 @@ enum PresetSamplingValidator {
     static let c2Pole = 2.0 / 3.0
 
     /// nil when the engine would accept this recipe on the draft's family;
-    /// otherwise the sentence the editor shows and blocks Save with. The
-    /// family-pair check runs first (it is what `SamplingRecipePicker`
-    /// already reports), then every field the editor added in #419.
+    /// otherwise the sentence the editor shows and blocks Save with — the
+    /// engine's own wording wherever a gate has one. Only `.refused` statuses
+    /// and out-of-range values block; `.inert` fields are labelled, not
+    /// refused (the engine accepts and ignores them). The family-pair check
+    /// runs first (it is what `SamplingRecipePicker` already reports).
     static func validationError(_ d: PresetSamplingDraft) -> String? {
         let familyName = SamplingRecipeCatalog.canonicalFamily(d.modelFamily) ?? "this model"
 
@@ -111,72 +234,57 @@ enum PresetSamplingValidator {
         // shift — a positive number the family reads and the schedule honours.
         if let shift = d.shift {
             guard shift.isFinite, shift > 0 else {
-                return "Shift must be a positive number (leave it empty for the model default)."
+                return "shift must be a positive number (got \(format(shift))); omit it for the resolution-dependent default"
             }
-            guard SamplingGate.shiftAllowed(modelFamily: d.modelFamily) else {
-                return "Shift is a krea2 / Z-Image schedule field; \(familyName) does not honour it."
-            }
-            guard SamplingRecipeCatalog.shiftIsHonoured(sigmaSchedule: d.sigmaSchedule, forModelFamily: d.modelFamily) else {
-                return "Shift is not read by the '\(d.sigmaSchedule)' schedule on \(familyName) — drop it, or choose a schedule that honours it."
+            if case .refused(let why) = SamplingGate.shift(modelFamily: d.modelFamily, sigmaSchedule: d.sigmaSchedule) {
+                return why
             }
         }
 
-        // eta / bongmath — krea2 + RES4LYF sampler only.
+        // eta / bongmath — the Krea 2 tier gates.
         if let eta = d.eta, eta != 0 {
-            guard eta.isFinite, eta >= 0 else { return "Eta must be a finite number ≥ 0." }
-            guard SamplingGate.sdeAllowed(modelFamily: d.modelFamily, sampler: d.sampler) else {
-                return "Eta \(format(eta)) needs a Krea 2 RES4LYF sampler; '\(d.sampler.isEmpty ? "model default (euler)" : d.sampler)' on \(familyName) would be refused."
-            }
+            guard eta.isFinite, eta >= 0 else { return "eta must be a finite number >= 0 (got \(format(eta)))" }
+            if case .refused(let why) = SamplingGate.eta(modelFamily: d.modelFamily, sampler: d.sampler) { return why }
         }
-        if d.bongmath == true, !SamplingGate.sdeAllowed(modelFamily: d.modelFamily, sampler: d.sampler) {
-            return "Bongmath needs a Krea 2 RES4LYF sampler; '\(d.sampler.isEmpty ? "model default (euler)" : d.sampler)' on \(familyName) would be refused."
+        if d.bongmath == true, case .refused(let why) = SamplingGate.bongmath(modelFamily: d.modelFamily, sampler: d.sampler) {
+            return why
         }
 
-        // RES4LYF noise / implicit-RK / c2 / projector — krea2 only, in range.
-        let noiseAllowed = SamplingGate.noiseAllowed(modelFamily: d.modelFamily)
-        if let noiseType = d.noiseType, !noiseType.isEmpty {
-            guard ["gaussian", "fractal", "pyramid"].contains(noiseType) else {
-                return "Noise type must be gaussian, fractal or pyramid."
-            }
-            guard noiseAllowed else { return "Noise type is a Krea 2 setting; \(familyName) does not read it." }
+        // RES4LYF noise / implicit-RK / c2 / projector — range checks only
+        // (`PresetStore.validateRecipeFields`); no family gate exists.
+        if let noiseType = d.noiseType, !noiseType.isEmpty,
+           !["gaussian", "fractal", "pyramid"].contains(noiseType) {
+            return "noise_type must be one of gaussian, fractal, pyramid (got \(noiseType))"
         }
-        if let noiseAlpha = d.noiseAlpha, noiseAlpha != 0 {
-            guard noiseAlpha.isFinite else { return "Noise alpha must be a finite number." }
-            guard noiseAllowed else { return "Noise alpha is a Krea 2 setting; \(familyName) does not read it." }
+        if let noiseAlpha = d.noiseAlpha, !noiseAlpha.isFinite {
+            return "noise_alpha must be a finite number"
         }
-        if let implicitSteps = d.implicitSteps, implicitSteps != 0 {
-            guard (0...8).contains(implicitSteps) else { return "Implicit steps must be an integer in 0…8." }
-            guard noiseAllowed else { return "Implicit steps is a Krea 2 setting; \(familyName) does not read it." }
+        if let implicitSteps = d.implicitSteps, !(0...8).contains(implicitSteps) {
+            return "implicit_steps must be an integer in 0...8 (got \(implicitSteps)); 0 is the explicit render"
         }
-        if let c2 = d.c2 {
-            guard c2.isFinite, c2 > 0, c2 <= 1, abs(c2 - c2Pole) >= 1e-6 else {
-                return "C2 must be in (0, 1] and not 2/3 (the res_3s tableau pole)."
-            }
-            if c2 != 0.5, !noiseAllowed { return "C2 is a Krea 2 setting; \(familyName) does not read it." }
+        if let c2 = d.c2, !(c2.isFinite && c2 > 0 && c2 <= 1 && abs(c2 - c2Pole) >= 1e-6) {
+            return "c2 must be a finite number in (0, 1] other than 2/3 (got \(format(c2))); 0.5 is the default"
         }
-        if let projectorScale = d.projectorScale {
-            guard projectorScale.isFinite, (0.0...3.0).contains(projectorScale) else {
-                return "Projector scale must be in 0…3 (1.0 is neutral)."
-            }
-            if projectorScale != 1.0, !noiseAllowed { return "Projector scale is a Krea 2 setting; \(familyName) does not read it." }
+        if let projectorScale = d.projectorScale, !(projectorScale.isFinite && (0.0...3.0).contains(projectorScale)) {
+            return "projector_scale must be a finite number in 0.0...3.0 (got \(format(projectorScale))); 1.0 is neutral"
         }
 
-        // vae — krea2 only, non-blank when present.
+        // vae — a Krea 2 request field (vaeGate).
         if let vae = d.vae, !vae.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           !SamplingGate.vaeAllowed(modelFamily: d.modelFamily) {
-            return "A VAE override is a Krea 2 setting; \(familyName) does not read it."
+           case .refused(let why) = SamplingGate.vae(modelFamily: d.modelFamily) {
+            return why
         }
 
-        // stage 2 — krea2 only; needs steps AND denoise; own pair + eta rule.
+        // stage 2 — krea2 only (stage2Gate); needs steps AND denoise; own
+        // pair; eta on the EFFECTIVE sampler with the EFFECTIVE eta
+        // (`stage2.eta ?? eta`, WarmServer.stage2Gate); bongmath unimplemented.
         if d.stage2Enabled {
-            guard SamplingGate.stage2Allowed(modelFamily: d.modelFamily) else {
-                return "A detail pass (stage 2) is a Krea 2 mechanism; \(familyName) has no such seam."
-            }
+            if case .refused(let why) = SamplingGate.stage2(modelFamily: d.modelFamily) { return why }
             guard let steps = d.stage2Steps, steps > 0 else {
-                return "Stage 2 needs a positive step count."
+                return "stage2.steps must be positive — a detail pass needs a step count"
             }
             guard let denoise = d.stage2Denoise, denoise.isFinite, denoise > 0, denoise <= 1 else {
-                return "Stage 2 needs a denoise fraction in (0, 1]."
+                return "stage2.denoise is the fraction of the schedule the stage runs and must be in (0, 1]"
             }
             if !d.stage2Sampler.isEmpty || !d.stage2SigmaSchedule.isEmpty {
                 if !SamplingRecipeCatalog.supports(
@@ -187,13 +295,16 @@ enum PresetSamplingValidator {
                     return "The stage 2 sampler/scheduler pair is not supported by \(familyName)."
                 }
             }
-            if let eta = d.stage2Eta, eta != 0 {
-                guard eta.isFinite, eta >= 0 else { return "Stage 2 eta must be a finite number ≥ 0." }
-                guard SamplingGate.stage2SDEAllowed(
+            if d.stage2Bongmath == true {
+                return "'stage2.bongmath' = 'true' is not supported: bongmath is parity tier T3 (WP-E16) and is not implemented yet; omit it or send false"
+            }
+            let effectiveEta = d.stage2Eta ?? d.eta ?? 0
+            if effectiveEta != 0 {
+                guard effectiveEta.isFinite, effectiveEta >= 0 else { return "stage2.eta must be a finite number >= 0" }
+                if case .refused(let why) = SamplingGate.stage2Eta(
                     modelFamily: d.modelFamily, stage2Sampler: d.stage2Sampler, stage1Sampler: d.sampler
-                ) else {
-                    let effective = d.stage2Sampler.isEmpty ? d.sampler : d.stage2Sampler
-                    return "Stage 2 eta needs a RES4LYF sampler; stage 2 would run '\(effective.isEmpty ? "model default (euler)" : effective)'."
+                ) {
+                    return why
                 }
             }
         }

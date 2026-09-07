@@ -143,15 +143,24 @@ struct GenerationView: View {
         engine.currentModelFamily ?? engine.currentModel
     }
 
+    /// #419: the same validator the preset editor uses — sampler/schedule
+    /// pair, shift (incl. the flux1 schedule rule), eta/bongmath tier gates,
+    /// noise ranges — so Generate refuses locally exactly what the engine
+    /// would 400 on, with the engine's wording.
     private var samplingValidationError: String? {
-        guard !sampler.isEmpty || !sigmaSchedule.isEmpty else { return nil }
-        guard !SamplingRecipeCatalog.supports(
-            sampler: sampler.isEmpty ? nil : sampler,
-            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
-            forModelFamily: samplingModelFamily
-        ) else { return nil }
-        let family = SamplingRecipeCatalog.canonicalFamily(samplingModelFamily) ?? "the active model"
-        return "Sampler '\(sampler.isEmpty ? "Model Default" : sampler)' and scheduler '\(sigmaSchedule.isEmpty ? "Model Default" : sigmaSchedule)' are not supported together by \(family)."
+        PresetSamplingValidator.validationError(PresetSamplingDraft(
+            modelFamily: samplingModelFamily,
+            sampler: sampler,
+            sigmaSchedule: sigmaSchedule,
+            shift: shift.wrappedValue,
+            eta: eta == 0 ? nil : eta,
+            bongmath: bongmath ? true : nil,
+            noiseType: noiseType == "gaussian" ? nil : noiseType,
+            noiseAlpha: noiseAlpha == 0 ? nil : noiseAlpha,
+            implicitSteps: implicitSteps.rounded() == 0 ? nil : Int(implicitSteps.rounded()),
+            c2: c2 == 0.5 ? nil : c2,
+            projectorScale: projectorScale == 1.0 ? nil : projectorScale
+        ))
     }
 
     // Sidebar sections
@@ -299,10 +308,11 @@ struct GenerationView: View {
                         negativePrompt: editedNegative.isEmpty ? nil : editedNegative,
                         steps: Int(steps),
                         guidance: guidance,
-                        projectorScale: projectorScale,
+                        // Neutral values stay absent — never freeze a default.
+                        projectorScale: projectorScale == 1.0 ? nil : projectorScale,
                         noiseType: noiseType == "gaussian" ? nil : noiseType,
                         noiseAlpha: noiseAlpha == 0 ? nil : noiseAlpha,
-                        implicitSteps: implicitSteps == 0 ? nil : Int(implicitSteps),
+                        implicitSteps: implicitSteps.rounded() == 0 ? nil : Int(implicitSteps.rounded()),
                         c2: c2 == 0.5 ? nil : c2,
                         width: effectiveWidth,
                         height: effectiveHeight,
@@ -853,13 +863,20 @@ struct GenerationView: View {
                 modelFamily: samplingModelFamily
             )
             .disabled(backend != .local)
+            .onChange(of: sampler) { _, newSampler in
+                // User-initiated (the picker is the only writer besides
+                // applyPreset, which sets a whole recipe): the one automatic
+                // reset — a sampler that refuses eta/bongmath drops them.
+                if SamplingGate.eta(modelFamily: samplingModelFamily, sampler: newSampler).isRefused { eta = 0 }
+                if SamplingGate.bongmath(modelFamily: samplingModelFamily, sampler: newSampler).isRefused { bongmath = false }
+            }
 
             // #419: shift + projector scale + the RES4LYF SDE / bongmath /
             // noise knobs (the Clownshark recipe) — the SAME family-aware
-            // subview the preset editor shows, so the "eta needs krea2 + a
-            // RES4LYF sampler" gate exists once. eta/bongmath are sampler-
-            // gated 400s on the engine, not no-ops: the subview disables and
-            // resets them when the family or sampler stops honouring them.
+            // subview the preset editor shows, so the eta/bongmath gate
+            // exists once. A refused value is greyed with Clear beside it and
+            // `samplingValidationError` refuses the render locally; nothing is
+            // reset when the model changes underneath a loaded value.
             SamplingAdvancedControls(
                 shift: shift,
                 projectorScale: $projectorScale,
@@ -1232,7 +1249,7 @@ struct GenerationView: View {
             bongmath: bongmath,
             noiseType: noiseType,
             noiseAlpha: Float(noiseAlpha),
-            implicitSteps: Int(implicitSteps),
+            implicitSteps: Int(implicitSteps.rounded()),
             c2: Float(c2),
             shift: shift.wrappedValue.map { Float($0) },
             sampler: sampler.isEmpty ? nil : sampler,
@@ -1286,7 +1303,7 @@ struct GenerationView: View {
             bongmath: bongmath,
             noiseType: noiseType,
             noiseAlpha: Float(noiseAlpha),
-            implicitSteps: Int(implicitSteps),
+            implicitSteps: Int(implicitSteps.rounded()),
             c2: Float(c2),
             shift: shift.wrappedValue.map { Float($0) },
             sampler: sampler.isEmpty ? nil : sampler,
