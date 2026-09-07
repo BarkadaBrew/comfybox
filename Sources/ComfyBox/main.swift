@@ -3780,13 +3780,27 @@ struct ZImageCLI {
     #if canImport(AVFoundation) && canImport(CoreGraphics)
     let cgFrames = LTX2PostProcess.framesToImages(from: output.decoded)
     print("  Extracted \(cgFrames.count) frames")
+    // comfybox#401 (review round 2, ruling 2): this CLI ("ComfyBox video")
+    // renders through `LTX2Pipeline` directly, bypassing
+    // `LTX2VideoGenerator.render`'s choke point — build the record from
+    // this command's own resolved arguments.
+    let videoCLIRecord = VideoGenerationRecord(
+      prompt: promptText, seed: actualSeed, steps: denoiseSteps,
+      model: VideoGenerationRecord.basename(transformerPath.path),
+      width: width, height: height, frames: cgFrames.count, fps: fps,
+      resolvedWidth: width, resolvedHeight: height,
+      twoPass: false, refine: false, audio: false,
+      kind: VideoGenerationRecord.kind(initImagePath: imagePath, extendToSeconds: 0),
+      loras: loraPath.map { [VideoGenerationRecord.LoRAEntry(name: VideoGenerationRecord.basename($0), scale: loraStrength)] } ?? [])
     try LTX2PostProcess.writeMP4(
       frames: cgFrames,
       outputPath: outputPath,
       fps: fps,
       width: width,
-      height: height
+      height: height,
+      generationRecordJSON: videoCLIRecord.atomJSONString
     )
+    VideoSidecar.write(videoCLIRecord, forMediaAt: outputPath)
     #else
     // Fallback: write PPM frames and invoke ffmpeg
     let ppmDir = outputPath.replacingOccurrences(of: ".mp4", with: "-frames")
@@ -4229,13 +4243,27 @@ struct ZImageCLI {
     #if canImport(AVFoundation) && canImport(CoreGraphics)
     let cgFrames = LTX2PostProcess.framesToImages(from: output.decoded)
     print("  Extracted \(cgFrames.count) CGImage frames")
+    // comfybox#401 (review round 2, ruling 2): "ltx2-demo" bypasses
+    // `LTX2VideoGenerator.render` — build the record from this command's
+    // own resolved arguments. `prompt` is optional here (embeddings/dummy
+    // modes skip the text encoder entirely).
+    let ltx2DemoRecord = VideoGenerationRecord(
+      prompt: prompt ?? (embeddingsPath.map { "(embeddings: \($0))" } ?? "(dummy random embeddings)"),
+      seed: UInt64(seed), steps: steps,
+      model: VideoGenerationRecord.basename(transformerPath.path),
+      width: width, height: height, frames: cgFrames.count, fps: 24,
+      resolvedWidth: width, resolvedHeight: height,
+      twoPass: false, refine: false, audio: false, kind: "t2v",
+      loras: loraPath.map { [VideoGenerationRecord.LoRAEntry(name: VideoGenerationRecord.basename($0), scale: loraStrength)] } ?? [])
     try LTX2PostProcess.writeMP4(
       frames: cgFrames,
       outputPath: outputPath,
       fps: 24,
       width: width,
-      height: height
+      height: height,
+      generationRecordJSON: ltx2DemoRecord.atomJSONString
     )
+    VideoSidecar.write(ltx2DemoRecord, forMediaAt: outputPath)
     #else
     let ppmDir = outputPath.replacingOccurrences(of: ".mp4", with: "-frames")
     try LTX2PostProcess.writeFramesPPM(from: output.decoded, outputDir: ppmDir)
@@ -4686,13 +4714,26 @@ struct ZImageCLI {
     print("Total time:   \(String(format: "%.1f", overallTime))s")
 
     print("Writing MP4 to \(outputPath)...")
+    // comfybox#401 (review round 2, ruling 2): "ltx2-i2v" (chunked) bypasses
+    // `LTX2VideoGenerator.render` — build the record from this command's
+    // own resolved arguments.
+    let ltx2I2VRecord = VideoGenerationRecord(
+      prompt: promptText, seed: UInt64(seed), steps: steps,
+      model: VideoGenerationRecord.basename(transformerPath.path),
+      width: width, height: height, frames: allFrames.count, fps: fps,
+      resolvedWidth: width, resolvedHeight: height,
+      twoPass: false, refine: false, audio: false,
+      kind: VideoGenerationRecord.kind(initImagePath: initImagePath, extendToSeconds: extendToSeconds),
+      loras: loraPath.map { [VideoGenerationRecord.LoRAEntry(name: VideoGenerationRecord.basename($0), scale: loraStrength)] } ?? [])
     try LTX2PostProcess.writeMP4(
       frames: allFrames,
       outputPath: outputPath,
       fps: fps,
       width: width,
-      height: height
+      height: height,
+      generationRecordJSON: ltx2I2VRecord.atomJSONString
     )
+    VideoSidecar.write(ltx2I2VRecord, forMediaAt: outputPath)
 
     if let attrs = try? FileManager.default.attributesOfItem(atPath: outputPath),
        let size = attrs[FileAttributeKey.size] as? Int {

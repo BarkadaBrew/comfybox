@@ -38,6 +38,10 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
   /// single seed) — every per-shot/per-render record carries one.
   public let seed: UInt64?
   public let steps: Int?
+  /// CFG guidance — LTX's primary motion lever (>1 amplifies the action
+  /// direction). Same field/key `ImageMetadata.generation`'s `guidance`
+  /// carries on the PNG side.
+  public let guidance: Float?
   /// Physical model file basename (no directory, no extension) — mirrors
   /// `ImageMetadata.generation`'s `model` field.
   public let model: String
@@ -75,6 +79,18 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
   /// `"extend"` is an i2v render whose request asked for more than one chunk
   /// (`extendToSeconds > 0`); a plain i2v single chunk stays `"i2v"`.
   public let kind: String
+  /// Which app/persona generated it — same field `ImageMetadata.generation`
+  /// writes under the `source` key (parameter name `generatedBy` there;
+  /// named `source` here to land on the identical wire key).
+  public let source: String?
+  /// Content mode (neutral/apple/banana/avocado) — same key
+  /// `ImageMetadata.generation`'s `content_mode` carries.
+  public let contentMode: String?
+  /// `true` only on the mp4 atom's copy of a record that exceeded
+  /// `VideoGenerationRecord.atomSizeCap` (ruling 5) — the sidecar this
+  /// field's record sits next to is ALWAYS the full, untruncated record;
+  /// this flag only ever appears embedded in the container header.
+  public let truncated: Bool
 
   public let loras: [LoRAEntry]
 
@@ -89,15 +105,18 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
 
   public init(
     prompt: String, negativePrompt: String? = nil, seed: UInt64? = nil, steps: Int? = nil,
+    guidance: Float? = nil,
     model: String, width: Int, height: Int, frames: Int, fps: Int,
     resolvedWidth: Int, resolvedHeight: Int, dimensionReason: String? = nil,
     twoPass: Bool, refine: Bool, refineSkippedReason: String? = nil, audio: Bool,
-    kind: String, loras: [LoRAEntry] = []
+    kind: String, source: String? = nil, contentMode: String? = nil, truncated: Bool = false,
+    loras: [LoRAEntry] = []
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
     self.seed = seed
     self.steps = steps
+    self.guidance = guidance
     self.model = model
     self.width = width
     self.height = height
@@ -111,6 +130,9 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     self.refineSkippedReason = refineSkippedReason
     self.audio = audio
     self.kind = kind
+    self.source = source
+    self.contentMode = contentMode
+    self.truncated = truncated
     self.loras = loras
   }
 }
@@ -120,7 +142,7 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
 extension VideoGenerationRecord {
   /// A file's basename with its extension stripped — the same normalisation
   /// `ImageMetadata.generation`'s `model`/`loras[].name` use.
-  static func basename(_ path: String) -> String {
+  public static func basename(_ path: String) -> String {
     (((path as NSString).lastPathComponent) as NSString).deletingPathExtension
   }
 
@@ -133,6 +155,14 @@ extension VideoGenerationRecord {
   /// Build the record for one `LTX2VideoGenerator.render()` output. Pure —
   /// takes only value types, no pipeline/model access — so it's testable
   /// without weights.
+  ///
+  /// `dimensionReason` comes from `request.dimensionReason` — review round 2
+  /// ruling 6: this is NOT a one-line wire-up. `#405`/`#408`
+  /// (`VideoDimensionResolver`) runs inside `WarmServer.prepareLocalVideo`,
+  /// a different layer than this generator-level `render()`, and #408 was
+  /// still rewriting that area of `WarmServer.swift` as of this ticket. The
+  /// field exists on `LTX2VideoRequest` now so #408's PR only has to set one
+  /// property when it lands; #408 owns the actual wire-up.
   public static func build(
     request: LTX2VideoRequest,
     transformerFile: String,
@@ -141,14 +171,14 @@ extension VideoGenerationRecord {
     resolvedHeight: Int,
     twoStageRequested: Bool,
     refineSkippedReason: String?,
-    audioWritten: Bool,
-    dimensionReason: String? = nil
+    audioWritten: Bool
   ) -> VideoGenerationRecord {
     VideoGenerationRecord(
       prompt: request.prompt,
       negativePrompt: request.negativePrompt,
       seed: request.seed,
       steps: request.steps,
+      guidance: request.guidance,
       model: basename(transformerFile),
       width: request.width,
       height: request.height,
@@ -156,12 +186,14 @@ extension VideoGenerationRecord {
       fps: request.fps,
       resolvedWidth: resolvedWidth,
       resolvedHeight: resolvedHeight,
-      dimensionReason: dimensionReason,
+      dimensionReason: request.dimensionReason,
       twoPass: twoStageRequested,
       refine: twoStageRequested && refineSkippedReason == nil,
       refineSkippedReason: refineSkippedReason,
       audio: audioWritten,
       kind: kind(initImagePath: request.initImagePath, extendToSeconds: request.extendToSeconds),
+      source: request.source,
+      contentMode: request.contentMode,
       loras: request.effectiveLoRAs.map { LoRAEntry(name: basename($0.path), scale: $0.scale) }
     )
   }
@@ -185,6 +217,36 @@ extension VideoGenerationRecord {
     let decoder = JSONDecoder()
     decoder.keyDecodingStrategy = .convertFromSnakeCase
     return try decoder.decode(VideoGenerationRecord.self, from: data)
+  }
+
+  /// Review round 2, ruling 5: the mp4 metadata atom lives in the container
+  /// header — an unbounded record there is a header an unrelated tool has to
+  /// buffer whole just to seek the file. The sidecar has no such constraint
+  /// and always carries the full record; only the atom is capped.
+  public static let atomSizeCap = 64 * 1024
+
+  /// JSON for the mp4 atom: the full record when it fits under
+  /// `atomSizeCap`, otherwise a minimal record — prompt clipped to 200
+  /// characters, every other optional field dropped — with `truncated: true`
+  /// so a reader of the atom alone can tell it isn't the whole story (the
+  /// sidecar next to the file is). Never throws; `nil` only if even the
+  /// truncated record can't encode.
+  public func atomJSON() -> Data? {
+    guard let full = try? encodeJSON() else { return nil }
+    guard full.count > Self.atomSizeCap else { return full }
+    let clipped = VideoGenerationRecord(
+      prompt: String(prompt.prefix(200)), seed: seed, steps: steps, model: model,
+      width: width, height: height, frames: frames, fps: fps,
+      resolvedWidth: resolvedWidth, resolvedHeight: resolvedHeight,
+      twoPass: twoPass, refine: refine, audio: audio, kind: kind, truncated: true)
+    return try? clipped.encodeJSON()
+  }
+
+  /// Convenience for a `writeMP4(generationRecordJSON:)` call site — the
+  /// atom's bytes as UTF-8, or `nil` if neither the full nor the clipped
+  /// record could encode.
+  public var atomJSONString: String? {
+    atomJSON().flatMap { String(data: $0, encoding: .utf8) }
   }
 }
 
