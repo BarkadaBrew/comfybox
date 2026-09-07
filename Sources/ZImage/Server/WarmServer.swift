@@ -294,6 +294,17 @@ public final class WarmServer {
   let characterStore = CharacterStore()
   /// Nearline model/LoRA catalog (attached storage staged on demand).
   let nearlineLibrary = NearlineLibrary()
+  /// comfybox#396: names whose nearline copy is still running past the
+  /// bound in `boundedNearlineStage(name:)` — a retry reports `.timedOut`
+  /// at once instead of parking another thread on a hung volume.
+  private var nearlineStagesInFlight: [String: Date] = [:]
+  private let nearlineStageLock = NSLock()
+  /// PR #418 review (item 3): an in-flight entry expires after this age even
+  /// if its thread is still blocked, so a replugged volume lets the name
+  /// resolve again; and at most this many staging threads may be parked
+  /// before further staging is refused outright.
+  static var nearlineStageInFlightMaxAge: TimeInterval = 600
+  static var nearlineStageMaxParkedThreads = 8
   /// Local LTX-2 video generator, built lazily when the weights are configured.
   /// Held in a shared, lock-based box so the coordinator can evict it before an
   /// image load — image + video cannot co-reside in unified memory (#218).
@@ -823,8 +834,16 @@ public final class WarmServer {
 
     case ("POST", "/v1/lora/swap"):
       do {
-        var payload = try decode(LoRASwapPayload.self, from: request.body)
-        payload = stageNearlineLoras(in: payload)
+        // comfybox#415/#396: every entry validated and resolved on local
+        // disk HERE — a malformed entry is a 400 and nothing is enqueued;
+        // an unresolvable one is skipped and reported, never walked for on
+        // the actor or fetched from anywhere.
+        let (payload, unresolved) = try preflightSwap(try decode(LoRASwapPayload.self, from: request.body))
+        // PR #418 review (Critical 2): ATOMIC — any unresolvable entry
+        // refuses the whole swap; the resident stack is untouched.
+        if !unresolved.isEmpty {
+          return .json(status: 400, payload: LoRASwapRefusal(unresolved: unresolved))
+        }
         // #402 fix round 1/2 (Critical 1): prefer the swap's OWN declared
         // family (checkpoint_family/model); fall back to whatever base is
         // RESIDENT right now (RequestStackResolver's WarmDefaultTag doc) —
@@ -1204,6 +1223,9 @@ public final class WarmServer {
       return .error(.error(status: 500, message: "Failed to serialize LoRA entry"))
 
     case ("POST", "/v1/loras/scan"):
+      // PR #418 review: a rescan is the engine's only "library changed"
+      // signal (no filesystem watcher) — drop the bare-name walk cache.
+      LoRAEntry.invalidateLocalIndex()
       guard let library = loraLibrary else {
         return .error(.error(status: 503, message: "LoRA Library not initialized"))
       }
@@ -2023,23 +2045,108 @@ public final class WarmServer {
     return .json(.rawJSON(status: 200, data: data))
   }
 
-  /// Auto-stage: rewrite bare LoRA filenames that only exist on nearline
-  /// storage to their freshly staged local paths, so a preset (or any swap
-  /// request) can reference archived LoRAs and they appear on demand.
+  /// The library index as a bare-name → absolute-path lookup for
+  /// `LoRASwapPreflight` (nil when no library is loaded).
+  private func libraryPathLookup(_ name: String) -> String? {
+    guard let library = loraLibrary, let url = try? library.resolve(name) else { return nil }
+    return url.path
+  }
+
+  /// comfybox#396: `NearlineLibrary.stage` is a synchronous copy from an
+  /// attached disk, and on a hung volume it never returns — the 2026-09-07
+  /// swap for `KreaAmateur_V2.safetensors` sat in it for the daemon's full
+  /// 600 s timeout although the file was on local disk all along (the
+  /// nearline catalog also lists it, on Bolt). Two fixes: the caller only
+  /// gets here for a name that is NOT on local disk, and the copy runs on
+  /// its own `Thread` (not the cooperative pool) with the wait bounded by
+  /// `LoRASwapPreflight.nearlineStageTimeout`. A copy that outlives the
+  /// bound keeps running; its name stays in `nearlineStagesInFlight` so a
+  /// retry reports `.timedOut` at once instead of parking another thread
+  /// (`stage()` itself already joins a concurrent copy of the same name).
+  func boundedNearlineStage(name: String) -> LoRASwapPreflight.NearlineStageOutcome {
+    guard name.hasSuffix(".safetensors"), nearlineLibrary.item(named: name) != nil else { return .notNearline }
+    nearlineStageLock.lock()
+    let now = Date()
+    // Expire stale in-flight marks (thread still parked on a dead mount past
+    // the max age) so a replug lets the name be attempted again.
+    nearlineStagesInFlight = nearlineStagesInFlight.filter {
+      now.timeIntervalSince($0.value) < Self.nearlineStageInFlightMaxAge
+    }
+    if nearlineStagesInFlight[name] != nil {
+      nearlineStageLock.unlock()
+      return .timedOut
+    }
+    if nearlineStagesInFlight.count >= Self.nearlineStageMaxParkedThreads {
+      nearlineStageLock.unlock()
+      logger.warning("Nearline: refusing to stage \(name) — \(nearlineStagesInFlight.count) copies already parked (cap \(Self.nearlineStageMaxParkedThreads))")
+      return .failed("nearline staging refused: \(Self.nearlineStageMaxParkedThreads) copies already in flight — is the nearline volume responding?")
+    }
+    let mark = now
+    nearlineStagesInFlight[name] = mark
+    nearlineStageLock.unlock()
+
+    let box = NearlineStageResultBox()
+    let library = nearlineLibrary
+    let thread = Thread { [weak self] in
+      let result = Result { try library.stage(name: name) }
+      if let self {
+        self.nearlineStageLock.lock()
+        // PR #418 re-review (item 3): only clear OUR mark — a thread that
+        // finishes late (after its mark expired and a newer attempt for
+        // the same name was started) must not erase the newer mark.
+        if self.nearlineStagesInFlight[name] == mark { self.nearlineStagesInFlight[name] = nil }
+        self.nearlineStageLock.unlock()
+      }
+      box.finish(result)
+    }
+    thread.name = "comfybox.nearline-stage"
+    thread.start()
+    guard let result = box.wait(timeout: LoRASwapPreflight.nearlineStageTimeout) else {
+      logger.warning("Nearline: staging \(name) exceeded \(Int(LoRASwapPreflight.nearlineStageTimeout))s — reported unresolved; copy continues in the background")
+      return .timedOut
+    }
+    switch result {
+    case .success(let staged):
+      logger.info("Nearline: auto-staged \(name) for LoRA swap")
+      return .staged(staged)
+    case .failure(let error):
+      return .failed(error.localizedDescription)
+    }
+  }
+
+  /// `POST /v1/lora/swap`'s preflight (and the persisted-swap replay's): every
+  /// entry validated and resolved on local disk BEFORE the family guard and
+  /// before any coordinator work. Throws (a 400) for a malformed entry;
+  /// otherwise returns the payload to enqueue — every path absolute — plus
+  /// the entries that were skipped. See `LoRASwapPreflight`.
+  func preflightSwap(_ payload: LoRASwapPayload) throws -> (payload: LoRASwapPayload, unresolved: [LoRASwapPreflight.Unresolved]) {
+    let preflight = try LoRASwapPreflight.run(
+      entries: payload.loras,
+      libraryLookup: libraryPathLookup,
+      nearlineStage: boundedNearlineStage)
+    for skipped in preflight.unresolved {
+      logger.warning("/v1/lora/swap: skipped '\(skipped.path)' — \(skipped.reason)")
+    }
+    // Staging/resolution changes only the storage path. The semantic slot is
+    // part of the requested stack and must survive (notably `role: "accel"`
+    // for Krea-2 distill adapters whose names do not contain `turbo_lora`) —
+    // `LoRASwapPreflight` copies scale and role onto every rewritten entry.
+    let resolvedPayload = LoRASwapPayload(
+      loras: preflight.resolved, checkpointFamily: payload.checkpointFamily, model: payload.model)
+    return (resolvedPayload, preflight.unresolved)
+  }
+
+  /// Auto-stage for the GENERATE path's preset expansion: rewrite bare LoRA
+  /// filenames that exist ONLY on nearline storage to their staged local
+  /// paths. Names already on local disk are left untouched (the generate
+  /// path resolves them itself); the stage is the same bounded one the swap
+  /// route uses.
   private func stageNearlineLoras(in payload: LoRASwapPayload) -> LoRASwapPayload {
     let entries = payload.loras.map { entry -> LoRAEntry in
-      // Only bare safetensors filenames are candidates — absolute/relative
-      // paths and HF ids resolve through the normal machinery.
-      guard !entry.path.hasPrefix("/"), !entry.path.hasPrefix("~"), !entry.path.hasPrefix("."),
-            entry.path.hasSuffix(".safetensors"),
-            !FileManager.default.fileExists(atPath: (entry.path as NSString).expandingTildeInPath),
-            nearlineLibrary.item(named: entry.path) != nil
+      guard !LoRAEntry.looksLikeDirectPath(entry.path),
+            entry.resolvedLocalPath(libraryLookup: libraryPathLookup, searchRoots: LoRAEntry.bareFilenameSearchRoots) == .notFound,
+            case .staged(let staged) = boundedNearlineStage(name: entry.path)
       else { return entry }
-      guard let staged = try? nearlineLibrary.stage(name: entry.path) else { return entry }
-      logger.info("Nearline: auto-staged \(entry.path) for LoRA swap")
-      // Staging changes only the storage path. The semantic slot is part of
-      // the requested stack and must survive (notably `role: "accel"` for
-      // Krea-2 distill adapters whose names do not contain `turbo_lora`).
       return LoRAEntry(path: staged, scale: entry.scale, role: entry.role)
     }
     return LoRASwapPayload(loras: entries, checkpointFamily: payload.checkpointFamily, model: payload.model)
@@ -5834,6 +5941,13 @@ public final class WarmServer {
     // warm pipeline happened to hold, on whatever base was active.
     var expanded = try expandGeneratePayload(
       payload, store: store, stageNearline: stageNearline, loraExists: loraExists, log: log)
+    // PR #418 re-review (item 2): an EXPLICIT `loras` entry that is an
+    // absolute path on a removable volume is refused here — a 400 on the
+    // live routes, a dropped-and-recorded job on queue recovery — without a
+    // stat (a preset stack naming one already fell back above via
+    // `loraExists`). Left alone, `resolveSource` would take the path at its
+    // word and the loader would stat a hung mount on the actor at dequeue.
+    try LoRAEntry.refuseRemovableVolumeEntries(expanded.loras ?? [])
     // Todd 2026-08-24 ("I prefer style pack"): collapse the request's and the
     // preset's look declarations onto ONE resolved `style` name.
     //
@@ -6006,6 +6120,11 @@ public final class WarmServer {
     guard let configuration = try? entry.makeConfiguration() else { return false }
     switch configuration.source {
     case .local(let url):
+      // PR #418 re-review (item 2): this runs on the request task AND on
+      // queue recovery, where a `fileExists` on a hung /Volumes mount stalls
+      // the replay of every remaining job. A path on (or linking into) a
+      // removable volume is "not there" without a stat.
+      if LoRAEntry.classifyWithoutFollowing(url.path) == .removableVolume { return false }
       return FileManager.default.fileExists(atPath: url.path)
     case .huggingFace:
       return true
@@ -6225,7 +6344,21 @@ public final class WarmServer {
             _ = try await renderTask.value
             logger.info("Queue recovery: completed generate job \(job.id)")
           case QueueJobKind.loraSwap.rawValue:
-            let payload = stageNearlineLoras(in: try decode(LoRASwapPayload.self, from: job.rawBody))
+            // comfybox#415 poison-job guard: the same preflight the live
+            // route runs. A malformed entry throws (recorded by the catch
+            // below, never enqueued); a job none of whose entries resolve on
+            // local disk is DROPPED here with a log line — the incident's
+            // `{"path":""}` swap was replayed after every restart and parked
+            // the coordinator each time. Not enqueued means not in the
+            // coordinator's snapshot, and the unadmitted tail narrows past it
+            // (cleared at the end of this loop), so the next restart does not
+            // see it again.
+            let (payload, unresolved) = try preflightSwap(try decode(LoRASwapPayload.self, from: job.rawBody))
+            if let reason = LoRASwapPreflight.poisonReason(
+              LoRASwapPreflight(resolved: payload.loras, unresolved: unresolved)) {
+              logger.warning("Queue recovery: dropping poison lora_swap job \(job.id) — \(reason)")
+              throw WarmServerError.invalidRequest(message: "poison lora_swap job dropped at replay — \(reason)")
+            }
             // Same admit-then-narrow fix as generate above. `jobId: job.id`
             // (new — `enqueueSwap` had no way to name a job before r3) is
             // what makes this job observable to `waitForAdmissionOrCompletion` at all.
@@ -6243,6 +6376,12 @@ public final class WarmServer {
           // WP-E4 (D22, AC-18): a persisted job that fails replay is marked
           // FAILED with the reason on its own id (GET /v1/generate/status/{id})
           // and in the audit log — never rendered, never silently dropped.
+          // PR #418 re-review (item 2): a persisted job whose LoRA stack names
+          // a removable-volume path is a poison job — say so explicitly (the
+          // swap case above logs its own line before throwing).
+          if error.localizedDescription.hasPrefix(LoRAEntry.removableVolumeRefusalPrefix) {
+            logger.warning("Queue recovery: dropping poison \(job.kind) job \(job.id) — \(error.localizedDescription)")
+          }
           logger.error("Queue recovery: job \(job.id) (\(job.kind)) failed — \(error.localizedDescription)")
           // #339 review r4, item 3: a failed lora_swap replay is recorded
           // here too, not just generate — there is no dedicated swap-job
@@ -14135,7 +14274,9 @@ struct UpscaleResponse: Encodable, Sendable {
   let warning: String?            // non-nil if target_resolution > 1024
 }
 
-private struct LoRASwapPayload: Decodable, Sendable {
+/// Internal (was private) since comfybox#415/#396 so the recovery-replay
+/// tests can decode a persisted swap body through the real wire decoder.
+struct LoRASwapPayload: Decodable, Sendable {
   let loras: [LoRAEntry]
   /// #402 fix round 1: the client's declared target family — same wire keys
   /// and same resolution (`PresetStore.resolvedLoRAFamily`) as a preset's
@@ -14155,10 +14296,173 @@ private struct LoRASwapPayload: Decodable, Sendable {
   }
 }
 
-private struct LoRASwapResponse: Encodable, Sendable {
+struct LoRASwapResponse: Encodable, Sendable {
   let success: Bool
   let loraCount: Int
   let loras: [LoRAState]
+}
+
+/// comfybox#415 / comfybox#396 — `POST /v1/lora/swap`'s entry validation,
+/// run at the ROUTE before the family guard, before `enqueueSwap`, before
+/// any coordinator hop. Pure given its closures, so it is unit-testable
+/// without a warm server.
+///
+/// Why it exists: the route used to enqueue the request as-is and let
+/// `LoRAEntry.resolveSource` run INSIDE `WarmServerCoordinator.runSwap`, on
+/// the actor. Two things could park it there for minutes: a walk of
+/// `/Volumes/Bolt/Models/loras` (a `fileExists` on a hung USB volume never
+/// returns — that is the 2026-09-07 coordinator wedge, comfybox#415, whose
+/// persisted `{"path":""}` job was replayed after every restart), and, in the
+/// route itself, `stageNearlineLoras` copying from that same volume for a
+/// name that was ALREADY on local disk (the ~10-minute hung response,
+/// comfybox#396). Now: an entry is either resolved to an absolute LOCAL path
+/// here, or reported in `unresolved` and skipped — within milliseconds. No
+/// network, no external volumes: this route performs no HuggingFace
+/// resolution at all (intent.md: no cloud fallbacks).
+struct LoRASwapPreflight: Sendable {
+  struct Unresolved: Codable, Sendable, Equatable {
+    let path: String
+    let reason: String
+  }
+
+  /// What a nearline stage attempt came back with — see
+  /// `WarmServer.boundedNearlineStage(name:)`.
+  enum NearlineStageOutcome: Equatable {
+    /// The name is not in the nearline catalog at all.
+    case notNearline
+    case staged(String)
+    /// The copy did not finish inside the bound; it keeps running in the
+    /// background and a retry joins it.
+    case timedOut
+    case failed(String)
+  }
+
+  /// Entries that resolved, with `path` rewritten to the absolute local
+  /// file (scale and role preserved).
+  let resolved: [LoRAEntry]
+  let unresolved: [Unresolved]
+
+  /// PR #418 review (Critical 2): the swap stays ATOMIC. ANY unresolvable
+  /// entry → the route answers 400 with `unresolved` and leaves the resident
+  /// stack alone; 200 means every entry was applied. The daemon treats any
+  /// 200 as "all loaded" (coffeeshop-server resilient-swap.ts), so a partial
+  /// 200 would falsify provenance (#1639); its probe (whole set → each alone
+  /// → the good subset) does the skipping honestly on a 400.
+  var hasUnresolved: Bool { !unresolved.isEmpty }
+
+  /// Default bound on a nearline stage (a synchronous copy from an attached
+  /// disk). `static var` so tests can shrink it.
+  static var nearlineStageTimeout: TimeInterval = 10
+
+  static func run(
+    entries: [LoRAEntry],
+    libraryLookup: (String) -> String?,
+    searchRoots: [String] = LoRAEntry.bareFilenameSearchRoots,
+    nearlineStage: (String) -> NearlineStageOutcome = { _ in .notNearline }
+  ) throws -> LoRASwapPreflight {
+    var resolved: [LoRAEntry] = []
+    var unresolved: [Unresolved] = []
+    for entry in entries {
+      // Malformed entries are a 400 for the whole request, before anything
+      // is enqueued: an empty path (the #415 poison job), an unknown role,
+      // a non-finite scale.
+      let path = try LoRAEntry.validatedPath(entry.path)
+      try entry.validateDeclaredFields()
+
+      switch entry.resolvedLocalPath(libraryLookup: libraryLookup, searchRoots: searchRoots) {
+      case .found(let local):
+        resolved.append(LoRAEntry(path: local, scale: entry.scale, role: entry.role))
+        continue
+      case .removableVolume(let candidate):
+        unresolved.append(Unresolved(
+          path: path,
+          reason: "removable-volume: '\(candidate)' is on /Volumes; /v1/lora/swap never reads a removable volume "
+            + "(a hung mount would park the request) — copy the file into the LoRA library"))
+        continue
+      case .notFound:
+        break
+      }
+      if LoRAEntry.looksLikeDirectPath(path) {
+        unresolved.append(Unresolved(path: path, reason: "file does not exist"))
+        continue
+      }
+      if !LoRAEntry.looksLikeLocalFilename(path) {
+        unresolved.append(Unresolved(
+          path: path,
+          reason: "not a local file; /v1/lora/swap does not resolve HuggingFace repo ids or download anything"))
+        continue
+      }
+      switch nearlineStage(path) {
+      case .staged(let stagedPath):
+        resolved.append(LoRAEntry(path: stagedPath, scale: entry.scale, role: entry.role))
+      case .timedOut:
+        unresolved.append(Unresolved(
+          path: path,
+          reason: "nearline staging did not finish within \(Int(nearlineStageTimeout))s; "
+            + "the copy continues in the background — retry the swap"))
+      case .failed(let message):
+        unresolved.append(Unresolved(path: path, reason: "nearline staging failed: \(message)"))
+      case .notNearline:
+        unresolved.append(Unresolved(
+          path: path,
+          reason: "not found in the LoRA library index or under \(searchRoots.joined(separator: ", "))"))
+      }
+    }
+    return LoRASwapPreflight(resolved: resolved, unresolved: unresolved)
+  }
+
+  /// The reason a persisted `lora_swap` job must be DROPPED at replay
+  /// instead of enqueued (comfybox#415 poison-job guard), or nil when it may
+  /// replay. A throwing preflight (empty path, bad role/scale) is the other
+  /// drop path — the caller's catch records it.
+  static func poisonReason(_ preflight: LoRASwapPreflight) -> String? {
+    guard preflight.hasUnresolved else { return nil }
+    return "the live route would refuse it (atomic swap) — unresolved on local disk: "
+      + preflight.unresolved.map { "'\($0.path)' (\($0.reason))" }.joined(separator: "; ")
+  }
+}
+
+/// 400 body for a swap whose entries ALL failed to resolve (see
+/// `LoRASwapPreflight.nothingApplicable`). `error` keeps the pre-existing
+/// "LoRA '<name>' not found" spelling clients already match on;
+/// `unresolved` is the structured list.
+struct LoRASwapRefusal: Encodable, Sendable {
+  let success: Bool
+  let error: String
+  let unresolved: [LoRASwapPreflight.Unresolved]
+
+  init(unresolved: [LoRASwapPreflight.Unresolved]) {
+    self.success = false
+    self.error = "LoRA "
+      + unresolved.map { "'\($0.path)' not found (\($0.reason))" }.joined(separator: "; ")
+      + ". No adapters applied; the resident stack is unchanged."
+    self.unresolved = unresolved
+  }
+}
+
+/// One-shot result slot for `WarmServer.boundedNearlineStage(name:)`: the
+/// staging thread `finish`es it, the caller `wait`s on it for at most the
+/// bound. A late finish after a timed-out wait is simply kept (nothing is
+/// waiting) — the thread never touches a continuation or a dead caller.
+final class NearlineStageResultBox: @unchecked Sendable {
+  private let lock = NSLock()
+  private let semaphore = DispatchSemaphore(value: 0)
+  private var result: Result<String, Error>?
+
+  func finish(_ result: Result<String, Error>) {
+    lock.lock()
+    self.result = result
+    lock.unlock()
+    semaphore.signal()
+  }
+
+  /// nil on timeout.
+  func wait(timeout: TimeInterval) -> Result<String, Error>? {
+    guard semaphore.wait(timeout: .now() + timeout) == .success else { return nil }
+    lock.lock()
+    defer { lock.unlock() }
+    return result
+  }
 }
 
 extension WarmServer {
@@ -14320,18 +14624,248 @@ struct LoRAEntry: Codable, Sendable {
   /// against — this used to hardcode a stale, unrelated "~/Models/loras"
   /// path that nothing actually writes to, so bare-filename resolution
   /// against the real library silently never worked.
-  private static var bareFilenameSearchRoots: [String] {
+  ///
+  /// comfybox#415: LOCAL DISK ONLY. This list used to end with
+  /// `/Volumes/Bolt/Models/loras` and `~/Downloads`; `fileExists` on the
+  /// Bolt mount blocked the coordinator actor indefinitely once that USB
+  /// volume hung (2026-09-07), and the walk runs for EVERY name that is not
+  /// under the roots before it — including the empty one. External volumes
+  /// are the nearline library's business (`NearlineLibrary`), behind a bound.
+  static var bareFilenameSearchRoots: [String] {
     var roots: [String] = []
     if let envRoot = ProcessInfo.processInfo.environment["COMFYBOX_MODELS"], !envRoot.isEmpty {
       roots.append((envRoot as NSString).expandingTildeInPath)
     }
     roots.append(("~/.comfybox/loras" as NSString).expandingTildeInPath)
-    roots.append("/Volumes/Bolt/Models/loras")
-    // Ad-hoc/test LoRAs commonly land in Downloads before being filed into
-    // the library proper — worth checking before giving up.
-    roots.append(("~/Downloads" as NSString).expandingTildeInPath)
     var seen = Set<String>()
     return roots.filter { seen.insert($0).inserted }
+  }
+
+  /// comfybox#415: the incident's persisted job was `{"path":"","scale":0.5}`.
+  /// An empty (or whitespace) path is never resolvable and used to fall
+  /// through every search root before being handed to the HuggingFace
+  /// fallback as repo id "". Refused up front, everywhere an entry is read.
+  static func validatedPath(_ path: String) throws -> String {
+    guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      throw WarmServerError.invalidRequest(message: "LoRA entry has an empty path")
+    }
+    return path
+  }
+
+  /// Role and scale validation with no filesystem access — the swap
+  /// preflight runs this before anything is enqueued.
+  func validateDeclaredFields() throws {
+    _ = try resolvedRole()
+    _ = try resolvedScale()
+  }
+
+  /// Absolute, relative or tilde-prefixed: taken as a location, never as a
+  /// library name.
+  static func looksLikeDirectPath(_ path: String) -> Bool {
+    path.hasPrefix("/") || path.hasPrefix("./") || path.hasPrefix("../") || path.hasPrefix("~")
+  }
+
+  /// A string shaped like a local filename (ends in a known weight extension,
+  /// no "/") is never a valid HuggingFace repo id.
+  static func looksLikeLocalFilename(_ path: String) -> Bool {
+    !path.contains("/") && [".safetensors", ".ckpt", ".pt", ".bin"].contains { path.hasSuffix($0) }
+  }
+
+  /// Outcome of `resolvedLocalPath`.
+  enum LocalResolution: Equatable {
+    case found(String)
+    /// The candidate lives on — or symlinks into — `/Volumes`. It was NOT
+    /// stat'd (PR #418 review, Critical 1): a `stat` that follows a link
+    /// onto a hung removable mount never returns.
+    case removableVolume(String)
+    case notFound
+  }
+
+  static let removableVolumePrefix = "/Volumes/"
+
+  /// What a path is, learned with `lstat`/`readlink` ONLY — nothing here
+  /// ever follows a symlink with the kernel, so a link into a hung mount
+  /// (`~/.comfybox/loras/quarantine -> /Volumes/Bolt/…` on Todd's box) costs
+  /// a readlink, not a wedge. Link chains are resolved lexically, up to 8
+  /// hops, and any hop under `/Volumes` short-circuits to `.removableVolume`.
+  enum CandidateKind: Equatable { case file, directory, missing, removableVolume, other }
+
+  static func classifyWithoutFollowing(_ path: String, hops: Int = 0) -> CandidateKind {
+    if path.hasPrefix(removableVolumePrefix) || path == "/Volumes" { return .removableVolume }
+    var info = stat()
+    guard lstat(path, &info) == 0 else { return .missing }
+    switch info.st_mode & S_IFMT {
+    case S_IFREG: return .file
+    case S_IFDIR: return .directory
+    case S_IFLNK:
+      guard hops < 8, let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: path)
+      else { return .other }
+      let absolute = destination.hasPrefix("/")
+        ? destination
+        : ((path as NSString).deletingLastPathComponent as NSString).appendingPathComponent(destination)
+      // Lexical normalisation only — `standardizedFileURL` does not resolve
+      // symlinks, so the next hop is classified by its own lstat.
+      return classifyWithoutFollowing(URL(fileURLWithPath: absolute).standardizedFileURL.path, hops: hops + 1)
+    default: return .other
+    }
+  }
+
+  private static let walkLogger = Logger(label: "z-image.lora-walk")
+
+  /// Message prefix of the refusal thrown for a removable-volume LoRA, so the
+  /// recovery loop can recognise a poison job without a dedicated error case.
+  static let removableVolumeRefusalPrefix = "removable-volume:"
+
+  /// PR #418 re-review (item 2): refuse any EXPLICIT direct-path entry that
+  /// is on (or links into) `/Volumes` — classified without a stat.
+  static func refuseRemovableVolumeEntries(_ entries: [LoRAEntry]) throws {
+    for entry in entries where looksLikeDirectPath(entry.path) {
+      let expanded = (entry.path as NSString).expandingTildeInPath
+      if classifyWithoutFollowing(expanded) == .removableVolume {
+        throw WarmServerError.invalidRequest(
+          message: "\(removableVolumeRefusalPrefix) LoRA '\(entry.path)' is on /Volumes, which is never read on a "
+            + "request or recovery path (a hung mount would park the engine) — copy the file into the LoRA library")
+      }
+    }
+  }
+
+  /// Bounds on the bare-name walk (PR #418 review, Critical 1).
+  static let walkMaxDepth = 6
+  static let walkMaxEntries = 20_000
+  static let walkMaxSeconds: TimeInterval = 2
+  /// The walk result is cached per process; `invalidateLocalIndex()` (wired
+  /// to `POST /v1/loras/scan` — the engine has no filesystem watcher) drops
+  /// it, and this TTL is the safety net for files added without a rescan.
+  static var localIndexTTL: TimeInterval = 60
+
+  private static let localIndexLock = NSLock()
+  private static var cachedLocalIndex: (roots: [String], builtAt: Date, byName: [String: String])?
+
+  static func invalidateLocalIndex() {
+    localIndexLock.lock()
+    cachedLocalIndex = nil
+    localIndexLock.unlock()
+  }
+
+  /// filename → absolute path for every regular file under `roots`, from the
+  /// cache when it is fresh for exactly these roots.
+  static func localIndex(for roots: [String]) -> [String: String] {
+    localIndexLock.lock()
+    defer { localIndexLock.unlock() }
+    if let cached = cachedLocalIndex, cached.roots == roots,
+       Date().timeIntervalSince(cached.builtAt) < localIndexTTL {
+      return cached.byName
+    }
+    let built = buildLocalIndex(roots: roots)
+    cachedLocalIndex = (roots, Date(), built)
+    return built
+  }
+
+  /// The walk itself: local disk only. Never descends a symlinked directory
+  /// (every entry is classified with `lstat`, and anything that is not a
+  /// plain file or directory has its descendants skipped), never records a
+  /// candidate that resolves under `/Volumes` or outside `roots`, and stops
+  /// at `walkMaxDepth` / `walkMaxEntries` / `walkMaxSeconds`. The enumerator
+  /// prefetches NO resource values — a prefetch would `stat` (follow) each
+  /// entry, which is exactly the syscall that hangs on a dead mount.
+  static func buildLocalIndex(roots: [String]) -> [String: String] {
+    let fm = FileManager.default
+    var byName: [String: String] = [:]
+    var entries = 0
+    let deadline = Date().addingTimeInterval(walkMaxSeconds)
+    for root in roots {
+      guard classifyWithoutFollowing(root) == .directory else { continue }
+      guard let enumerator = fm.enumerator(
+        at: URL(fileURLWithPath: root), includingPropertiesForKeys: [], options: [.skipsHiddenFiles]
+      ) else { continue }
+      for case let url as URL in enumerator {
+        entries += 1
+        if entries > walkMaxEntries || Date() > deadline {
+          let cutShort = "LoRA walk under \(roots.joined(separator: ", ")) cut short at \(entries) entries "
+            + "(bounds: \(walkMaxEntries) entries / \(Int(walkMaxSeconds))s) — partial index cached "
+            + "for \(Int(localIndexTTL))s or until POST /v1/loras/scan; a name it missed reads as unresolved"
+          walkLogger.warning("\(cutShort)")
+          return byName
+        }
+        // The entry ITSELF, by lstat. `skipDescendants()` is only ever
+        // called for a real directory: Foundation applies it to the NEXT
+        // directory when the current item is a leaf, which silently skipped
+        // a sibling tree.
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { continue }
+        switch info.st_mode & S_IFMT {
+        case S_IFDIR:
+          if enumerator.level >= walkMaxDepth { enumerator.skipDescendants() }
+        case S_IFREG:
+          // Lexical containment: a real file under the root (symlinks were
+          // never followed, so the path is where the walk found it).
+          guard url.path.hasPrefix(root.hasSuffix("/") ? root : root + "/"),
+                !url.path.hasPrefix(removableVolumePrefix)
+          else { continue }
+          if byName[url.lastPathComponent] == nil { byName[url.lastPathComponent] = url.path }
+        case S_IFLNK:
+          // PR #418 re-review (item 1): ~/.comfybox/loras is 87 symlinked
+          // LoRA files, 85 of them to LOCAL paths — those must keep
+          // resolving by bare name. Classified lexically (readlink chain,
+          // no kernel follow): a link whose chain ends at a regular file is
+          // indexed under the LINK's path; a chain into /Volumes stays
+          // excluded; a link to a directory is never descended.
+          if classifyWithoutFollowing(url.path) == .file, byName[url.lastPathComponent] == nil {
+            byName[url.lastPathComponent] = url.path
+          }
+        default:
+          continue
+        }
+      }
+    }
+    return byName
+  }
+
+  /// A single candidate path, checked without following into `/Volumes`.
+  private static func checked(_ candidate: String) -> LocalResolution? {
+    switch classifyWithoutFollowing(candidate) {
+    case .file: return .found(candidate)
+    case .removableVolume: return .removableVolume(candidate)
+    case .directory, .missing, .other: return nil
+    }
+  }
+
+  /// comfybox#396: resolve `path` on LOCAL disk only — no network, no
+  /// external volumes.
+  ///
+  /// - A direct path (`looksLikeDirectPath`) or a path that exists relative
+  ///   to the working directory is `.found` when it is a file — or
+  ///   `.removableVolume` when it is on (or links into) `/Volumes`, in which
+  ///   case it was never stat'd.
+  /// - A bare name is looked up in the LoRA library index first
+  ///   (`libraryLookup`, instant: `library.json` knows
+  ///   `vault/KreaAmateur_V2.safetensors` by filename; an indexed path on
+  ///   `/Volumes` is `.removableVolume`, a stale one falls through), then
+  ///   tried relative to each root, then looked up in the bounded, cached
+  ///   walk of `searchRoots` (a nested subdirectory is fine — the pre-#396
+  ///   behaviour Todd relied on).
+  func resolvedLocalPath(libraryLookup: (String) -> String?, searchRoots: [String]) -> LocalResolution {
+    let expanded = (path as NSString).expandingTildeInPath
+    if Self.looksLikeDirectPath(path) {
+      return Self.checked(expanded) ?? .notFound
+    }
+    if let relative = Self.checked(expanded) {
+      if case .found = relative { return .found(URL(fileURLWithPath: expanded).standardizedFileURL.path) }
+      return relative
+    }
+    if let indexed = libraryLookup(path), let hit = Self.checked(indexed) {
+      return hit
+    }
+    if path.contains("/") {
+      for root in searchRoots {
+        if let hit = Self.checked((root as NSString).appendingPathComponent(path)) { return hit }
+      }
+      return .notFound
+    }
+    if let walked = Self.localIndex(for: searchRoots)[path] {
+      return .found(walked)
+    }
+    return .notFound
   }
 
   func makeConfiguration() throws -> LoRAConfiguration {
@@ -14342,44 +14876,42 @@ struct LoRAEntry: Codable, Sendable {
 
   private func resolveSource() throws -> LoRAConfiguration {
     let clampedScale = try resolvedScale()
+    _ = try Self.validatedPath(path)
     let expanded = (path as NSString).expandingTildeInPath
 
-    // Direct path (absolute, relative, tilde-expanded)
-    if path.hasPrefix("/") || path.hasPrefix("./") || path.hasPrefix("../") || path.hasPrefix("~")
-       || FileManager.default.fileExists(atPath: expanded) {
+    // Direct path (absolute, relative, tilde-expanded) — taken at its word;
+    // `WarmServer.loRASourceExists` stats it where existence matters.
+    if Self.looksLikeDirectPath(path) {
       return .local(expanded, scale: clampedScale)
     }
 
-    // Library resolution: search known local LoRA locations for the bare
-    // filename before assuming it's a remote reference.
-    let fm = FileManager.default
-    for root in Self.bareFilenameSearchRoots {
-      guard fm.fileExists(atPath: root) else { continue }
-      guard let enumerator = fm.enumerator(
-        at: URL(fileURLWithPath: root), includingPropertiesForKeys: [.isRegularFileKey]
-      ) else { continue }
-      for case let fileURL as URL in enumerator {
-        if fileURL.lastPathComponent == path {
-          return .local(fileURL.path, scale: clampedScale)
-        }
-      }
+    // Library resolution: the working directory, then the local LoRA roots
+    // (no library index here — the swap route's preflight consults it and
+    // rewrites the entry to an absolute path before this ever runs).
+    switch resolvedLocalPath(libraryLookup: { _ in nil }, searchRoots: Self.bareFilenameSearchRoots) {
+    case .found(let local):
+      return .local(local, scale: clampedScale)
+    case .removableVolume(let candidate):
+      throw WarmServerError.invalidRequest(
+        message: "LoRA '\(path)' resolves to '\(candidate)' on a removable volume (/Volumes), which is never read on a request path.")
+    case .notFound:
+      break
     }
 
-    // A string shaped like a local filename (ends in a known weight
-    // extension, no "/") is never a valid HuggingFace repo id — don't
-    // attempt a network download that's certain to fail with a confusing
-    // "Model not found" error. This is almost always a stale reference
-    // (e.g. reconstructed from a PNG's embedded metadata, which only ever
-    // stores a display name, not the original path) — say so plainly.
-    let looksLikeLocalFilename = !path.contains("/") &&
-      [".safetensors", ".ckpt", ".pt", ".bin"].contains { path.hasSuffix($0) }
-    if looksLikeLocalFilename {
+    // A string shaped like a local filename is never a valid HuggingFace
+    // repo id — don't attempt a network download that's certain to fail
+    // with a confusing "Model not found" error. This is almost always a
+    // stale reference (e.g. reconstructed from a PNG's embedded metadata,
+    // which only ever stores a display name, not the original path).
+    if Self.looksLikeLocalFilename(path) {
       throw WarmServerError.invalidRequest(
         message: "LoRA '\(path)' not found. Searched: \(Self.bareFilenameSearchRoots.joined(separator: ", "))."
       )
     }
 
-    // HuggingFace fallback — only for strings actually shaped like a repo id.
+    // HuggingFace fallback — only for strings actually shaped like a repo
+    // id, and only on the generate/preset path: `/v1/lora/swap` reports
+    // such an entry as unresolved instead (`LoRASwapPreflight`).
     return .huggingFace(path, scale: clampedScale)
   }
 }

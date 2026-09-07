@@ -213,9 +213,9 @@ final class GeneratePresetRouteTests: XCTestCase {
     // compares positionally.
     let payload = try expand(#"""
       {"prompt":"x","preset":"krea-kira","loras":[
-        {"path":"/Volumes/Bolt/loras/kroma-v0.3-base-lora-rank-384-fro-0985.safetensors","scale":0.6},
-        {"path":"/Volumes/Bolt/loras/krea2_turbo_distill_r256.safetensors","scale":0.6},
-        {"path":"/Volumes/Bolt/loras/RealisticSnapshotKrea2.safetensors","scale":0.4}]}
+        {"path":"/tmp/loras/kroma-v0.3-base-lora-rank-384-fro-0985.safetensors","scale":0.6},
+        {"path":"/tmp/loras/krea2_turbo_distill_r256.safetensors","scale":0.6},
+        {"path":"/tmp/loras/RealisticSnapshotKrea2.safetensors","scale":0.4}]}
       """#, store: store)
     XCTAssertNil(payload.presetStackMismatch, "same adapters by name and scale — no disagreement")
   }

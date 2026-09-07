@@ -127,6 +127,41 @@ In particular, Krea-2 distillation files such as
 they fill the accelerator slot. Auto-staging may change `path`, but preserves
 `role`.
 
+## Swap entry resolution (#415, #396)
+
+`POST /v1/lora/swap` validates and resolves every entry at the route, before
+the family guard and before anything is enqueued:
+
+- an empty `path` (or an unknown `role` / non-finite `scale`) is a **400** and
+  nothing is applied;
+- a bare filename is resolved on **local disk only** — the LoRA library index
+  first, then a recursive walk of `COMFYBOX_MODELS` and `~/.comfybox/loras`
+  (nested subdirectories are fine). No external volumes, no HuggingFace, no
+  downloads; a repo-id-shaped string is reported unresolved;
+- the walk never follows a symlink with the kernel: a symlinked `.safetensors`
+  whose (lexical) link chain ends at a local file still resolves by bare name,
+  a symlinked directory is never descended, and the walk never touches
+  `/Volumes` (a candidate on or linking into a removable volume
+  is reported `unresolved` with reason `removable-volume`, without a stat), and
+  is bounded (depth 6, 20 000 entries, 2 s) with its result cached until the
+  next `POST /v1/loras/scan` (or 60 s);
+- a name that exists only on nearline storage is staged with the copy bounded
+  to 10 s (it keeps running in the background; retry the swap to pick it up);
+- the swap is **atomic**: if any entry cannot be resolved the answer is a 400
+  carrying `unresolved: [{path, reason}]` and the resident stack is left alone;
+  a 200 means every entry was applied (the response shape is unchanged). A
+  daemon probing one entry at a time therefore reads an unresolvable entry
+  exactly as before.
+
+A persisted `lora_swap` job whose entries fail this preflight at crash
+recovery is dropped with a log line instead of being replayed.
+
+The generate path applies the same removable-volume rule: an explicit `loras`
+entry that is an absolute path on `/Volumes` is a 400 on `/v1/generate` and
+`/v1/generate/async` (never stat'd), a preset stack naming one falls back as an
+unresolvable preset as before, and a persisted generate job carrying one is
+dropped and recorded at crash recovery.
+
 ## Per-request LoRA stacks and the warm default (#282)
 
 **Every render carries its own stack.** A job's adapters are resolved once, at
