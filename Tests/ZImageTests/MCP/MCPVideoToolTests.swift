@@ -489,3 +489,62 @@ final class MCPVideoToolTests: XCTestCase {
     XCTAssertEqual(ReplicateVideoProxy.t2vFallbackModel, "wan-video/wan-2.2-t2v-fast")
   }
 }
+
+// MARK: - comfybox#405: generate_video dims forwarding
+//
+// `executeGenerateVideo` builds its body from an explicit whitelist, so an
+// unforwarded key vanishes silently — which is how i2v ended up with no way to
+// size a render at all. These pin the pure decision the executor now calls.
+
+extension MCPVideoToolTests {
+
+  func testI2VForwardsCallerSuppliedDims() {
+    // Pre-#405 this returned nothing for i2v: width/height were dropped on the
+    // floor whenever image_path was present.
+    let dims = MCPToolExecutor.videoRequestDims(
+      width: 512, height: 896, imagePath: "/tmp/kira.png", aspectRatio: "16:9")
+    XCTAssertEqual(dims?.width, 512)
+    XCTAssertEqual(dims?.height, 896)
+  }
+
+  func testI2VWithoutDimsSendsNoneSoTheServerResolvesFromTheSource() {
+    // The bug: synthesizing 704x448 here forced every i2v landscape.
+    XCTAssertNil(MCPToolExecutor.videoRequestDims(
+      width: nil, height: nil, imagePath: "/tmp/kira.png", aspectRatio: "16:9"))
+    XCTAssertNil(MCPToolExecutor.videoRequestDims(
+      width: nil, height: nil, imagePath: "/tmp/kira.png", aspectRatio: "9:16"))
+    // A half-specified pair is not a size — still let the server resolve.
+    XCTAssertNil(MCPToolExecutor.videoRequestDims(
+      width: 512, height: nil, imagePath: "/tmp/kira.png", aspectRatio: nil))
+  }
+
+  func testT2VDimsAreUnchanged() {
+    // Regression guard (ruling 3): t2v must be byte-identical to today.
+    let landscape = MCPToolExecutor.videoRequestDims(
+      width: nil, height: nil, imagePath: nil, aspectRatio: nil)
+    XCTAssertEqual(landscape?.width, 704)
+    XCTAssertEqual(landscape?.height, 448)
+
+    let explicit16x9 = MCPToolExecutor.videoRequestDims(
+      width: nil, height: nil, imagePath: nil, aspectRatio: "16:9")
+    XCTAssertEqual(explicit16x9?.width, 704)
+    XCTAssertEqual(explicit16x9?.height, 448)
+
+    let portrait = MCPToolExecutor.videoRequestDims(
+      width: nil, height: nil, imagePath: nil, aspectRatio: "9:16")
+    XCTAssertEqual(portrait?.width, 448)
+    XCTAssertEqual(portrait?.height, 704)
+
+    let caller = MCPToolExecutor.videoRequestDims(
+      width: 960, height: 576, imagePath: nil, aspectRatio: "9:16")
+    XCTAssertEqual(caller?.width, 960)
+    XCTAssertEqual(caller?.height, 576)
+  }
+
+  func testGenerateVideoSchemaExposesWidthAndHeight() {
+    let tool = MCPToolRegistry.tool(named: "generate_video")!
+    let properties = tool.inputSchema["properties"] as? [String: Any]
+    XCTAssertEqual((properties?["width"] as? [String: Any])?["type"] as? String, "integer")
+    XCTAssertEqual((properties?["height"] as? [String: Any])?["type"] as? String, "integer")
+  }
+}

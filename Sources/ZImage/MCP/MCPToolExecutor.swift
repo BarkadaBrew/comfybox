@@ -626,6 +626,37 @@ public final class MCPToolExecutor: @unchecked Sendable {
   }
 
 
+  /// The width/height `generate_video` forwards to `/v1/video/generate/async`,
+  /// or nil to send none and let the server resolve them.
+  ///
+  /// T2V has no source frame, so an aspect_ratio has to become explicit
+  /// width/height here: the warm server's video request decodes width/height,
+  /// not aspect_ratio, so otherwise every t2v render fell back to the 704x448
+  /// landscape default regardless of the requested orientation. Portrait
+  /// ("9:16") swaps to 448x704 (both /64).
+  ///
+  /// comfybox#405: caller-supplied width/height are now forwarded on I2V too.
+  /// They used to be dropped on the floor — `generate_video` had NO way to
+  /// size an i2v render, so an i2v request could only ever land on whatever
+  /// budget the server defaulted to. They remain only a pixel-area BUDGET for
+  /// i2v (the source image's aspect decides the shape, server-side, in
+  /// `VideoDimensionResolver`); what changes is that the caller can choose the
+  /// magnitude. The synthesized 704x448/448x704 fallback stays T2V-ONLY —
+  /// synthesizing a landscape default for an i2v request is exactly the bug
+  /// this ticket is about.
+  ///
+  /// Pure and internal so the whitelist can be unit-tested: this body is an
+  /// explicit whitelist, and an unforwarded key vanishes silently (which is
+  /// how #405 stayed invisible).
+  static func videoRequestDims(
+    width: Int?, height: Int?, imagePath: String?, aspectRatio: String?
+  ) -> (width: Int, height: Int)? {
+    if let w = width, let h = height { return (w, h) }
+    guard imagePath == nil else { return nil }
+    let portrait = (aspectRatio ?? "16:9") == "9:16"
+    return portrait ? (448, 704) : (704, 448)
+  }
+
   /// generate_video -> POST /v1/video/generate/async (submit; poll video_status)
   private func executeGenerateVideo(_ params: MCPParams?) async throws -> MCPToolResult {
     guard let prompt = params?.string("prompt"), !prompt.isEmpty else {
@@ -649,24 +680,12 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let aspectRatio = params?.string("aspect_ratio") {
       body["aspect_ratio"] = aspectRatio
     }
-    // T2V has no source frame, so translate aspect_ratio into explicit
-    // width/height here: WarmServer's video request decodes width/height, NOT
-    // aspect_ratio, so otherwise every t2v render fell back to the 704x448
-    // landscape default regardless of the requested orientation. Portrait
-    // ("9:16") swaps to 448x704 (both /64). I2V leaves dims unset so WarmServer
-    // keeps matching the source image aspect.
-    if params?.string("image_path") == nil {
-      // Respect caller-supplied dims; otherwise orient the standard t2v dims by
-      // aspect_ratio. WarmServer reads width/height (not aspect_ratio/resolution),
-      // so without this every t2v fell back to the 704x448 landscape default.
-      if let w = params?.integer("width"), let h = params?.integer("height") {
-        body["width"] = w
-        body["height"] = h
-      } else {
-        let portrait = (params?.string("aspect_ratio") ?? "16:9") == "9:16"
-        body["width"] = portrait ? 448 : 704
-        body["height"] = portrait ? 704 : 448
-      }
+    if let dims = Self.videoRequestDims(
+      width: params?.integer("width"), height: params?.integer("height"),
+      imagePath: params?.string("image_path"), aspectRatio: params?.string("aspect_ratio")
+    ) {
+      body["width"] = dims.width
+      body["height"] = dims.height
     }
     if let seed = params?.integer("seed") {
       body["seed"] = seed

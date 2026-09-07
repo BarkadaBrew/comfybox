@@ -2203,6 +2203,13 @@ public final class WarmServer {
     /// comfybox#307: non-nil only when `two_stage` was requested and the
     /// refine pass could not run — see `LTX2RefineGate`.
     let refineSkipped: String?
+    /// comfybox#405: the dims the resolver settled on and WHY
+    /// (`source_aspect` | `explicit` | `default`). Additive — an older client
+    /// ignores the extra keys, and the unknown-field-ignored convention means
+    /// an older engine simply never sends them.
+    let resolvedWidth: Int
+    let resolvedHeight: Int
+    let dimensionReason: String
   }
 
   /// Submit a video render to the paid Replicate cloud proxy and return its 202
@@ -2267,6 +2274,11 @@ public final class WarmServer {
     /// dropped before reaching the generator — stamped onto the
     /// response/trace as `beat_schedule_ignored`.
     let beatScheduleIgnoredReason: String?
+    /// comfybox#405: how the render dims were decided (`source_aspect` |
+    /// `explicit` | `default`) plus the budget they were fitted into —
+    /// stamped onto the response and the render trace so a wrong-shaped clip
+    /// is diagnosable without log archaeology.
+    let resolvedDimensions: ResolvedVideoDimensions
   }
 
   /// Map the daemon/MCP `duration` field onto chunked continuation: 0 when
@@ -2320,68 +2332,24 @@ public final class WarmServer {
     return (w, h, true)
   }
 
+  /// comfybox#405: one /64 rule, defined in `VideoDimensionResolver`.
   static func snapDim64(_ value: Int) -> Int {
-    max(256, Int((Double(value) / 64.0).rounded()) * 64)
+    VideoDimensionResolver.snap64(value)
   }
 
   /// Derive I2V render dims matching the source image aspect within the
-  /// requested pixel-area budget, both dims /64. Pure for unit testing.
+  /// requested pixel-area budget, both dims /64.
   ///
-  /// Rounding each axis to /64 independently compounds error in opposite
-  /// directions: a 1664x896 source (aspect 1.857) at a 448x704 budget produced
-  /// 768x384 (aspect 2.000) — the height's ideal 412.1 sat almost exactly on a
-  /// 64-boundary midpoint and rounded DOWN while the width rounded up, a 7.7%
-  /// distortion that visibly squashes the subject (2026-08-01). Search the /64
-  /// neighbourhood instead and keep the pair whose aspect is closest to the
-  /// source, breaking ties toward the pixel budget.
+  /// comfybox#405: the arithmetic now lives in `VideoDimensionResolver` — the
+  /// ONE resolver every video caller shares. This shim keeps the name the
+  /// existing call sites and tests use.
   static func deriveVideoDims(
     sourceWidth: Int, sourceHeight: Int, budgetWidth: Int, budgetHeight: Int
   ) -> (width: Int, height: Int) {
-    guard sourceWidth > 0, sourceHeight > 0 else {
-      return (snapDim64(budgetWidth), snapDim64(budgetHeight))
-    }
-    let aspect = Double(sourceWidth) / Double(sourceHeight)
-    let budget = Double(max(budgetWidth, 64) * max(budgetHeight, 64))
-    let idealW = (budget * aspect).squareRoot()
-    let idealH = idealW / aspect
-
-    let baseW = Int((idealW / 64.0).rounded())
-    let baseH = Int((idealH / 64.0).rounded())
-
-    func search(areaCap: Double) -> (w: Int, h: Int, aspectErr: Double, areaErr: Double)? {
-      var best: (w: Int, h: Int, aspectErr: Double, areaErr: Double)?
-      for dw in -1...1 {
-        for dh in -1...1 {
-          let w = max(256, (baseW + dw) * 64)
-          let h = max(256, (baseH + dh) * 64)
-          let area = Double(w * h)
-          guard area <= budget * areaCap else { continue }
-          let aspectErr = abs(Double(w) / Double(h) - aspect) / aspect
-          let areaErr = abs(area - budget) / budget
-          if let b = best {
-            let better = aspectErr < b.aspectErr - 1e-9
-              || (abs(aspectErr - b.aspectErr) <= 1e-9 && areaErr < b.areaErr)
-            if better { best = (w, h, aspectErr, areaErr) }
-          } else {
-            best = (w, h, aspectErr, areaErr)
-          }
-        }
-      }
-      return best
-    }
-
-    // Prefer staying near the budget; but at small budgets the 256 floor pins one
-    // axis and the tight cap can force a badly stretched pair (a halved two-stage
-    // budget hit 19% that way), so allow a larger clip rather than distort.
-    var pick = search(areaCap: 1.25)
-    if pick == nil || pick!.aspectErr > 0.03, let relaxed = search(areaCap: 1.6),
-       relaxed.aspectErr < (pick?.aspectErr ?? .infinity) - 1e-9 {
-      pick = relaxed
-    }
-    guard let chosen = pick else {
-      return (snapDim64(Int(idealW.rounded())), snapDim64(Int(idealH.rounded())))
-    }
-    return (chosen.w, chosen.h)
+    let resolved = VideoDimensionResolver.resolve(
+      requestWidth: budgetWidth, requestHeight: budgetHeight,
+      sourceWidth: sourceWidth, sourceHeight: sourceHeight)
+    return (resolved.width, resolved.height)
   }
 
   /// Pixel dimensions of an image file without decoding the bitmap.
@@ -2526,10 +2494,13 @@ public final class WarmServer {
     presetWidth: Int?, presetHeight: Int?,
     videoConfigDefaults: VideoDefaultValues
   ) -> (width: Int, height: Int) {
-    (
-      width: requestWidth ?? namedWidth ?? presetWidth ?? videoConfigDefaults.width ?? 704,
-      height: requestHeight ?? namedHeight ?? presetHeight ?? videoConfigDefaults.height ?? 448
-    )
+    // comfybox#405: the chain itself now lives in `VideoDimensionResolver`,
+    // the one resolver every video caller shares.
+    VideoDimensionResolver.budget(
+      requestWidth: requestWidth, requestHeight: requestHeight,
+      namedWidth: namedWidth, namedHeight: namedHeight,
+      presetWidth: presetWidth, presetHeight: presetHeight,
+      configWidth: videoConfigDefaults.width, configHeight: videoConfigDefaults.height)
   }
 
   /// F3: the frames half of the same real `prepareLocalVideo` chain —
@@ -2552,8 +2523,15 @@ public final class WarmServer {
     resolvedTwoStage: Bool
   ) -> [[String: String]] {
     var plan: [[String: String]] = []
-    var w = width ?? presetWidth ?? videoConfigDefaults.width ?? 704
-    var h = height ?? presetHeight ?? videoConfigDefaults.height ?? 448
+    // comfybox#405: the same budget chain the real path uses (no named
+    // resolution in this preview's query shape).
+    let previewBudget = VideoDimensionResolver.budget(
+      requestWidth: width, requestHeight: height,
+      namedWidth: nil, namedHeight: nil,
+      presetWidth: presetWidth, presetHeight: presetHeight,
+      configWidth: videoConfigDefaults.width, configHeight: videoConfigDefaults.height)
+    var w = previewBudget.width
+    var h = previewBudget.height
     let snappedW = Self.snapDim64(w), snappedH = Self.snapDim64(h)
     if snappedW != w || snappedH != h {
       plan.append(["step": "snap_64", "note": "\(w)x\(h) -> \(snappedW)x\(snappedH)"])
@@ -2769,41 +2747,45 @@ public final class WarmServer {
     // preset like 704x448 applied to a portrait source distorts the
     // conditioning frame and the render drifts off the image. The requested
     // width x height is kept only as a pixel-area budget for I2V.
-    // Priority: explicit width/height > named resolution ("720p" etc., FIXED:
-    // previously silently dropped) > preset dims > config.videoDefaults >
-    // 704x448 engine default (FDD §3.3, D3 — only width/height/frames migrate
-    // from the desktop's local settings; steps stays untouched below).
+    // Priority: explicit width/height > named resolution ("720p" etc., FIXED
+    // in #219 follow-up: previously silently dropped) >
+    // preset dims > config.videoDefaults > 704x448 engine default (FDD §3.3,
+    // D3 — only width/height/frames migrate from the desktop's local
+    // settings; steps stays untouched below).
+    //
+    // comfybox#405: all of that now happens in ONE pure resolver
+    // (`VideoDimensionResolver`) that every video caller reaches through this
+    // function — /v1/video/generate, /v1/video/generate/async, the winner
+    // rerender/extend replays, the storyboard i2v arm and the MCP
+    // generate_video tool all land here — and it reports WHY it chose the
+    // dims it did, so the response and the render trace can record it.
+    // `aspect_ratio` still only orients the BUDGET: for i2v the source image
+    // is ground truth for the shape (real traffic sends a defaulted "16:9"
+    // next to a portrait source, and honouring that would be the bug, not
+    // the fix — see the resolver's `resolve` doc comment).
     let namedDims = Self.videoDims(resolution: req.resolution, aspectRatio: req.aspectRatio)
     let videoConfigDefaults = ServerConfigStore.shared.videoDefaults()
-    let requestedDims = Self.resolvedLTX2RequestDims(
+    let sourceSize = effectiveInitImage.flatMap { Self.imagePixelSize(atPath: $0) }
+    let resolvedDims = VideoDimensionResolver.resolve(
       requestWidth: req.width, requestHeight: req.height,
       namedWidth: namedDims?.width, namedHeight: namedDims?.height,
       presetWidth: videoPreset?.width, presetHeight: videoPreset?.height,
-      videoConfigDefaults: videoConfigDefaults)
-    var renderWidth = requestedDims.width
-    var renderHeight = requestedDims.height
+      configWidth: videoConfigDefaults.width, configHeight: videoConfigDefaults.height,
+      sourceWidth: sourceSize?.width, sourceHeight: sourceSize?.height,
+      aspectRatio: req.aspectRatio)
+    var renderWidth = resolvedDims.width
+    var renderHeight = resolvedDims.height
     if req.width == nil, let nd = namedDims {
       logger.info("LTX-2: resolution '\(req.resolution ?? "")' -> \(nd.width)x\(nd.height) budget")
     }
-    if let initPath = effectiveInitImage,
-       let sourceSize = Self.imagePixelSize(atPath: initPath) {
-      let derived = Self.deriveVideoDims(
-        sourceWidth: sourceSize.width, sourceHeight: sourceSize.height,
-        budgetWidth: renderWidth, budgetHeight: renderHeight)
-      if derived.width != renderWidth || derived.height != renderHeight {
-        logger.info(
-          "LTX-2 I2V: adjusted \(renderWidth)x\(renderHeight) -> \(derived.width)x\(derived.height) (source \(sourceSize.width)x\(sourceSize.height), aspect-matched, /64)")
-        renderWidth = derived.width
-        renderHeight = derived.height
-      }
-    } else {
-      let snappedW = Self.snapDim64(renderWidth)
-      let snappedH = Self.snapDim64(renderHeight)
-      if snappedW != renderWidth || snappedH != renderHeight {
-        logger.info("LTX-2: snapped \(renderWidth)x\(renderHeight) -> \(snappedW)x\(snappedH) (dims must be /64, #219)")
-        renderWidth = snappedW
-        renderHeight = snappedH
-      }
+    if resolvedDims.adjusted {
+      let sourceNote = sourceSize.map { " (source \($0.width)x\($0.height))" } ?? ""
+      logger.info(
+        "LTX-2 dims: \(resolvedDims.budgetWidth)x\(resolvedDims.budgetHeight) -> \(renderWidth)x\(renderHeight)\(sourceNote), reason \(resolvedDims.reason.rawValue), /64 (#405)")
+    }
+    if effectiveInitImage != nil, sourceSize == nil {
+      logger.warning(
+        "LTX-2 I2V: could not read the init image's pixel size — rendering at the requested \(renderWidth)x\(renderHeight) budget shape, which may not match the source aspect (#405)")
     }
     // Two-stage dims convention (2026-08-02): with LTX2_TWO_STAGE=1 the request
     // dims are the FINAL output size (matching ComfyUI and every caller's
@@ -2971,7 +2953,8 @@ public final class WarmServer {
       source: req.source ?? "api",
       optimizationAttemptId: req.optimizationAttemptId,
       enhancementSkippedReason: enhancementSkippedReason,
-      beatScheduleIgnoredReason: beatScheduleIgnoredReason)
+      beatScheduleIgnoredReason: beatScheduleIgnoredReason,
+      resolvedDimensions: resolvedDims)
   }
 
   /// If LTX-2 is configured, ASYNC-submit the local render and return 202 + a
@@ -2994,7 +2977,7 @@ public final class WarmServer {
     }
     do {
       guard let prep = try await prepareLocalVideo(body: body) else { return nil }
-      logger.info("LTX-2: local video job submitted (\(prep.request.width)x\(prep.request.height), \(prep.request.framesPerChunk)f)")
+      logger.info("LTX-2: local video job submitted (\(prep.request.width)x\(prep.request.height), \(prep.request.framesPerChunk)f, dims \(prep.resolvedDimensions.reason.rawValue))")
       var tracePayload: [String: String] = ["prompt": prep.request.prompt]
       if prep.request.audio {
         tracePayload["has_audio"] = "true"
@@ -3025,6 +3008,20 @@ public final class WarmServer {
       tracePayload["height"] = String(prep.request.height)
       tracePayload["frames"] = String(prep.request.framesPerChunk)
       tracePayload["fps"] = String(prep.request.fps)
+      // comfybox#405: the resolver's answer and WHY. `width`/`height` above
+      // are the dims handed to the generator (already halved when two-stage
+      // is on); these are the OUTPUT dims the resolver settled on, the budget
+      // it fitted into, and the reason it chose that shape — so a
+      // wrong-shaped clip can be diagnosed from the trace alone.
+      tracePayload["resolved_width"] = String(prep.resolvedDimensions.width)
+      tracePayload["resolved_height"] = String(prep.resolvedDimensions.height)
+      tracePayload["dimension_reason"] = prep.resolvedDimensions.reason.rawValue
+      tracePayload["dimension_budget"] =
+        "\(prep.resolvedDimensions.budgetWidth)x\(prep.resolvedDimensions.budgetHeight)"
+      if let sw = prep.resolvedDimensions.sourceWidth,
+         let sh = prep.resolvedDimensions.sourceHeight {
+        tracePayload["source_size"] = "\(sw)x\(sh)"
+      }
       if let initImage = prep.request.initImagePath {
         tracePayload["image_path"] = initImage
       }
@@ -3278,7 +3275,10 @@ public final class WarmServer {
         backend: "ltx2-local",
         enhancementSkipped: prep.enhancementSkippedReason,
         beatScheduleIgnored: prep.beatScheduleIgnoredReason,
-        refineSkipped: result.refineSkippedReason
+        refineSkipped: result.refineSkippedReason,
+        resolvedWidth: prep.resolvedDimensions.width,
+        resolvedHeight: prep.resolvedDimensions.height,
+        dimensionReason: prep.resolvedDimensions.reason.rawValue
       ))
     } catch let error as LTX2VideoError {
       return .error(.error(status: 400, message: error.localizedDescription))
