@@ -173,6 +173,18 @@ public final class RenderTraceStore: @unchecked Sendable {
     /// trace event itself carries (the same bug class `enhancementSkipped`
     /// above was added to fix, comfybox#328).
     public let refineSkipped: String?
+    /// comfybox#405: the dims the dimension resolver settled on and WHY
+    /// (`source_aspect` | `explicit` | `default`), plus the budget it fitted
+    /// into and the i2v source size it read. `GET /v1/video/traces` returns
+    /// THIS type, not the raw payload — a field missing here is invisible to
+    /// every caller of that endpoint (the same bug class comfybox#328 fixed
+    /// for `enhancementSkipped`), and diagnosing a wrong-shaped clip is the
+    /// whole point of recording it.
+    public let resolvedWidth: String?
+    public let resolvedHeight: String?
+    public let dimensionReason: String?
+    public let dimensionBudget: String?
+    public let sourceSize: String?
   }
 
   public func recentSummaries(limit: Int = 50) -> [TraceSummary] {
@@ -200,7 +212,12 @@ public final class RenderTraceStore: @unchecked Sendable {
         rating: rated.map { "\($0.payload["axis"] ?? "overall"):\($0.payload["vote"] ?? "?")" },
         enhancementSkipped: submitted?.payload["enhancement_skipped"],
         beatScheduleIgnored: submitted?.payload["beat_schedule_ignored"],
-        refineSkipped: terminal?.payload["refine_skipped"]
+        refineSkipped: terminal?.payload["refine_skipped"],
+        resolvedWidth: submitted?.payload["resolved_width"],
+        resolvedHeight: submitted?.payload["resolved_height"],
+        dimensionReason: submitted?.payload["dimension_reason"],
+        dimensionBudget: submitted?.payload["dimension_budget"],
+        sourceSize: submitted?.payload["source_size"]
       )
     }
     return summaries
