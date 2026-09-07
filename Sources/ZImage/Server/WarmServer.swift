@@ -5941,6 +5941,18 @@ public final class WarmServer {
     // warm pipeline happened to hold, on whatever base was active.
     var expanded = try expandGeneratePayload(
       payload, store: store, stageNearline: stageNearline, loraExists: loraExists, log: log)
+    // #419: the expansion above may have put the PRESET's sampler / schedule
+    // (and its `stage2` names) on the payload, after the request's own were
+    // validated. The seam already refused an unresolvable preset name with a
+    // 400 naming the preset; this re-run is the structural guarantee that
+    // nothing enqueued carries a name the dequeue's `validateRecipeNames()`
+    // would refuse later — same "400 before anything is enqueued" rule as
+    // the request's own names, on the expanded values.
+    _ = try expanded.validateRecipeNames()
+    if let stage2 = expanded.stage2 {
+      _ = try RecipeNameResolver.resolve(
+        scheduler: stage2.scheduler, sigmaSchedule: stage2.sigmaSchedule)
+    }
     // PR #418 re-review (item 2): an EXPLICIT `loras` entry that is an
     // absolute path on a removable volume is refused here — a 400 on the
     // live routes, a dropped-and-recorded job on queue recovery — without a
@@ -6165,6 +6177,41 @@ public final class WarmServer {
         object[key] = value
         changed = true
       }
+    }
+    // #419: the preset-owned sampler recipe survives a replay the same way,
+    // or the replayed job would render on the engine default sampler — the
+    // exact silent substitution #419 closed. Written under the wire's
+    // snake_case keys; a request that sent the field under EITHER spelling
+    // (`.convertFromSnakeCase` accepts both, and `sampler` aliases
+    // `scheduler`) is left alone, since the request's value already won.
+    func present(_ keys: [String]) -> Bool { keys.contains { object[$0] != nil } }
+    let recipe: [(keys: [String], value: Any?)] = [
+      (["scheduler", "sampler"], payload.scheduler as Any?),
+      (["sigma_schedule", "sigmaSchedule"], payload.sigmaSchedule as Any?),
+      (["eta"], payload.eta as Any?),
+      (["bongmath"], payload.bongmath as Any?),
+      (["noise_type", "noiseType"], payload.noiseType as Any?),
+      (["noise_alpha", "noiseAlpha"], payload.noiseAlpha as Any?),
+      (["implicit_steps", "implicitSteps"], payload.implicitSteps as Any?),
+      (["c2"], payload.c2 as Any?),
+      (["projector_scale", "projectorScale"], payload.projectorScale as Any?),
+    ]
+    for entry in recipe where !present(entry.keys) {
+      if let value = entry.value {
+        object[entry.keys[0]] = value
+        changed = true
+      }
+    }
+    if let stage2 = payload.stage2, !present(["stage2"]) {
+      var stage: [String: Any] = ["steps": stage2.steps, "denoise": stage2.denoise]
+      if let scheduler = stage2.scheduler { stage["scheduler"] = scheduler }
+      if let schedule = stage2.sigmaSchedule { stage["sigma_schedule"] = schedule }
+      if let guidance = stage2.guidance { stage["guidance"] = guidance }
+      if let eta = stage2.eta { stage["eta"] = eta }
+      if let bongmath = stage2.bongmath { stage["bongmath"] = bongmath }
+      if let seed = stage2.seed { stage["seed"] = seed }
+      object["stage2"] = stage
+      changed = true
     }
     guard changed, let data = try? JSONSerialization.data(withJSONObject: object) else {
       return original
@@ -6554,7 +6601,8 @@ public final class WarmServer {
       // caller's error, named in full (AC-15, AC-28).
       case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField,
            .unsupportedSampler, .orphanField, .projectorScaleOutOfRange, .unknownNoiseType,
-           .unknownStyle, .styleFromUnusablePreset, .implicitStepsOutOfRange, .c2OutOfRange:
+           .unknownStyle, .styleFromUnusablePreset, .implicitStepsOutOfRange, .c2OutOfRange,
+           .presetRecipeInvalid:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
            .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded, .krea2VariantUnknown:
@@ -7840,6 +7888,8 @@ public struct ImageJobStatus: Codable, Sendable {
   public let presetUnresolved: String?
   public let presetUnresolvedReason: String?
   public let presetStackMismatch: Bool?
+  /// #419: `preset_recipe_applied`, the same list the sync response carries.
+  public let presetRecipeApplied: [String]?
   /// #22 (PR #363 review, C1b): the same memory-advisory numbers the sync
   /// response carries, set at accept time (before the job runs).
   public let memoryEstimateBytes: UInt64?
@@ -7872,7 +7922,7 @@ public struct ImageJobStatus: Codable, Sendable {
     error: String?, elapsedMs: Int, preemptRefused: Bool?, etaSec: Double?,
     applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil,
     presetUnresolved: String? = nil, presetUnresolvedReason: String? = nil,
-    presetStackMismatch: Bool? = nil,
+    presetStackMismatch: Bool? = nil, presetRecipeApplied: [String]? = nil,
     memoryEstimateBytes: UInt64? = nil, memoryAvailableBytes: UInt64? = nil,
     loraStackOrigin: String? = nil,
     warmDefaultSkipped: String? = nil, loraReload: Bool? = nil,
@@ -7892,6 +7942,7 @@ public struct ImageJobStatus: Codable, Sendable {
     self.presetUnresolved = presetUnresolved
     self.presetUnresolvedReason = presetUnresolvedReason
     self.presetStackMismatch = presetStackMismatch
+    self.presetRecipeApplied = presetRecipeApplied
     self.memoryEstimateBytes = memoryEstimateBytes
     self.memoryAvailableBytes = memoryAvailableBytes
     self.loraStackOrigin = loraStackOrigin
@@ -7923,6 +7974,8 @@ private final class ImageJob: @unchecked Sendable {
   var presetUnresolved: String?
   var presetUnresolvedReason: String?
   var presetStackMismatch: Bool?
+  /// #419: the preset-sourced recipe keys, set from the result on success.
+  var presetRecipeApplied: [String]?
   /// #22: set at accept time from the payload (before the job runs) — see
   /// `job.memoryEstimateBytes = payload.memoryEstimateBytes` at submit.
   var memoryEstimateBytes: UInt64?
@@ -7951,7 +8004,7 @@ private final class ImageJob: @unchecked Sendable {
       preemptRefused: preemptRefused, etaSec: etaSec, applied: applied,
       appliedLoras: appliedLoras, presetUnresolved: presetUnresolved,
       presetUnresolvedReason: presetUnresolvedReason,
-      presetStackMismatch: presetStackMismatch,
+      presetStackMismatch: presetStackMismatch, presetRecipeApplied: presetRecipeApplied,
       memoryEstimateBytes: memoryEstimateBytes, memoryAvailableBytes: memoryAvailableBytes,
       loraStackOrigin: loraStackOrigin,
       warmDefaultSkipped: warmDefaultSkipped, loraReload: loraReload,
@@ -8042,6 +8095,9 @@ final class ImageJobTracker: @unchecked Sendable {
     job.presetUnresolved = payload.presetUnresolved
     job.presetUnresolvedReason = payload.presetUnresolvedReason
     job.presetStackMismatch = payload.presetStackMismatch
+    // #419: same posture — which recipe fields the preset supplied is
+    // decided at expansion, so the 202 can already say so.
+    job.presetRecipeApplied = payload.presetRecipeApplied
     // #22: same "known at submit" posture as the preset flags above.
     job.memoryEstimateBytes = payload.memoryEstimateBytes
     job.memoryAvailableBytes = payload.memoryAvailableBytes
@@ -8113,6 +8169,7 @@ final class ImageJobTracker: @unchecked Sendable {
       job.presetUnresolved = result.presetUnresolved ?? job.presetUnresolved
       job.presetUnresolvedReason = result.presetUnresolvedReason ?? job.presetUnresolvedReason
       job.presetStackMismatch = result.presetStackMismatch ?? job.presetStackMismatch
+      job.presetRecipeApplied = result.presetRecipeApplied ?? job.presetRecipeApplied
       job.loraStackOrigin = result.loraStackOrigin ?? job.loraStackOrigin
       job.warmDefaultSkipped = result.warmDefaultSkipped ?? job.warmDefaultSkipped
       job.loraReload = result.loraReload ?? job.loraReload
@@ -11364,6 +11421,7 @@ private actor WarmServerCoordinator {
           presetUnresolved: payload.presetUnresolved,
           presetUnresolvedReason: payload.presetUnresolvedReason,
           presetStackMismatch: payload.presetStackMismatch,
+          presetRecipeApplied: payload.presetRecipeApplied,
           memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
           loraStackOrigin: payload.loraStackOrigin,
           warmDefaultSkipped: payload.warmDefaultSkipped,
@@ -11482,6 +11540,7 @@ private actor WarmServerCoordinator {
           presetUnresolved: payload.presetUnresolved,
           presetUnresolvedReason: payload.presetUnresolvedReason,
           presetStackMismatch: payload.presetStackMismatch,
+          presetRecipeApplied: payload.presetRecipeApplied,
           memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
           loraStackOrigin: payload.loraStackOrigin,
           warmDefaultSkipped: payload.warmDefaultSkipped,
@@ -11821,6 +11880,7 @@ private actor WarmServerCoordinator {
         appliedLoras: appliedLoRAStates(), presetUnresolved: payload.presetUnresolved,
         presetUnresolvedReason: payload.presetUnresolvedReason,
         presetStackMismatch: payload.presetStackMismatch,
+        presetRecipeApplied: payload.presetRecipeApplied,
         memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
         loraStackOrigin: payload.loraStackOrigin,
         warmDefaultSkipped: payload.warmDefaultSkipped,
@@ -11905,6 +11965,7 @@ private actor WarmServerCoordinator {
           presetUnresolved: payload.presetUnresolved,
           presetUnresolvedReason: payload.presetUnresolvedReason,
           presetStackMismatch: payload.presetStackMismatch,
+          presetRecipeApplied: payload.presetRecipeApplied,
           memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
           loraStackOrigin: payload.loraStackOrigin,
           warmDefaultSkipped: payload.warmDefaultSkipped,
@@ -11988,6 +12049,7 @@ private actor WarmServerCoordinator {
           presetUnresolved: payload.presetUnresolved,
           presetUnresolvedReason: payload.presetUnresolvedReason,
           presetStackMismatch: payload.presetStackMismatch,
+          presetRecipeApplied: payload.presetRecipeApplied,
           memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
           loraStackOrigin: payload.loraStackOrigin,
           warmDefaultSkipped: payload.warmDefaultSkipped,
@@ -12911,14 +12973,21 @@ struct GeneratePayload: Sendable {
   let outputPath: String?
   let levelsMin: Float?
   let levelsMax: Float?
-  let scheduler: String?
-  let sigmaSchedule: String?
-  let eta: Float?
+  /// `var` since #419, the `var shift` rule: filled from the named `preset`'s
+  /// DECLARED `sampler` (or its legacy `scheduler`) when the request carried
+  /// none. Before #419 a `{preset: x}` request rendered on the engine default
+  /// sampler while x said `res_2s`, silently. Which fields the preset filled
+  /// is recorded in ``presetRecipeApplied``.
+  var scheduler: String?
+  /// `var` since #419, same rule as `scheduler`.
+  var sigmaSchedule: String?
+  /// `var` since #419, same rule as `scheduler`.
+  var eta: Float?
   /// RES4LYF `bongmath` (parity tier T3, WP-E16). Krea 2 + the RES4LYF
   /// samplers only; asked for with any other sampler it is a 400 naming the
   /// sampler (`validateKrea2TierGates`), never a silent drop. Absent/false is
-  /// byte-identical to today.
-  let bongmath: Bool?
+  /// byte-identical to today. `var` since #419, same rule as `scheduler`.
+  var bongmath: Bool?
   /// Explicit schedule shift. nil = the model's own resolution-dependent
   /// default; a value is validated by `validateShift(_:family:)` → 400, never
   /// clamped, and refused on a family that does not read it.
@@ -13117,7 +13186,12 @@ struct GeneratePayload: Sendable {
 
   /// WP-E17 (§3.14, D4): the second stage of this render. Krea 2 only —
   /// refused, never ignored, on any other family (``stage2Gate(_:family:)``).
-  let stage2: Stage2Payload?
+  ///
+  /// `var` since #419: filled from the named `preset`'s declared `stage2`
+  /// when the request carried none — as ONE object, never field-merged with
+  /// a request stage. A preset stage missing `steps` or `denoise` is a 400
+  /// at expansion, the same refusal `init(from:)` makes on the wire.
+  var stage2: Stage2Payload?
 
   /// The MCP tool schema's spelling of a detail pass (§3.17, AC-68a): the
   /// CLIENT expands `detail_pass` into `stage2` from its family policy table.
@@ -13129,24 +13203,37 @@ struct GeneratePayload: Sendable {
   /// NaN included. `Double` for the same reason `stage2.denoise` is.
   let detailDenoise: Double?
 
-  /// Default memberwise init for bridge-created payloads.
   /// Projector-scale text-conditioning gain (wire: `projector_scale`). Krea 2
   /// only; 1.0/absent = neutral. Forwarded verbatim to Krea2Pipeline.Request.
-  let projectorScale: Float?
+  /// `var` since #419 (preset-declared, request wins), like `scheduler`.
+  var projectorScale: Float?
   /// RES4LYF spatial noise generator (wire: `noise_type`: gaussian|fractal|
   /// pyramid). Krea 2 only; absent/`gaussian` = byte-identical to today.
-  let noiseType: String?
+  /// `var` since #419, same rule.
+  var noiseType: String?
   /// Fractal `alpha` exponent (wire: `noise_alpha`); only read for
   /// `noise_type: fractal`. Absent = 0.0 (fractal ≡ gaussian).
-  let noiseAlpha: Float?
+  /// `var` since #419, same rule.
+  var noiseAlpha: Float?
   /// RES4LYF implicit-RK refinement (wire: `implicit_steps`). Krea 2 + the
   /// RES4LYF explicit tableaus only; re-iterates the tableau this many extra
   /// times as a fixed point. Absent/0 = byte-identical to today. Mirrors
   /// `eta`/`bongmath`: decoded here, forwarded to Krea2Pipeline.Request.
-  let implicitSteps: Int?
+  /// `var` since #419, same rule.
+  var implicitSteps: Int?
   /// RES4LYF `res_2s` / `res_3s` substep location (wire: `c2`). Krea 2
   /// only; absent = 0.5, preserving the existing scheduler recipe.
-  let c2: Float?
+  /// `var` since #419, same rule.
+  var c2: Float?
+  /// #419: set by the engine, never by the wire — the wire keys of the
+  /// sampler-recipe fields above that were filled from the named `preset`
+  /// rather than sent by the client (`PresetExpansion.recipeWireKeys`
+  /// order). nil when the preset contributed none. Reaches the response as
+  /// `preset_recipe_applied`, the same kind of provenance `lora_stack_origin`
+  /// and `vae_source` give the stack and the VAE: a request field that was
+  /// sent is never in this list, because it always won.
+  var presetRecipeApplied: [String]?
+  /// Default memberwise init for bridge-created payloads.
   init(
     prompt: String, negativePrompt: String? = nil,
     width: Int? = nil, height: Int? = nil, steps: Int? = nil,
@@ -13181,6 +13268,7 @@ struct GeneratePayload: Sendable {
     self.noiseAlpha = noiseAlpha
     self.implicitSteps = implicitSteps
     self.c2 = c2
+    self.presetRecipeApplied = nil
     self.source = source
     self.preset = nil
     self.contentMode = contentMode
@@ -13345,6 +13433,10 @@ extension GeneratePayload: Decodable {
     noiseAlpha = try c.decodeIfPresent(Float.self, forKey: .noiseAlpha)
     implicitSteps = try c.decodeIfPresent(Int.self, forKey: .implicitSteps)
     c2 = try c.decodeIfPresent(Float.self, forKey: .c2)
+    // #419: engine-set, never decoded from the wire — see its doc comment. A
+    // replayed persisted body carries the accepted recipe as explicit fields,
+    // so it decodes here as request-owned (the `presetStackApplied` rule).
+    presetRecipeApplied = nil
   }
 
   /// Validate the `shift` field for the family that will render it.
@@ -14128,6 +14220,17 @@ struct GenerateResponse: Encodable, Sendable {
   /// this makes visible.
   let presetStackMismatch: Bool?
 
+  /// #419: `preset_recipe_applied` — the wire keys of the sampler-recipe
+  /// fields (`scheduler`, `sigma_schedule`, `eta`, `bongmath`, `stage2`,
+  /// `noise_type`, `noise_alpha`, `implicit_steps`, `c2`, `projector_scale`)
+  /// this render took from its named `preset` rather than from the request.
+  /// A field the request sent is never listed — it always won. Absent when
+  /// no preset was named, the preset declared none of them, or the preset
+  /// was unresolved. The same kind of provenance `lora_stack_origin` and
+  /// `applied.vae_source` give the stack and the VAE; the VALUES are in
+  /// `applied` (Krea 2) as they always were.
+  let presetRecipeApplied: [String]?
+
   /// #22 (PR #363 review, C1b): the render's estimated peak activation
   /// memory and the live free memory at the moment it was estimated —
   /// present whenever the preflight ran (width/height both given, and not a
@@ -14197,7 +14300,7 @@ struct GenerateResponse: Encodable, Sendable {
   init(success: Bool, outputPath: String, durationMs: Int, preemptRefused: Bool = false, etaSec: Double? = nil,
        applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil,
        presetUnresolved: String? = nil, presetUnresolvedReason: String? = nil,
-       presetStackMismatch: Bool? = nil,
+       presetStackMismatch: Bool? = nil, presetRecipeApplied: [String]? = nil,
        memoryEstimateBytes: UInt64? = nil, memoryAvailableBytes: UInt64? = nil,
        loraStackOrigin: String? = nil,
        warmDefaultSkipped: String? = nil, loraReload: Bool? = nil,
@@ -14212,6 +14315,7 @@ struct GenerateResponse: Encodable, Sendable {
     self.presetUnresolved = presetUnresolved
     self.presetUnresolvedReason = presetUnresolvedReason
     self.presetStackMismatch = presetStackMismatch
+    self.presetRecipeApplied = presetRecipeApplied
     self.memoryEstimateBytes = memoryEstimateBytes
     self.memoryAvailableBytes = memoryAvailableBytes
     self.loraStackOrigin = loraStackOrigin
@@ -15286,6 +15390,15 @@ public enum WarmServerError: Error, LocalizedError {
   /// or the requested base under the preset's name, are both wrong — so it is
   /// a 409 naming all three rather than a silent pick.
   case presetModelConflict(preset: String, presetModel: String, requestModel: String)
+  /// #419: the named preset declares a sampler-recipe field the engine cannot
+  /// put on the wire as declared — a sampler / sigma-schedule name it does
+  /// not resolve, or a `stage2` missing `steps` or `denoise`. A 400 naming
+  /// the preset and the field: the alternative was to render on the engine
+  /// default under the preset's name, which is the silent substitution #419
+  /// exists to remove. (An unexpandable preset — unknown id, video, foreign
+  /// engine — is still a LABEL, never a 400; this is a preset the engine DID
+  /// expand whose recipe it will not guess at.)
+  case presetRecipeInvalid(preset: String, field: String, reason: String)
   /// comfybox#322: the in-flight render was cancelled by
   /// `/v1/queue/interrupt`. Distinct from every failure above — nothing went
   /// wrong, an operator asked for the box back. `VideoJobTracker` and the
@@ -15337,6 +15450,10 @@ public enum WarmServerError: Error, LocalizedError {
       return "Preset '\(preset)' declares model '\(presetModel)' but the request asked for "
         + "'\(requestModel)'. A preset's LoRA stack is only valid on its own base — send one or "
         + "the other, or send the LoRAs explicitly in `loras` without the preset."
+    case .presetRecipeInvalid(let preset, let field, let reason):
+      return "Preset '\(preset)' declares '\(field)' the engine will not apply as declared: "
+        + "\(reason). Fix the preset (PUT /v1/presets), or send the field on the request — "
+        + "a request field always wins over the preset's"
 
     case .flux2DetectionFailed(let model):
       return "Model '\(model)' was identified as Flux 2 but detection failed at the snapshot directory"

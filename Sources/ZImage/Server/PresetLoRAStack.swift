@@ -87,6 +87,13 @@ public enum PresetLoRAStack: Sendable, Equatable {
   ///     four live krea2 presets already declare one (see the expansion site
   ///     below). `ResolvedPreset.shift` has no `PresetDefaults` fallback, so
   ///     there is no manufactured-default hazard here either.
+  ///   - requestRecipe: the request's own sampler-recipe fields (#419) —
+  ///     `scheduler`/`sampler`, `sigma_schedule`, `eta`, `bongmath`, `stage2`,
+  ///     `noise_type`, `noise_alpha`, `implicit_steps`, `c2`,
+  ///     `projector_scale`. Same rule as every field above, PER FIELD: the
+  ///     preset's DECLARED value is adopted only where the request carried
+  ///     none. `ResolvedPreset` has no `PresetDefaults` fallback for any of
+  ///     them, and they are read off `declared` anyway.
   ///   - normalizeModelSpec: how two model strings are compared — production
   ///     passes `WarmServer.parseModelSpec`, so an alias and the directory it
   ///     names are the same model, not a conflict.
@@ -99,6 +106,7 @@ public enum PresetLoRAStack: Sendable, Equatable {
     requestGuidance: Double? = nil,
     requestVAE: String? = nil,
     requestShift: Double? = nil,
+    requestRecipe: RequestRecipe = RequestRecipe(),
     normalizeModelSpec: (String) -> String = { $0 }
   ) -> PresetLoRAStack {
     let id = presetId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -278,7 +286,94 @@ public enum PresetLoRAStack: Sendable, Equatable {
       expansion.shift = shift
     }
 
+    // --- Declared sampler recipe (#419) — DECLARED, per field, only where
+    // the request said nothing. No family gate: names are family-agnostic
+    // and every family-specific refusal (capability matrix, eta/bongmath by
+    // sampler, `stage2` on a non-krea2 family, the T3 stage2.bongmath stub)
+    // runs at dispatch on the EXPANDED payload, so a preset that declares
+    // `euler + eta 0.5` on Krea 2 gets the same 400 an explicit request
+    // does. Before #419 every one of these was silently ignored and the
+    // render used the engine default under the preset's name. -------------
+
+    if requestRecipe.sampler == nil,
+       let sampler = nonEmpty(declared.sampler) ?? nonEmpty(declared.scheduler) {
+      expansion.sampler = sampler
+    }
+    if requestRecipe.sigmaSchedule == nil, let schedule = nonEmpty(declared.sigmaSchedule) {
+      expansion.sigmaSchedule = schedule
+    }
+    if requestRecipe.eta == nil, let eta = declared.eta { expansion.eta = eta }
+    if requestRecipe.bongmath == nil, let bongmath = declared.bongmath { expansion.bongmath = bongmath }
+    // `stage2` is adopted as ONE object: a request that sent its own stage
+    // keeps it whole (no field-wise merge across the two sources — that would
+    // build a stage nobody declared). An all-nil `{}` is not a declaration.
+    if !requestRecipe.stage2Declared, let stage2 = declared.stage2, !isEmptyStage(stage2) {
+      expansion.stage2 = stage2
+    }
+    if requestRecipe.noiseType == nil, let noiseType = nonEmpty(declared.noiseType) {
+      expansion.noiseType = noiseType
+    }
+    if requestRecipe.noiseAlpha == nil, let noiseAlpha = declared.noiseAlpha {
+      expansion.noiseAlpha = noiseAlpha
+    }
+    if requestRecipe.implicitSteps == nil, let implicitSteps = declared.implicitSteps {
+      expansion.implicitSteps = implicitSteps
+    }
+    if requestRecipe.c2 == nil, let c2 = declared.c2 { expansion.c2 = c2 }
+    if requestRecipe.projectorScale == nil, let projectorScale = declared.projectorScale {
+      expansion.projectorScale = projectorScale
+    }
+
     return .apply(expansion)
+  }
+
+  /// #419: the request's own sampler-recipe fields, as PRESENCE — the only
+  /// thing `decide` needs to know about them is whether the caller said
+  /// anything, so the values are carried as the wire's own types and never
+  /// interpreted here.
+  public struct RequestRecipe: Sendable, Equatable {
+    public var sampler: String?
+    public var sigmaSchedule: String?
+    public var eta: Double?
+    public var bongmath: Bool?
+    /// The request carried a `stage2` object (whatever it said).
+    public var stage2Declared: Bool
+    public var noiseType: String?
+    public var noiseAlpha: Double?
+    public var implicitSteps: Int?
+    public var c2: Double?
+    public var projectorScale: Double?
+
+    public init(
+      sampler: String? = nil, sigmaSchedule: String? = nil,
+      eta: Double? = nil, bongmath: Bool? = nil, stage2Declared: Bool = false,
+      noiseType: String? = nil, noiseAlpha: Double? = nil,
+      implicitSteps: Int? = nil, c2: Double? = nil, projectorScale: Double? = nil
+    ) {
+      self.sampler = sampler
+      self.sigmaSchedule = sigmaSchedule
+      self.eta = eta
+      self.bongmath = bongmath
+      self.stage2Declared = stage2Declared
+      self.noiseType = noiseType
+      self.noiseAlpha = noiseAlpha
+      self.implicitSteps = implicitSteps
+      self.c2 = c2
+      self.projectorScale = projectorScale
+    }
+  }
+
+  /// A trimmed, non-empty string, or nil — a blank is not a declaration.
+  static func nonEmpty(_ value: String?) -> String? {
+    guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !trimmed.isEmpty else { return nil }
+    return trimmed
+  }
+
+  /// A `stage2: {}` with nothing in it declares nothing.
+  static func isEmptyStage(_ stage: PresetStage) -> Bool {
+    nonEmpty(stage.sampler) == nil && nonEmpty(stage.sigmaSchedule) == nil
+      && stage.steps == nil && stage.denoise == nil && stage.eta == nil && stage.bongmath == nil
   }
 
   // MARK: Gates
@@ -376,6 +471,34 @@ public struct PresetExpansion: Sendable, Equatable {
   /// (`ModelSamplingFlux`). Same field, family-dependent meaning — the
   /// per-family gate is `GeneratePayload.validateShift(_:family:)`.
   public var shift: Double?
+  /// #419: the preset's declared stage-1 SAMPLER RECIPE, each field adopted
+  /// only where the request omitted its own — the `shift` rule, applied to
+  /// every other dial a preset can declare. Unlike `shift` there is NO
+  /// family gate here: sampler / schedule names are family-agnostic and the
+  /// family capability matrix, the eta/bongmath sampler gates and the
+  /// `stage2` gate all run at DISPATCH on the expanded payload, so a preset
+  /// declaring a combination its family cannot honour is refused by the same
+  /// 400 an explicit request gets — never rendered on the engine default.
+  ///
+  /// `sampler` is `declared.sampler ?? declared.scheduler` — the legacy
+  /// `scheduler` key is the same field under its older name (the daemon
+  /// still reads it), and a preset that carries only that spelling still
+  /// names a sampler.
+  public var sampler: String?
+  public var sigmaSchedule: String?
+  public var eta: Double?
+  public var bongmath: Bool?
+  /// The preset's declared second stage, AS DECLARED (`PresetStage`, every
+  /// field optional). The `/v1/generate` seam turns it into the wire's
+  /// `Stage2Payload`, which REQUIRES `steps` and `denoise` — a preset that
+  /// declares a stage without both is refused there (400), never completed
+  /// with a guess. An all-nil `stage2: {}` is treated as undeclared.
+  public var stage2: PresetStage?
+  public var noiseType: String?
+  public var noiseAlpha: Double?
+  public var implicitSteps: Int?
+  public var c2: Double?
+  public var projectorScale: Double?
   /// C2: the engine could not expand this preset. It behaves as the label it
   /// always was, and this reaches the response as `preset_unresolved` (the
   /// preset's name) plus `preset_unresolved_reason` (the machine-readable
@@ -406,6 +529,10 @@ public struct PresetExpansion: Sendable, Equatable {
     presetId: String, loras: [LoraReference]? = nil, model: String? = nil,
     steps: Int? = nil, guidance: Double? = nil, vae: String? = nil,
     shift: Double? = nil,
+    sampler: String? = nil, sigmaSchedule: String? = nil,
+    eta: Double? = nil, bongmath: Bool? = nil, stage2: PresetStage? = nil,
+    noiseType: String? = nil, noiseAlpha: Double? = nil,
+    implicitSteps: Int? = nil, c2: Double? = nil, projectorScale: Double? = nil,
     unresolved: Unresolved? = nil,
     stackMismatch: Bool = false
   ) {
@@ -416,9 +543,27 @@ public struct PresetExpansion: Sendable, Equatable {
     self.guidance = guidance
     self.vae = vae
     self.shift = shift
+    self.sampler = sampler
+    self.sigmaSchedule = sigmaSchedule
+    self.eta = eta
+    self.bongmath = bongmath
+    self.stage2 = stage2
+    self.noiseType = noiseType
+    self.noiseAlpha = noiseAlpha
+    self.implicitSteps = implicitSteps
+    self.c2 = c2
+    self.projectorScale = projectorScale
     self.unresolved = unresolved
     self.stackMismatch = stackMismatch
   }
+
+  /// #419: the wire keys `sampler`… above adopt, in the order the response's
+  /// `preset_recipe_applied` lists them. One place, so the expansion seam,
+  /// the replay rewrite and the tests agree on the spelling.
+  public static let recipeWireKeys: [String] = [
+    "scheduler", "sigma_schedule", "eta", "bongmath", "stage2",
+    "noise_type", "noise_alpha", "implicit_steps", "c2", "projector_scale",
+  ]
 }
 
 // MARK: - The `/v1/generate` seam
@@ -462,6 +607,13 @@ extension GeneratePayload {
       requestGuidance: payload.guidance.map(Double.init),
       requestVAE: payload.vae,
       requestShift: payload.shift.map(Double.init),
+      requestRecipe: PresetLoRAStack.RequestRecipe(
+        sampler: payload.scheduler, sigmaSchedule: payload.sigmaSchedule,
+        eta: payload.eta.map(Double.init), bongmath: payload.bongmath,
+        stage2Declared: payload.stage2 != nil,
+        noiseType: payload.noiseType, noiseAlpha: payload.noiseAlpha.map(Double.init),
+        implicitSteps: payload.implicitSteps, c2: payload.c2.map(Double.init),
+        projectorScale: payload.projectorScale.map(Double.init)),
       normalizeModelSpec: normalizeModelSpec)
 
     switch decision {
@@ -517,7 +669,114 @@ extension GeneratePayload {
         out.presetVAEApplied = true
         log("Preset '\(expansion.presetId)': applying its declared VAE '\(vae)'")
       }
+      try out.applyPresetRecipe(expansion, log: log)
       return out
+    }
+  }
+
+  /// #419: put the preset's declared sampler recipe on the payload — the
+  /// fields `decide` adopted (request > preset, per field) — and RECORD which
+  /// ones, so the response's `preset_recipe_applied` can say where each dial
+  /// came from the way `vae_source: "preset"` and `lora_stack_origin` do.
+  ///
+  /// Two things are refused HERE, with a 400 naming the preset, rather than
+  /// left for dispatch: a sampler / schedule name the engine does not resolve
+  /// (the request's own names were validated BEFORE expansion, so a preset's
+  /// would otherwise slip past that check until the dequeue re-check — and
+  /// the daemon should learn which preset is broken, not just which name),
+  /// and a declared `stage2` missing `steps` or `denoise` (the wire's
+  /// `Stage2Payload` requires both because they decide the stretched grid;
+  /// a default for either would be an engine-invented recipe — exactly what
+  /// `Stage2Payload.init(from:)` refuses on the wire).
+  private mutating func applyPresetRecipe(
+    _ expansion: PresetExpansion, log: (String) -> Void
+  ) throws {
+    let id = expansion.presetId
+    var applied: [String] = []
+
+    if let sampler = expansion.sampler {
+      _ = try Self.presetName(id, field: "sampler") {
+        try RecipeNameResolver.resolveSchedulerKind(sampler)
+      }
+      scheduler = sampler
+      applied.append("scheduler")
+    }
+    if let schedule = expansion.sigmaSchedule {
+      _ = try Self.presetName(id, field: "sigma_schedule") {
+        try RecipeNameResolver.resolveSigmaScheduleKind(schedule)
+      }
+      sigmaSchedule = schedule
+      applied.append("sigma_schedule")
+    }
+    if let eta = expansion.eta { self.eta = Float(eta); applied.append("eta") }
+    if let bongmath = expansion.bongmath { self.bongmath = bongmath; applied.append("bongmath") }
+    if let stage = expansion.stage2 {
+      var missing: [String] = []
+      if stage.steps == nil { missing.append("steps") }
+      if stage.denoise == nil { missing.append("denoise") }
+      guard let steps = stage.steps, let denoise = stage.denoise else {
+        throw WarmServerError.presetRecipeInvalid(
+          preset: id, field: "stage2",
+          reason: "the preset declares a second stage without " + missing.joined(separator: " and ")
+            + " — both decide the stretched grid and have no default, so the engine will not "
+            + "guess them. Declare stage2.steps and stage2.denoise on the preset, or send "
+            + "`stage2` on the request")
+      }
+      let stageSampler = PresetLoRAStack.nonEmpty(stage.sampler)
+      let stageSchedule = PresetLoRAStack.nonEmpty(stage.sigmaSchedule)
+      _ = try Self.presetName(id, field: "stage2.sampler") {
+        try RecipeNameResolver.resolveSchedulerKind(stageSampler)
+      }
+      _ = try Self.presetName(id, field: "stage2.sigma_schedule") {
+        try RecipeNameResolver.resolveSigmaScheduleKind(stageSchedule)
+      }
+      stage2 = Stage2Payload(
+        steps: steps, denoise: denoise, scheduler: stageSampler, sigmaSchedule: stageSchedule,
+        eta: stage.eta.map(Float.init), bongmath: stage.bongmath)
+      applied.append("stage2")
+    }
+    if let noiseType = expansion.noiseType { self.noiseType = noiseType; applied.append("noise_type") }
+    if let noiseAlpha = expansion.noiseAlpha {
+      self.noiseAlpha = Float(noiseAlpha); applied.append("noise_alpha")
+    }
+    if let implicitSteps = expansion.implicitSteps {
+      self.implicitSteps = implicitSteps; applied.append("implicit_steps")
+    }
+    if let c2 = expansion.c2 { self.c2 = Float(c2); applied.append("c2") }
+    if let projectorScale = expansion.projectorScale {
+      self.projectorScale = Float(projectorScale); applied.append("projector_scale")
+    }
+
+    guard !applied.isEmpty else { return }
+    presetRecipeApplied = applied
+    let summary = [
+      expansion.sampler.map { "sampler=\($0)" },
+      expansion.sigmaSchedule.map { "sigma_schedule=\($0)" },
+      expansion.eta.map { "eta=\($0)" },
+      expansion.bongmath.map { "bongmath=\($0)" },
+      expansion.stage2.map { "stage2={steps: \($0.steps ?? 0), denoise: \($0.denoise ?? 0)}" },
+      expansion.noiseType.map { "noise_type=\($0)" },
+      expansion.noiseAlpha.map { "noise_alpha=\($0)" },
+      expansion.implicitSteps.map { "implicit_steps=\($0)" },
+      expansion.c2.map { "c2=\($0)" },
+      expansion.projectorScale.map { "projector_scale=\($0)" },
+    ].compactMap { $0 }.joined(separator: " ")
+    log("Preset '\(id)': applying its declared sampler recipe — \(summary) "
+      + "(request fields, where sent, took precedence)")
+  }
+
+  /// Resolve one preset-declared recipe name, rewrapping the resolver's
+  /// `unknownSampler` / `unknownSigmaSchedule` so the 400 names the PRESET
+  /// and the field, not just the string.
+  private static func presetName<T>(
+    _ presetId: String, field: String, _ resolve: () throws -> T
+  ) throws -> T {
+    do {
+      return try resolve()
+    } catch let error as WarmServerError {
+      throw WarmServerError.presetRecipeInvalid(
+        preset: presetId, field: field,
+        reason: error.errorDescription ?? "\(error)")
     }
   }
 

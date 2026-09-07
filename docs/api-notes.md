@@ -416,6 +416,35 @@ already go through), so a replay reports `vae_source: "payload"` even for an
 originally preset-sourced render — the price of replaying a frozen body
 instead of re-resolving a preset that may have changed since.
 
+## Preset sampler recipe on `/v1/generate` (comfybox#419)
+
+A named `preset` now supplies its whole **sampler recipe**, not only its
+stack: `sampler` (or the legacy `scheduler` key — the daemon still reads that
+spelling, and a preset carrying only it still names a sampler), `sigma_schedule`,
+`eta`, `bongmath`, `stage2`, `noise_type`, `noise_alpha`, `implicit_steps`,
+`c2` and `projector_scale`. Before #419 `{"preset": "krea-kira"}` rendered on
+the engine's default sampler while the preset said `res_2s + beta57`, and
+reported success; only the daemon, which reads presets.json itself and sends
+every field explicitly, ever got the recipe. **Precedence is the `shift` rule,
+per field: the request's own value always wins, the preset's DECLARED value
+fills in only where the request sent none, and nothing is ever manufactured
+from a default** — so a request that sends `preset` *and* the recipe spelled
+out (the daemon's shape) is unchanged. `stage2` is adopted as one object
+(never field-merged with a request stage), and because the wire's `stage2`
+requires `steps` and `denoise`, a preset stage missing either is a **400
+naming the preset**, not a guess; so is a preset sampler/schedule name the
+engine does not resolve. There is no family gate at expansion — the family
+capability matrix, the eta/bongmath-by-sampler gates and the `stage2` family
+gate all run at dispatch on the **expanded** values, so a preset declaring
+`euler + eta 0.5` on Krea 2 gets the same 400 the explicit request does. The
+one exception remains `shift` (next section): on Krea 2 it is `mu` and stays
+request-only. The response and `GET /v1/generate/status/{id}` carry the
+additive `preset_recipe_applied` array — the wire keys the render took from
+the preset (`["scheduler", "sigma_schedule", "eta", …]`); a field the request
+sent is never listed. A crash-recovery replay carries the accepted recipe as
+explicit request fields (the `vae_source` rule), so a replayed job renders the
+same recipe and reports none of it as preset-sourced.
+
 ## Schedule shift — `shift` (comfybox#154, and Krea 2's D3)
 
 `shift` is one request field with a **family-dependent meaning**, because
