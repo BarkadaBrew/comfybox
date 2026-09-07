@@ -228,7 +228,13 @@ public enum QwenImageIO {
       /// a Krea 2 render, so a REFUSED record writes `"applied": null` rather
       /// than vanishing into the same absent key a non-krea2 render produces.
       /// Takes precedence over `applied` when both are given.
-      appliedSlot: AppliedRecordSlot? = nil
+      appliedSlot: AppliedRecordSlot? = nil,
+      /// #399: the ``StylePack`` name the save path APPLIED, or nil. Written
+      /// as a top-level `style` key beside `applied` — the provenance record
+      /// can be refused (`"applied": null`), and the file must still say
+      /// which look its pixels carry. Absent when nil, so an unstyled
+      /// render's metadata is byte-identical to the pre-#399 one.
+      style: String? = nil
     ) -> ImageMetadata {
       var params: [String: Any] = ["prompt": prompt]
       // WP-E10 sink 2: the provenance record rides in the PNG under `applied`
@@ -279,6 +285,7 @@ public enum QwenImageIO {
       // Which app/persona generated it — placed persona renders in the gallery.
       if let generatedBy, !generatedBy.isEmpty { params["source"] = generatedBy }
       if let contentMode, !contentMode.isEmpty { params["content_mode"] = contentMode }
+      if let style, !style.isEmpty { params["style"] = style }
       if !loras.isEmpty {
         params["loras"] = loras.map { c -> [String: Any] in
           ["name": (c.source.displayName as NSString).deletingPathExtension,

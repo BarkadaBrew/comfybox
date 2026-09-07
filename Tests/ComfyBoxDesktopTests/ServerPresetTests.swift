@@ -219,6 +219,41 @@ struct ServerPresetTests {
         #expect(p.kromaDeprecated == nil)
         #expect(p.migrationNotes == nil)
     }
+
+    /// #399: an upsert REPLACES the stored document, so a preset's declared
+    /// StylePack look must survive a desktop edit-and-save cycle exactly like
+    /// `vae`/`sampler`/`shift` above. Without the passthrough, opening a
+    /// styled preset in the editor and renaming it would silently erase the
+    /// look from `presets.json`.
+    @Test("round-trip preserves the declared style and its phone_look alias")
+    func roundTripPreservesStylePack() throws {
+        let json = #"{"id":"kira","name":"Kira","style":"hp5-soft","phone_look":true}"#
+        var p = try snakeDecoder().decode(ServerPreset.self, from: Data(json.utf8))
+        #expect(p.style == "hp5-soft")
+        #expect(p.phoneLook == true)
+
+        p.name = "Renamed"
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let dict = try JSONSerialization.jsonObject(with: try encoder.encode(p)) as? [String: Any]
+        #expect(dict?["style"] as? String == "hp5-soft")
+        #expect(dict?["phone_look"] as? Bool == true)
+    }
+
+    /// A preset that declares no look stays that way — the additive fields
+    /// must never appear in the body a desktop save PUTs back.
+    @Test("a preset with no style encodes no style keys")
+    func noStyleEncodesNoKeys() throws {
+        let p = try snakeDecoder().decode(ServerPreset.self, from: Data(Self.liveJSON.utf8))
+        #expect(p.style == nil)
+        #expect(p.phoneLook == nil)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let dict = try #require(
+            try JSONSerialization.jsonObject(with: try encoder.encode(p)) as? [String: Any])
+        #expect(dict["style"] == nil)
+        #expect(dict["phone_look"] == nil)
+    }
 }
 
 final class ServerPresetNegativeTests: XCTestCase {

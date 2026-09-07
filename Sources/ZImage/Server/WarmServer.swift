@@ -4541,32 +4541,15 @@ public final class WarmServer {
       var lastResult: ComfyBridgeGenerateResult?
       var totalDurationMs = 0
       for i in 0..<request.batchSize {
-        // Vary seed per batch item for unique outputs.
-        var batchPayload = payload
-        if let baseSeed = request.seed {
-          batchPayload = GeneratePayload(
-            prompt: payload.prompt,
-            negativePrompt: payload.negativePrompt,
-            width: payload.width,
-            height: payload.height,
-            steps: payload.steps,
-            guidance: payload.guidance,
-            seed: baseSeed + UInt64(i),
-            outputPath: payload.outputPath,
-            levelsMin: payload.levelsMin,
-            levelsMax: payload.levelsMax,
-            scheduler: payload.scheduler,
-            sigmaSchedule: payload.sigmaSchedule,
-            shift: payload.shift,
-            inpaintImageData: payload.inpaintImageData,
-            maskData: payload.maskData,
-            denoise: payload.denoise,
-            maskGrow: payload.maskGrow,
-            maskFeather: payload.maskFeather,
-            maskCropX: payload.maskCropX,
-            maskCropY: payload.maskCropY
-          )
-        }
+        // Vary seed per batch item for unique outputs. #399 (review r2,
+        // ruling 3): ONE field is overridden and everything else is carried
+        // by copy — this loop used to rebuild the payload field by field and
+        // dropped every field the rebuild did not mention (`style`,
+        // `phone_look`, `preset`, `loras`, `model`, `content_mode`, `source`,
+        // `dype`, `eta`, `bongmath`, the img2img fields …).
+        let batchPayload = request.seed.map {
+          GeneratePayload.batchItem(payload, seed: $0 + UInt64(i))
+        } ?? payload
         let result = try await coordinator.enqueueGenerate(batchPayload, progressHandler: pipelineProgress, latentPreviewHandler: pipelineLatentPreview, source: "comfyui")
         totalDurationMs += result.durationMs
         lastResult = ComfyBridgeGenerateResult(outputPath: result.outputPath, durationMs: totalDurationMs)
@@ -5496,6 +5479,69 @@ public final class WarmServer {
     // warm pipeline happened to hold, on whatever base was active.
     var expanded = try expandGeneratePayload(
       payload, store: store, stageNearline: stageNearline, loraExists: loraExists, log: log)
+    // Todd 2026-08-24 ("I prefer style pack"): collapse the request's and the
+    // preset's look declarations onto ONE resolved `style` name.
+    //
+    // Resolved here rather than at the route so `/v1/generate`,
+    // `/v1/generate/async` and persisted-queue replay all agree about it, and
+    // precedence is main's rule for every other preset-contributed field
+    // (#286/#285/#154): explicit request > preset > nothing. Read from the
+    // DECLARED preset (`store.lookup`), never from `ResolvedPreset`, so
+    // `PresetDefaults` can never manufacture a look nobody asked for.
+    //
+    // #399: unlike `loras`/`model`/`steps`/`shift`, a style is NOT part of the
+    // recipe — it is a pure CPU pass over the decoded RGB buffer, family- and
+    // stack-independent. So it is taken from the declared preset even when the
+    // preset itself could not be expanded (`preset_unresolved`): "expand the
+    // recipe as a whole or not at all" exists to stop adapters landing on the
+    // wrong base, and there is no such hazard here. That also preserves the
+    // lane's shipped behaviour, where the look was read straight off the
+    // preset with no expansion involved.
+    //
+    // (review r1, ruling 2 / review r2, ruling 1): `lookup` returns the preset
+    // AND its validity flag (WP-E20 / AC-44c). A preset the store flagged
+    // INVALID contributes NOTHING — not its stack, not its model, and not its
+    // look: the document is the thing the engine has refused to trust, and a
+    // look read off it would be read off a record that failed validation.
+    //
+    // But dropping it is not an option either. `PresetLoRAStack`'s "an
+    // unexpandable preset is a LABEL, never a 400" rule exists because an
+    // unknown preset id was harmless provenance for the daemon's whole life —
+    // it is a rule about the RECIPE. A `style` is the caller asking for a
+    // visible change to the pixels, and silently not making it is the exact
+    // failure this feature is not allowed to have. So when the ONLY look on
+    // the request came from a preset the engine will not use, that is a 400
+    // naming the preset, the look and the reason.
+    //
+    // The rule stays scoped: a preset that declares NO look is untouched —
+    // still a label, still no 400, still just `preset_unresolved_reason`.
+    let presetId = payload.preset
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .flatMap { $0.isEmpty ? nil : $0 }
+    let lookedUp = presetId.map { store.lookup($0) }
+    let usablePreset: ImagePreset? = lookedUp.flatMap { $0.invalidReason == nil ? $0.preset : nil }
+
+    if let presetId, let looked = lookedUp, let invalidReason = looked.invalidReason,
+       // The request said nothing, so the preset's look was the only one.
+       StylePack.resolveName(
+         requestStyle: payload.style, requestPhoneLook: payload.phoneLook,
+         presetStyle: nil, presetPhoneLook: nil) == nil,
+       let dropped = StylePack.resolveName(
+         requestStyle: nil, requestPhoneLook: nil,
+         presetStyle: looked.preset?.style, presetPhoneLook: looked.preset?.phoneLook) {
+      throw WarmServerError.styleFromUnusablePreset(
+        preset: presetId, style: dropped,
+        // The store's own code for why it will not use this document. An
+        // undecodable entry keeps its decode reason; a validation failure
+        // keeps the failing field.
+        code: "invalid_preset", reason: invalidReason)
+    }
+
+    expanded.style = StylePack.resolveName(
+      requestStyle: payload.style, requestPhoneLook: payload.phoneLook,
+      presetStyle: usablePreset?.style, presetPhoneLook: usablePreset?.phoneLook)
+    // An unknown name is a 400 HERE — never a silent no-op at save time.
+    try StylePack.validate(expanded.style)
     // #22 (PR #363 review, C2): resolution/memory preflight — refuses an
     // oversized request BEFORE it is enqueued (let alone before any model
     // load), with the estimate/available/cap named in the refusal. Runs
@@ -5624,6 +5670,10 @@ public final class WarmServer {
       // replayed body that dropped it would silently render on the model's
       // own schedule instead.
       ("shift", payload.shift as Any?),
+      // #399: same reason for a preset-owned StylePack name — a replayed body
+      // that dropped it would render the job WITHOUT the look it was accepted
+      // with. (`style` needs no snake_case rewrite; it is one word.)
+      ("style", payload.style as Any?),
     ] where object[key] == nil {
       if let value {
         object[key] = value
@@ -5993,7 +6043,7 @@ public final class WarmServer {
       // caller's error, named in full (AC-15, AC-28).
       case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField,
            .unsupportedSampler, .orphanField, .projectorScaleOutOfRange, .unknownNoiseType,
-           .implicitStepsOutOfRange, .c2OutOfRange:
+           .unknownStyle, .styleFromUnusablePreset, .implicitStepsOutOfRange, .c2OutOfRange:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
            .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded, .krea2VariantUnknown:
@@ -10669,6 +10719,14 @@ private actor WarmServerCoordinator {
       continuation.resume(throwing: error)
       return
     }
+    // #399 (PR #407 review, ruling 1): a style pack must never be a silent
+    // no-op. The pass runs in `runKrea2Generate` only, so every other arm of
+    // the dispatch below refuses the look here instead of dropping it.
+    if let error = GeneratePayload.styleGate(payload, family: currentModelFamily) {
+      lastError = error.localizedDescription ?? "unsupported style"
+      continuation.resume(throwing: error)
+      return
+    }
 
     switch currentModelFamily {
     case .chroma:
@@ -11030,7 +11088,7 @@ private actor WarmServerCoordinator {
         }
       }
 
-      let image: MLXArray
+      var image: MLXArray
       // WP-E17: one trace per stage that ran, in order. `traces[0]` is the
       // render's own — the geometry, seed and schedule shift every sink reads.
       let traces: [Krea2RunTrace]
@@ -11107,6 +11165,37 @@ private actor WarmServerCoordinator {
       // loop just counted. `steps`/`guidance` above are NOT consulted here.
       // Fail CLOSED on an incomplete read-back: a record naming two of three
       // adapters is worse than no record, because it reads as complete.
+      // #399 — the engine-applied style pack (Todd 2026-08-24): a pure CPU
+      // pass over the decoded RGB buffer. Runs HERE, before the provenance
+      // record is built (PR #407 review, ruling 3), so `applied.style` and
+      // the PNG's `style` name the look that was actually applied rather than
+      // the one the request asked for — every other field of that record is a
+      // read-back and this one is too.
+      //
+      // An ABSENT style skips the whole block: `image` is never read out of
+      // MLX, never rebuilt, never written, so a render that asked for no look
+      // is byte-identical to the pre-#399 engine (`StylePackParityTests`).
+      // The name was validated at the decode and the FAMILY was gated at
+      // dispatch (`GeneratePayload.styleGate`), so reaching here with a look
+      // means this save path can apply it.
+      //
+      // DTYPE (ruling 4): `asArray(Float.self)` widens whatever the decoder
+      // produced to float32 and `MLXArray(px, …)` would rebuild it as float32.
+      // The rebuild is cast back to the decoder's own dtype, so a styled
+      // render hands `saveImage` an array of the SAME dtype an unstyled one
+      // does — the post-process changes the pixels, never the buffer's type.
+      // (The recipes are defined on [0,1] floats; the widening is internal to
+      // the pass and does not survive it.)
+      var appliedStyle: String?
+      if let style = StylePack.resolved(payload.effectiveStyleName) {
+        let hDim = image.dim(0), wDim = image.dim(1)
+        let decodedDType = image.dtype
+        var px: [Float] = image.asArray(Float.self)
+        style.apply(pixels: &px, width: wDim, height: hDim)
+        image = MLXArray(px, [hDim, wDim, 3]).asType(decodedDType)
+        appliedStyle = style.rawValue
+        logger.info("Krea2: applied style pack '\(style.rawValue)' after decode")
+      }
       let loraReadBacks = RenderRecipe.loRAReadBacks(
         configs: k2.loadedLoRAConfigs, reports: k2.loadedLoRAReports,
         // I6: the relativity the guard ENFORCED, so `relative_to` names what
@@ -11133,7 +11222,9 @@ private actor WarmServerCoordinator {
           // D4 / WP-E17: every stage that ran, so `applied.stages[]` and
           // `model_evals_total` describe the whole render rather than its
           // first half.
-          traces: traces))
+          traces: traces,
+          // #399: the look this render actually carries out of the save path.
+          style: appliedStyle))
       }
       // Sink 2 — the PNG. The negative comes from the TRACE (K-FIX-1 / I4):
       // absent when CFG never ran (AC-61), and an applied `""` is written as
@@ -11156,7 +11247,12 @@ private actor WarmServerCoordinator {
         loras: k2.loadedLoRAConfigs,
         // The SLOT, so a refused record writes `"applied": null` in the file
         // rather than looking like a family that has no record (round 2, C4).
-        appliedSlot: AppliedRecordSlot(record: record)
+        appliedSlot: AppliedRecordSlot(record: record),
+        // #399: a top-level `style` too, not only `applied.style` — the record
+        // can be REFUSED (`loraReadBacks == nil` writes `"applied": null`) and
+        // the file would then carry no trace of a look that was applied to
+        // its pixels.
+        style: appliedStyle
       )
       try QwenImageIO.saveImage(array: image.transposed(2, 0, 1), to: outputURL, metadata: metadata)
 
@@ -12257,7 +12353,13 @@ struct GeneratePayload: Sendable {
   var steps: Int?
   /// `var` since #286, same rule as `steps`.
   var guidance: Float?
-  let seed: UInt64?
+  /// `var` since #399 (review r2, ruling 3): the ComfyUI bridge's batch loop
+  /// needs a per-item seed, and with `let` it could only get one by REBUILDING
+  /// the payload field by field — which silently dropped every field the
+  /// rebuild forgot (`style`/`phone_look` were the third instance of that bug
+  /// in this feature alone). `GeneratePayload.batchItem(_:seed:)` now copies
+  /// and overrides this one field, so nothing can be forgotten again.
+  var seed: UInt64?
   let outputPath: String?
   let levelsMin: Float?
   let levelsMax: Float?
@@ -12303,6 +12405,13 @@ struct GeneratePayload: Sendable {
 
   // Phase 4: Img2img (set via HTTP API)
   var imagePath: String?   // var: may be filled in from initImageData (bytes upload)
+  /// Phone-look post-process; an alias for ``style`` == "phone". Kept as its
+  /// own wire field because the daemon already sends it (intent.md: version
+  /// or shim, never silently change).
+  var phoneLook: Bool?
+  /// The RESOLVED StylePack name (request > preset), filled in by
+  /// `WarmServer.decodedGeneratePayload`. nil = no post-process at all.
+  var style: String?
   /// Img2img init image sent as base64 (init_image_base64) — for remote clients
   /// that can't put a file on the server's filesystem. Decoded to a temp file.
   let initImageData: Data?
@@ -12569,6 +12678,8 @@ extension GeneratePayload: Decodable {
     case sampler
     case preset
     case denoise, maskGrow, maskFeather
+    case phoneLook
+    case style
     // NOTE: the /v1/generate decoder uses .convertFromSnakeCase, which rewrites
     // incoming keys to camelCase BEFORE matching CodingKey stringValues. So the
     // wire keys inpaint_image_base64 / mask_base64 arrive as these camelCase
@@ -12616,6 +12727,8 @@ extension GeneratePayload: Decodable {
     guidance = try c.decodeIfPresent(Float.self, forKey: .guidance)
     seed = try c.decodeIfPresent(UInt64.self, forKey: .seed)
     outputPath = try c.decodeIfPresent(String.self, forKey: .outputPath)
+    phoneLook = try c.decodeIfPresent(Bool.self, forKey: .phoneLook)
+    style = try c.decodeIfPresent(String.self, forKey: .style)
     levelsMin = try c.decodeIfPresent(Float.self, forKey: .levelsMin)
     levelsMax = try c.decodeIfPresent(Float.self, forKey: .levelsMax)
     let schedulerRaw = try c.decodeIfPresent(String.self, forKey: .scheduler)
@@ -12792,6 +12905,57 @@ extension GeneratePayload: Decodable {
     return .unsupportedRecipeField(
       field: "vae", value: vae, family: family.rawValue,
       reason: "VAE selection is a Krea 2 request field (WP-E9); this family decodes through its own VAE and does not honour it — remove it")
+  }
+
+  /// #399, the same shape for `style` / `phone_look`: the ``StylePack``
+  /// post-process pass exists in `runKrea2Generate` and nowhere else, so on
+  /// any other family a resolved look would be accepted at the decode,
+  /// reported back, and then never applied. Refused at DISPATCH (D18: family
+  /// gates live where the family is known, not at the decoder), which is the
+  /// one point `/v1/generate`, `/v1/generate/async`, crash-recovery replay,
+  /// preemption and the ComfyUI bridge all funnel through — every one of them
+  /// reaches the render via `enqueueGenerate` → `runGenerate`.
+  ///
+  /// `phoneLook` is read too, not just `style`: the decode collapses the
+  /// alias, but a payload built in-process (the bridge, a test) can carry the
+  /// boolean alone, and "the request asked for a look" is the thing being
+  /// gated.
+  static func styleGate(_ payload: GeneratePayload, family: WarmModelFamily) -> WarmServerError? {
+    FamilyRecipeMatrix.validateStyle(payload.effectiveStyleName, family: family)
+  }
+
+  /// #399 (review r2, ruling 2) — THE look this payload carries, as ONE
+  /// resolution both the family gate above and the save-path apply read.
+  ///
+  /// They used to differ: the gate resolved the `phone_look` alias while the
+  /// apply site read `style` alone, so a payload with `phone_look: true` and
+  /// no `style` was REFUSED on chroma/fibo/flux and rendered UNSTYLED on
+  /// krea2 — a look refused in one place and dropped in the other. The decode
+  /// normally collapses the alias before either sees it; a payload built
+  /// in-process (the ComfyUI bridge, a replay of a hand-written body) does
+  /// not go through it, which is exactly when the two disagreed.
+  ///
+  /// Preset fields are deliberately nil here: by this point the decode has
+  /// already folded the preset's declaration into `style`, and re-reading a
+  /// preset at dispatch would resolve it against a store that may have
+  /// changed since the job was accepted (#286 I5).
+  /// #399 (review r2, ruling 3) — one batch item's payload: the accepted
+  /// request with a per-item seed, and NOTHING else changed.
+  ///
+  /// A pure function so the ComfyUI bridge's batch loop has one carrying
+  /// rule that a unit test can drive (`StylePackBridgeBatchTests`), instead
+  /// of an inline rebuild whose correctness depended on someone remembering
+  /// to extend it every time `GeneratePayload` grew a field.
+  static func batchItem(_ payload: GeneratePayload, seed: UInt64) -> GeneratePayload {
+    var out = payload
+    out.seed = seed
+    return out
+  }
+
+  var effectiveStyleName: String? {
+    StylePack.resolveName(
+      requestStyle: style, requestPhoneLook: phoneLook,
+      presetStyle: nil, presetPhoneLook: nil)
   }
 
   /// K-FIX-1 / Codex I5: refuse a sampler / sigma schedule the ACTIVE FAMILY
@@ -14049,6 +14213,17 @@ public enum WarmServerError: Error, LocalizedError {
   /// name is a 400 naming the valid set — it must never silently degrade to
   /// gaussian (absent stays gaussian; that is the default, not a coercion).
   case unknownNoiseType(name: String, valid: [String])
+  /// #399: a `style` (or preset-declared style) that is not in the
+  /// ``StylePack`` registry. A 400 naming the known set at the generate
+  /// decode — a look the caller asked for must never be silently skipped.
+  case unknownStyle(name: String, valid: [String])
+  /// #399 (review r2, ruling 1): the ONLY look this request asked for was
+  /// declared by a preset the engine refuses to use. Dropping it would render
+  /// the plain image under the preset's name with nothing but
+  /// `preset_unresolved_reason` to explain it — the silent no-op this feature
+  /// is not allowed to have. 400 naming the preset, the look, and WHY the
+  /// preset is unusable.
+  case styleFromUnusablePreset(preset: String, style: String, code: String, reason: String)
   /// #286: the request named a `preset` AND an explicit `model` that resolve
   /// to different bases. Applying the preset's adapters to the requested base,
   /// or the requested base under the preset's name, are both wrong — so it is
@@ -14131,6 +14306,13 @@ public enum WarmServerError: Error, LocalizedError {
     case .unknownNoiseType(let name, let valid):
       return "Unknown noise_type '\(name)'. Valid noise types: \(valid.joined(separator: ", ")); "
         + "omit it for gaussian"
+    case .unknownStyle(let name, let valid):
+      return "Unknown style '\(name)'. Known styles: \(valid.joined(separator: ", ")); "
+        + "omit `style` for no post-process"
+    case .styleFromUnusablePreset(let preset, let style, let code, let reason):
+      return "'style' = '\(style)' is declared only by preset '\(preset)', which this engine "
+        + "will not use [\(code)]: \(reason). The look would have been silently dropped — fix "
+        + "the preset, or send `style` on the request"
     case .renderInterrupted:
       return "Render interrupted by /v1/queue/interrupt"
     case .queueRecoveryInProgress:

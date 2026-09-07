@@ -69,6 +69,17 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
   public let stages: [Stage]
   public let modelEvalsTotal: Int
 
+  // MARK: - Post-process (#399)
+
+  /// The ``StylePack`` name this render's save path actually applied
+  /// (`phone` | `trix-bw` | `hp5-soft`), or nil when no look was applied.
+  ///
+  /// A read-back like every other field here: it is set from the style whose
+  /// `apply` ran, after the pass, not from `payload.style`. Absent on the
+  /// wire when nil, so an unstyled render's record is byte-identical to the
+  /// pre-#399 one.
+  public let style: String?
+
   public struct Stage: Codable, Sendable, Equatable {
     /// 0-based.
     public let index: Int
@@ -265,6 +276,9 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
     /// empty array here would silently produce a record with no `stages[]` and
     /// a zero eval count, which reads as a completed render that cost nothing.
     public var traces: [Krea2RunTrace]
+    /// #399: the ``StylePack`` name the save path applied, or nil. Passed in
+    /// AFTER the pass ran, so the record names what happened.
+    public var style: String?
 
     /// The first stage's trace — the one the record's render-wide fields
     /// (geometry, seed, the schedule shift) come from.
@@ -275,21 +289,22 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
       baseModel: String, variant: Krea2Variant, transformerFile: URL, quantizationBits: Int?,
       vae: Krea2VAESelection, textEncoderFile: URL,
       loras: [LoRAReadBack], control: ControlReadBack?,
-      trace: Krea2RunTrace
+      trace: Krea2RunTrace, style: String? = nil
     ) {
       self.init(
         baseModel: baseModel, variant: variant, transformerFile: transformerFile,
         quantizationBits: quantizationBits, vae: vae, textEncoderFile: textEncoderFile,
-        loras: loras, control: control, traces: [trace])
+        loras: loras, control: control, traces: [trace], style: style)
     }
 
     public init(
       baseModel: String, variant: Krea2Variant, transformerFile: URL, quantizationBits: Int?,
       vae: Krea2VAESelection, textEncoderFile: URL,
       loras: [LoRAReadBack], control: ControlReadBack?,
-      traces: [Krea2RunTrace]
+      traces: [Krea2RunTrace], style: String? = nil
     ) {
       precondition(!traces.isEmpty, "a RenderRecipe needs at least one stage trace (D4)")
+      self.style = style
       self.baseModel = baseModel
       self.variant = variant
       self.transformerFile = transformerFile
@@ -395,7 +410,9 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
       // D4 / WP-E17: the SUM over every stage that ran. Never `stages[0]`'s
       // count — a two-stage render costs both, and the published recipe's
       // stage 2 is 6 evaluations of the 18 it takes.
-      modelEvalsTotal: stages.reduce(0) { $0 + $1.modelEvals })
+      modelEvalsTotal: stages.reduce(0) { $0 + $1.modelEvals },
+      // #399: what the post-process pass applied, read back after it ran.
+      style: i.style)
   }
 }
 

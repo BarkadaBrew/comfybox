@@ -401,6 +401,118 @@ already refuses every non-Z-Image family with `controlNetNotSupported`, so on
 that path the client sees that error instead.) See
 `bridge-developer-guide.md`.
 
+## Style packs — `style` / `phone_look` (comfybox#399)
+
+A **style pack** is a named, deterministic, engine-applied post-process: a pure
+CPU pass over the decoded RGB buffer, run **after VAE decode and before save**,
+in `runKrea2Generate`. It is not part of the recipe — it never touches the
+model, the LoRA stack, the sampler, the sigma grid or the seed — so the same
+request with and without a style renders the same latents and only differs in
+the pixels written to disk. `Sources/ZImage/Server/StylePack.swift` holds the
+registry and every recipe's numbers.
+
+**The v1 pack.**
+
+| `style` | What it is |
+|---|---|
+| `phone` | The accel-distill colour correction (`PhoneLook.swift`). Percentile auto-levels (P0.5/P99.5, guarded), S-contrast ×1.15, adaptive saturation toward a 0.32 mean capped at ×1.25, unsharp mask (σ 1.6 / 45% / threshold 2/255). Restores "a reasonable mobile phone look" on 4-step distills, which quit before the denoise steps that settle dynamic range. |
+| `trix-bw` | Guaranteed monochrome pushed film. Panchromatic channel mix (0.35/0.55/0.10), percentile levels, contrast ×1.3, soft highlight shoulder from 0.82 at 55%. Prompts alone rendered "Kodak Tri-X" in colour; the style makes B&W deterministic. Grain stays the model's job. |
+| `hp5-soft` | The gentler classic-gradation emulsion: same mono mix and levels, contrast ×1.08, lower/softer shoulder (0.75 at 70%). |
+
+Names are matched trimmed and case-insensitively. An **unknown** name is a
+**400** at the generate decode naming the known set — never a silent no-op at
+save time — and a preset that declares an unknown style is refused at
+`POST /v1/presets` upsert for the same reason.
+
+**Krea 2 only, and refused elsewhere.** The pass runs in the Krea 2 save path
+and nowhere else. A `style` (or `phone_look`) on a request that will render on
+`chroma`, `fibo`, `flux1` or `flux2` is a **400 at dispatch** naming the field,
+the value, the family and the family that can honour it — never accepted,
+reported back and then silently skipped. The capability is one flag
+(`appliesStylePack`) in `FamilyRecipeMatrix`, beside the sampler and
+sigma-schedule rows, so a family that grows the pass declares it in the same
+commit; the refusal runs at the single point `/v1/generate`,
+`/v1/generate/async`, crash-recovery replay, preemption and the ComfyUI bridge
+all funnel through (`enqueueGenerate` → `runGenerate`).
+
+**Wire fields (additive; both optional, both absent = no post-process at all).**
+
+```json
+{"prompt": "…", "style": "hp5-soft"}
+{"prompt": "…", "phone_look": true}
+```
+
+`phone_look` is the **legacy alias** for `style: "phone"` and is kept because
+the daemon already sends it (intent.md: version or shim, never silently
+change). `phone_look: false` is a statement, not an absence: it asks for no
+look. A preset may declare the same two fields (`style`, `phone_look`) and they
+round-trip through `presets.json`.
+
+**Precedence — explicit request > preset > nothing**, the same rule
+`steps`/`guidance` (#286), `vae` (#285) and `shift` (#154) follow. `phone_look`
+is consulted per side only when *that* side named no `style`, so a preset's own
+`style` is never overruled by its own historical `phone_look`.
+
+| # | Source | When it wins |
+|---|---|---|
+| 1 | the request's own `style` | whenever the key is present and non-blank |
+| 2 | the request's own `phone_look: true` | when the request sent no `style` |
+| 3 | the named `preset`'s declared `style` | when the request declared neither |
+| 4 | the named `preset`'s declared `phone_look: true` | when the request declared neither and the preset named no `style` |
+| 5 | **no post-process** | the default — nothing is applied, and the render is byte-identical to the pre-#399 engine |
+
+Resolution happens once, in `WarmServer.decodedGeneratePayload`, so
+`/v1/generate`, `/v1/generate/async` and crash-recovery replay all agree; a
+preset-owned style is written into the persisted replay body beside the
+preset-owned `model`/`steps`/`guidance`/`vae`/`shift`, so a replayed job keeps
+the look it was accepted with.
+
+**A style survives a preset the engine cannot expand.** Unlike the recipe
+fields, a declared `style` is adopted even when the preset comes back
+`preset_unresolved` (a video preset on the image path, a non-local engine, …).
+"Expand the recipe as a whole or not at all" exists to stop a preset's adapters
+landing on the wrong base; a post-process has no base to land on.
+
+**Read from the DECLARED preset, never from `ResolvedPreset`** — the same rule
+as `steps`/`guidance`/`vae`/`shift` — so `PresetDefaults` can never manufacture
+a look nobody asked for.
+
+**A preset the store flagged invalid lends nothing — and says so.** WP-E20 /
+AC-44c: `PresetStore.lookup` returns the preset *and* its validity flag, and
+both are read. An invalid document is not trusted for its look any more than
+for its stack. But the look is not silently dropped either: when the **only**
+look on the request came from an invalid preset, that is a **400** naming the
+preset, the look and the reason (`invalid_preset` plus the store's own
+message). `PresetLoRAStack`'s "an unexpandable preset is a label, never a 400"
+rule is about the *recipe* — an unknown preset id was harmless provenance for
+the daemon's whole life. A `style` is the caller asking for a visible change to
+the pixels, and not making it silently is the failure mode this feature is not
+allowed to have. An invalid preset that declares **no** look keeps the old
+behaviour exactly: a label, no 400, `preset_unresolved_reason` in the response.
+
+**Provenance.** A styled render records the look it applied in two places, both
+read back after the pass rather than echoed from the request:
+
+* `applied.style` on the `/v1/generate` response, `/health.last_recipe` and the
+  PNG's embedded `applied` block — the `RenderRecipe` field;
+* a top-level `style` key in the PNG parameter JSON, because the provenance
+  record can be *refused* (`"applied": null` when the LoRA read-backs are
+  incomplete) and the file must still say which look its pixels carry.
+
+Both keys are **absent** when no look ran, so an unstyled render's response,
+record and PNG bytes are identical to the pre-#399 engine's.
+
+**Buffer dtype.** The pass reads the decoded image into a `[Float]`, applies a
+pure recipe, and rebuilds the MLX array **cast back to the decoder's own
+dtype** — a styled render hands the PNG writer an array of the same type an
+unstyled one does. The float32 widening is internal to the pass.
+
+**Spelling on disk vs on the wire.** `POST /v1/presets` decodes
+`.convertFromSnakeCase`, so a client sends `phone_look`. `~/.comfybox/presets.json`
+is written and read with a plain coder, so the file spells the same field
+`phoneLook` (`style` is one word either way). Both reach the same
+`ImagePreset` fields; a hand-edited presets.json must use the camelCase form.
+
 ## Gallery output filenames
 
 Default render filenames (no `output_path` in the request) are built by

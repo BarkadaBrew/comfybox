@@ -2,7 +2,7 @@
 
 **Repo:** `BarkadaBrew/comfybox` (`~/Projects/zimage.swift`, Swift/MLX)
 **Maintained:** living reference — update as pipelines are ported/verified.
-**Last updated:** 2026-09-05
+**Last updated:** 2026-09-06
 
 > **Framing.** ComfyBox is *not* "ComfyUI + MLX." ComfyUI is a general node-graph engine plus an unbounded custom-node ecosystem on PyTorch/CUDA. ComfyBox is a **curated set of pipelines hand-ported to mlx-swift** — a capability exists only if it was ported *and* verified against the reference. It is a vertically-integrated, Apple-Silicon-native **subset** that is faster and better-integrated for the models it covers, not a superset. Parity is per-feature and never automatic (see the LTX-2 fps-RoPE bug, `FDD-ltx2-temporal-motion.md`).
 
@@ -51,6 +51,7 @@
 |---|---|
 | ESRGAN / RRDBNet | ✅ Working (`upscale`) |
 | SeedVR2 super-resolution | 🟡 Working @1024px; 2048px experimental (OOM risk) |
+| Style packs — engine-applied post-process looks (`phone`, `trix-bw`, `hp5-soft`) | ✅ Working (#399) — pure CPU pass after decode, request/preset selected, **Krea 2 only** (a 400 on every other family, never a silent skip); recorded as `applied.style` + the PNG's `style`. ComfyUI has no equivalent single node (it is an image-op subgraph there) |
 
 ## Samplers / schedulers
 | Capability | Status |
