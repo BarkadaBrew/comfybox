@@ -566,7 +566,15 @@ public enum MCPToolRegistry {
         ] as [String: Any],
         "aspect_ratio": [
           "type": "string",
-          "description": "Aspect ratio: '16:9' or '9:16' (default: '16:9').",
+          "description": "Aspect ratio: '16:9' or '9:16' (default: '16:9'). T2V only \u{2014} for I2V the SOURCE image's aspect always decides the output shape (comfybox#405), and this only orients the pixel budget.",
+        ] as [String: Any],
+        "width": [
+          "type": "integer",
+          "description": "Explicit render width. Wins over resolution/aspect_ratio. For I2V this is only the pixel-area BUDGET \u{2014} the source image's aspect decides the shape, snapped to /64.",
+        ] as [String: Any],
+        "height": [
+          "type": "integer",
+          "description": "Explicit render height. Wins over resolution/aspect_ratio. For I2V this is only the pixel-area BUDGET \u{2014} the source image's aspect decides the shape, snapped to /64.",
         ] as [String: Any],
         "seed": [
           "type": "integer",

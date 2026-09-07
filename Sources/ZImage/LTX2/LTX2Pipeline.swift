@@ -585,10 +585,16 @@ public final class LTX2Pipeline {
       // Gate-skip decode fix (2026-08-05): check BEFORE upsampling — see
       // applyTwoStageRefine. Above the gate, keep base latents (native size).
       // Same 1.5x refine logic as applyTwoStageRefine (Todd 2026-08-07).
-      let rScale = max(1.0, min(2.0, resolvedConfig.refineScale))
-      let sLatH = max(1, Int((Float(latH) * rScale).rounded()))
-      let sLatW = max(1, Int((Float(latW) * rScale).rounded()))
-      let t2vPreVolume = latents.dim(2) * sLatH * sLatW
+      // comfybox#405 (review round 3): one definition of the refine grid and
+      // of the pre-refine volume, shared with the other refine site below and
+      // with the warm server's skip prediction — see `LTX2RefineGate`.
+      let rScale = LTX2RefineGate.clampedRefineScale(resolvedConfig.refineScale)
+      let sLat = LTX2RefineGate.scaledLatentDims(
+        latentHeight: latH, latentWidth: latW, refineScale: resolvedConfig.refineScale)
+      let sLatH = sLat.height, sLatW = sLat.width
+      let t2vPreVolume = LTX2RefineGate.preRefineVolume(
+        latentFrames: latents.dim(2), latentHeight: latH, latentWidth: latW,
+        refineScale: resolvedConfig.refineScale)
       let t2vRefineMax = resolvedConfig.refineMaxVol
       if resumeRefine == nil, t2vPreVolume > t2vRefineMax,
          ProcessInfo.processInfo.environment["LTX2_REFINE_UPSCALE_ON_SKIP"] != "1" {
@@ -2367,10 +2373,14 @@ public final class LTX2Pipeline {
     // the upsampled latent is bilinearly resized down first: refine area
     // drops to (rScale/2)^2 (56% at 1.5) and the volume gates reflect the
     // REAL refine size, so more clips refine instead of skipping.
-    let rScale = max(1.0, min(2.0, resolvedConfig.refineScale))
-    let sLatH = max(1, Int((Float(latH) * rScale).rounded()))
-    let sLatW = max(1, Int((Float(latW) * rScale).rounded()))
-    let preVolume = latents.dim(2) * sLatH * sLatW
+    // comfybox#405 (review round 3): same shared definitions as the T2V site.
+    let rScale = LTX2RefineGate.clampedRefineScale(resolvedConfig.refineScale)
+    let sLat = LTX2RefineGate.scaledLatentDims(
+      latentHeight: latH, latentWidth: latW, refineScale: resolvedConfig.refineScale)
+    let sLatH = sLat.height, sLatW = sLat.width
+    let preVolume = LTX2RefineGate.preRefineVolume(
+      latentFrames: latents.dim(2), latentHeight: latH, latentWidth: latW,
+      refineScale: resolvedConfig.refineScale)
     let preMaxVolume = resolvedConfig.refineMaxVol
     if resumeRefine == nil, preVolume > preMaxVolume,
        ProcessInfo.processInfo.environment["LTX2_REFINE_UPSCALE_ON_SKIP"] != "1",

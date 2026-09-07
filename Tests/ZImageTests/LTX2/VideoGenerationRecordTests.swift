@@ -59,7 +59,9 @@ final class VideoGenerationRecordTests: XCTestCase {
     XCTAssertEqual(record.fps, request.fps)
     XCTAssertEqual(record.resolvedWidth, 704)
     XCTAssertEqual(record.resolvedHeight, 448)
-    XCTAssertNil(record.dimensionReason, "not populated until #405/#408 lands — see VideoGenerationRecord.build's doc comment")
+    XCTAssertNil(
+      record.dimensionReason,
+      "a request that carries no reason still records none — the field is optional")
     XCTAssertFalse(record.twoPass)
     XCTAssertFalse(record.refine)
     XCTAssertNil(record.refineSkippedReason)
@@ -342,5 +344,80 @@ final class VideoGenerationRecordTests: XCTestCase {
       resolvedWidth: 1, resolvedHeight: 1, twoPass: false, refine: false, audio: false, kind: "t2v")
     let expected = String(data: try XCTUnwrap(record.atomJSON()), encoding: .utf8)
     XCTAssertEqual(record.atomJSONString, expected)
+  }
+}
+
+// MARK: - comfybox#405: the dimension_reason wire-up
+//
+// comfybox#401 shipped `dimensionReason` on the record and on
+// `LTX2VideoRequest`, always nil, with the wire-up explicitly left to #405/#408
+// ("the field exists here, additive and currently always nil, so wiring it
+// later is a one-line change"). #408 owns `VideoDimensionResolver`, so it owns
+// the wire-up. These pin that the record stops writing null.
+
+extension VideoGenerationRecordTests {
+
+  private func recordForRequest(_ request: LTX2VideoRequest) -> VideoGenerationRecord {
+    VideoGenerationRecord.build(
+      request: request,
+      transformerFile: "/weights/transformer-distilled.safetensors",
+      frameCount: 49,
+      resolvedWidth: request.width, resolvedHeight: request.height,
+      twoStageRequested: false,
+      refineSkippedReason: nil,
+      audioWritten: false,
+      configGuidance: 1.0)
+  }
+
+  /// The case the ticket is about: an i2v render whose shape came from the
+  /// SOURCE IMAGE must say so in its sidecar, so a wrong-shaped clip is
+  /// diagnosable from the file itself.
+  func testI2VRecordCarriesSourceAspectAsTheDimensionReason() {
+    let request = LTX2VideoRequest(
+      prompt: "she turns toward the window",
+      initImagePath: "/tmp/kira-portrait.png",
+      width: 512, height: 896,
+      outputPath: "/tmp/out.mp4",
+      dimensionReason: VideoDimensionReason.sourceAspect.rawValue)
+    let record = recordForRequest(request)
+    XCTAssertEqual(record.kind, "i2v")
+    XCTAssertEqual(record.dimensionReason, "source_aspect")
+  }
+
+  func testTheOtherTwoReasonsRoundTripToo() {
+    let explicit = recordForRequest(LTX2VideoRequest(
+      prompt: "p", width: 960, height: 576, outputPath: "/tmp/out.mp4",
+      dimensionReason: VideoDimensionReason.explicit.rawValue))
+    XCTAssertEqual(explicit.dimensionReason, "explicit")
+    XCTAssertEqual(explicit.kind, "t2v")
+
+    let fallback = recordForRequest(LTX2VideoRequest(
+      prompt: "p", outputPath: "/tmp/out.mp4",
+      dimensionReason: VideoDimensionReason.default.rawValue))
+    XCTAssertEqual(fallback.dimensionReason, "default")
+  }
+
+  /// The wire-up is only useful if it survives to the sidecar JSON under the
+  /// snake_case key the DAM ingest path reads.
+  func testDimensionReasonSurvivesEncodingAsSnakeCase() throws {
+    let record = recordForRequest(LTX2VideoRequest(
+      prompt: "p",
+      initImagePath: "/tmp/kira-portrait.png",
+      width: 512, height: 896,
+      outputPath: "/tmp/out.mp4",
+      dimensionReason: VideoDimensionReason.sourceAspect.rawValue))
+    let encoder = JSONEncoder()
+    encoder.keyEncodingStrategy = .convertToSnakeCase
+    let json = try JSONSerialization.jsonObject(
+      with: try encoder.encode(record)) as? [String: Any]
+    XCTAssertEqual(json?["dimension_reason"] as? String, "source_aspect")
+  }
+
+  /// The values the record can carry are exactly the resolver's, so the
+  /// sidecar and the render trace cannot describe the same render differently.
+  func testTheRecordsVocabularyIsTheResolversVocabulary() {
+    XCTAssertEqual(VideoDimensionReason.sourceAspect.rawValue, "source_aspect")
+    XCTAssertEqual(VideoDimensionReason.explicit.rawValue, "explicit")
+    XCTAssertEqual(VideoDimensionReason.default.rawValue, "default")
   }
 }
