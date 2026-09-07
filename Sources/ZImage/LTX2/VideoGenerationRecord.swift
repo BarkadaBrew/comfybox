@@ -163,6 +163,20 @@ extension VideoGenerationRecord {
   /// still rewriting that area of `WarmServer.swift` as of this ticket. The
   /// field exists on `LTX2VideoRequest` now so #408's PR only has to set one
   /// property when it lands; #408 owns the actual wire-up.
+  ///
+  /// `configGuidance` (review round 3, ruling 1): `request.guidance` is only
+  /// an OVERRIDE — `pipeline.generateT2V`/`generateI2V` resolve the CFG scale
+  /// they actually run as `guidance ?? config.guidance`
+  /// (`LTX2Pipeline.swift`), and `LTX2PipelineConfig.guidance` is never nil
+  /// (3.5 dev / 1.0 distilled by default). Recording `request.guidance`
+  /// alone wrote `guidance: null` for the common case — every render that
+  /// took the config default. The caller (`LTX2VideoGenerator.render`)
+  /// passes `pipeline.config.guidance`; the preset fallback
+  /// (`request override, else preset guidance, else pipeline.config.guidance`)
+  /// happens one layer up, in `WarmServer.buildLocalVideoRequest`, which now
+  /// bakes `videoPreset?.guidance` into `request.guidance` itself (the same
+  /// pattern `steps`/`seed` already used) — so by the time it reaches here,
+  /// `request.guidance` already reflects "request override, else preset".
   public static func build(
     request: LTX2VideoRequest,
     transformerFile: String,
@@ -171,14 +185,15 @@ extension VideoGenerationRecord {
     resolvedHeight: Int,
     twoStageRequested: Bool,
     refineSkippedReason: String?,
-    audioWritten: Bool
+    audioWritten: Bool,
+    configGuidance: Float
   ) -> VideoGenerationRecord {
     VideoGenerationRecord(
       prompt: request.prompt,
       negativePrompt: request.negativePrompt,
       seed: request.seed,
       steps: request.steps,
-      guidance: request.guidance,
+      guidance: request.guidance ?? configGuidance,
       model: basename(transformerFile),
       width: request.width,
       height: request.height,

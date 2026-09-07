@@ -41,6 +41,31 @@ app/persona submitted it — same key/values as the PNG side's `source`),
 aggregates have no single seed/steps/guidance (N independently-seeded shots
 or pre-rendered segments) — those fields are absent there, by design.
 
+`guidance` is the CFG scale the render actually used, not merely an echoed
+request field: `request override, else preset guidance, else
+LTX2PipelineConfig.guidance` (3.5 dev / 1.0 distilled) —
+`WarmServer.buildLocalVideoRequest` bakes the preset fallback into
+`LTX2VideoRequest.guidance` (same pattern `steps`/`seed` already use), and
+`VideoGenerationRecord.build` fills in the pipeline's config default when
+neither is set, so the common "no override" render still records a real
+number, not `null`.
+
+### Writer coverage
+
+| Writer / route | Sidecar | Atom |
+|---|---|---|
+| `LTX2VideoGenerator.render` (t2v, i2v, extend, `/v1/video/rerender`, storyboard per-shot clips) | ✅ | ✅ |
+| Storyboard final assembled clip / plain `/v1/montage/compose` (`MontageComposer`) | ✅ (aggregate) | — (different writer) |
+| CLI `video` / `ltx2-demo` / `ltx2-i2v` (`Sources/ComfyBox/main.swift`) | ✅ | ✅ |
+| Desktop `MediaToolsService.exportVideo` (image-sequence → mp4 via `ffmpeg`) | — | — |
+| Non-Apple-platform `ffmpeg` PPM fallback (`#else` branch of the three CLI writers, unreachable on macOS) | — | — |
+
+The last two are outside the engine's own render path — `MediaToolsService`
+converts already-existing images the user picked (no generation to record),
+and the ffmpeg fallback only compiles where `AVFoundation`/`CoreGraphics`
+aren't available, which is never true on the Apple-Silicon-only target this
+repo ships (intent.md).
+
 Two sinks, one mandatory:
 
 1. **`.json` sidecar** next to the output file — `<basename>.json`, same

@@ -2662,7 +2662,12 @@ public final class WarmServer {
       seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
       strength: req.strength ?? 1.0,
       imgCompression: req.imgCompression,
-      guidance: req.guidance,
+      // comfybox#401 (review round 3, ruling 1): preset fallback, same
+      // pattern `steps`/`seed` above already use — previously ONLY the
+      // request's own `guidance` reached the render, so a video preset's
+      // declared `guidance` was silently ignored (not just unrecorded: the
+      // render itself never honored it).
+      guidance: req.guidance ?? videoPreset?.guidance.map(Float.init),
       // Re-enabled by default for EXTENDED renders (#231, 2026-07-16): the
       // 2026-07-13 MLX mutex crash on this path was memory pressure — with
       // the int8 stack (#230) a 12s/3-chunk anchored render completed clean

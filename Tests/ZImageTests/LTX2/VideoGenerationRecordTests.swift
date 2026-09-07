@@ -20,7 +20,7 @@ final class VideoGenerationRecordTests: XCTestCase {
 
   // the record for a t2v matches the request fields")
 
-  func testBuildMatchesT2VRequestFields() {
+  func testBuildMatchesT2VRequestFields() throws {
     let request = LTX2VideoRequest(
       prompt: "a fox in a snowy forest",
       negativePrompt: "blurry",
@@ -42,7 +42,10 @@ final class VideoGenerationRecordTests: XCTestCase {
       resolvedWidth: 704, resolvedHeight: 448,
       twoStageRequested: false,
       refineSkippedReason: nil,
-      audioWritten: false)
+      audioWritten: false,
+      // Deliberately different from request.guidance (3.5) — the request
+      // override must win; see testBuildGuidanceRequestOverrideWinsOverConfig.
+      configGuidance: 1.0)
 
     XCTAssertEqual(record.prompt, request.prompt)
     XCTAssertEqual(record.negativePrompt, request.negativePrompt)
@@ -65,7 +68,51 @@ final class VideoGenerationRecordTests: XCTestCase {
     XCTAssertEqual(record.source, "bree")
     XCTAssertEqual(record.contentMode, "apple")
     XCTAssertEqual(record.loras, [.init(name: "motion_v2", scale: 0.8)])
+
+    // Review round 3, minor 2: end-to-end through the real encoder too — an
+    // ENGINE-produced record (via build(), not a hand-written JSON literal)
+    // must actually carry guidance/source/content_mode on the wire, not
+    // just as Swift struct fields the encoder happens to drop.
+    let json = try JSONSerialization.jsonObject(with: record.encodeJSON()) as? [String: Any]
+    XCTAssertEqual(json?["guidance"] as? Double ?? -1, 3.5, accuracy: 0.0001)
+    XCTAssertEqual(json?["source"] as? String, "bree")
+    XCTAssertEqual(json?["content_mode"] as? String, "apple")
   }
+
+  // MARK: - guidance is the value ACTUALLY USED, not just the request field
+  // (review round 3, ruling 1)
+
+  /// `pipeline.generateT2V`/`generateI2V` resolve CFG as
+  /// `guidance ?? config.guidance` — `LTX2PipelineConfig.guidance` is never
+  /// nil, so a request with no override must record THAT value, not `null`.
+  func testBuildGuidanceFallsBackToConfigGuidanceWhenRequestHasNoOverride() {
+    let request = LTX2VideoRequest(prompt: "p", width: 704, height: 448, framesPerChunk: 97, steps: 8, outputPath: "/tmp/o.mp4")
+    XCTAssertNil(request.guidance, "fixture sanity: no override on the request")
+    let record = VideoGenerationRecord.build(
+      request: request, transformerFile: "t.safetensors", frameCount: 97,
+      resolvedWidth: 704, resolvedHeight: 448, twoStageRequested: false,
+      refineSkippedReason: nil, audioWritten: false, configGuidance: 1.0)
+    XCTAssertEqual(record.guidance, 1.0, "the distilled pipeline's actual CFG scale, not null")
+  }
+
+  func testBuildGuidanceRequestOverrideWinsOverConfig() {
+    let request = LTX2VideoRequest(
+      prompt: "p", width: 704, height: 448, framesPerChunk: 97, steps: 8, guidance: 4.5,
+      outputPath: "/tmp/o.mp4")
+    let record = VideoGenerationRecord.build(
+      request: request, transformerFile: "t.safetensors", frameCount: 97,
+      resolvedWidth: 704, resolvedHeight: 448, twoStageRequested: false,
+      refineSkippedReason: nil, audioWritten: false, configGuidance: 3.5)
+    XCTAssertEqual(record.guidance, 4.5, "an explicit request override must win over the config default")
+  }
+
+  // `WarmServer.buildLocalVideoRequest` is where "request override, else
+  // preset guidance" actually happens — `build()` above only sees whatever
+  // `request.guidance` already holds by the time it gets there. See
+  // `LocalVideoRequestDecodeTests` (Tests/ZImageTests/LocalVideoRequestDecodeTests.swift)
+  // for that half of ruling 1's fallback chain: a preset-carried guidance is
+  // honored when the request has none, and an explicit request override
+  // still wins over the preset.
 
   func testBuildClassifiesI2VAndExtend() {
     let i2v = LTX2VideoRequest(
@@ -74,7 +121,7 @@ final class VideoGenerationRecordTests: XCTestCase {
     let i2vRecord = VideoGenerationRecord.build(
       request: i2v, transformerFile: "t.safetensors", frameCount: 97,
       resolvedWidth: 704, resolvedHeight: 448, twoStageRequested: false,
-      refineSkippedReason: nil, audioWritten: false)
+      refineSkippedReason: nil, audioWritten: false, configGuidance: 1.0)
     XCTAssertEqual(i2vRecord.kind, "i2v")
 
     let extend = LTX2VideoRequest(
@@ -83,7 +130,7 @@ final class VideoGenerationRecordTests: XCTestCase {
     let extendRecord = VideoGenerationRecord.build(
       request: extend, transformerFile: "t.safetensors", frameCount: 193,
       resolvedWidth: 704, resolvedHeight: 448, twoStageRequested: false,
-      refineSkippedReason: nil, audioWritten: false)
+      refineSkippedReason: nil, audioWritten: false, configGuidance: 1.0)
     XCTAssertEqual(extendRecord.kind, "extend")
     XCTAssertEqual(extendRecord.frames, 193)
   }
@@ -93,7 +140,7 @@ final class VideoGenerationRecordTests: XCTestCase {
     let record = VideoGenerationRecord.build(
       request: request, transformerFile: "t.safetensors", frameCount: 97,
       resolvedWidth: 704, resolvedHeight: 448, twoStageRequested: true,
-      refineSkippedReason: "upsampler_unavailable", audioWritten: false)
+      refineSkippedReason: "upsampler_unavailable", audioWritten: false, configGuidance: 3.5)
     XCTAssertTrue(record.twoPass, "two_stage WAS requested")
     XCTAssertFalse(record.refine, "…but it did not run")
     XCTAssertEqual(record.refineSkippedReason, "upsampler_unavailable")
@@ -104,7 +151,7 @@ final class VideoGenerationRecordTests: XCTestCase {
     let record = VideoGenerationRecord.build(
       request: request, transformerFile: "t.safetensors", frameCount: 97,
       resolvedWidth: 1408, resolvedHeight: 896, twoStageRequested: true,
-      refineSkippedReason: nil, audioWritten: false)
+      refineSkippedReason: nil, audioWritten: false, configGuidance: 3.5)
     XCTAssertTrue(record.twoPass)
     XCTAssertTrue(record.refine)
     XCTAssertEqual(record.resolvedWidth, 1408, "2x-refined size, not the request budget")
@@ -119,7 +166,7 @@ final class VideoGenerationRecordTests: XCTestCase {
     let record = VideoGenerationRecord.build(
       request: request, transformerFile: "t.safetensors", frameCount: 97,
       resolvedWidth: 704, resolvedHeight: 448, twoStageRequested: false,
-      refineSkippedReason: nil, audioWritten: false)
+      refineSkippedReason: nil, audioWritten: false, configGuidance: 1.0)
     XCTAssertEqual(record.loras, [
       .init(name: "old_single", scale: 1.0),
       .init(name: "new_a", scale: 0.5),

@@ -1779,7 +1779,8 @@ public final class LTX2VideoGenerator {
             resolvedHeight: deliveredH,
             twoStageRequested: pipeline.resolvedConfig.twoStage,
             refineSkippedReason: refineSkippedReason,
-            audioWritten: audioTrack != nil)
+            audioWritten: audioTrack != nil,
+            configGuidance: pipeline.config.guidance)
 
         // comfybox#322: last boundary before anything is written to disk, so a
         // cancelled render never leaves a file at `outputPath` (the `defer`

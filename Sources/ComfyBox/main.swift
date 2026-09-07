@@ -3786,6 +3786,11 @@ struct ZImageCLI {
     // this command's own resolved arguments.
     let videoCLIRecord = VideoGenerationRecord(
       prompt: promptText, seed: actualSeed, steps: denoiseSteps,
+      // comfybox#401 (review round 3, ruling 1): no --guidance flag exists
+      // on this command and generateT2V/generateI2V above is never called
+      // with a guidance: override, so pipelineConfig.guidance (the distilled
+      // default, 1.0) is the value actually used.
+      guidance: pipelineConfig.guidance,
       model: VideoGenerationRecord.basename(transformerPath.path),
       width: width, height: height, frames: cgFrames.count, fps: fps,
       resolvedWidth: width, resolvedHeight: height,
@@ -4250,6 +4255,10 @@ struct ZImageCLI {
     let ltx2DemoRecord = VideoGenerationRecord(
       prompt: prompt ?? (embeddingsPath.map { "(embeddings: \($0))" } ?? "(dummy random embeddings)"),
       seed: UInt64(seed), steps: steps,
+      // comfybox#401 (review round 3, ruling 1): no --guidance flag; the
+      // denoising loop above is never called with a guidance override, so
+      // pipelineConfig.guidance is the value actually used.
+      guidance: pipelineConfig.guidance,
       model: VideoGenerationRecord.basename(transformerPath.path),
       width: width, height: height, frames: cgFrames.count, fps: 24,
       resolvedWidth: width, resolvedHeight: height,
@@ -4719,6 +4728,10 @@ struct ZImageCLI {
     // own resolved arguments.
     let ltx2I2VRecord = VideoGenerationRecord(
       prompt: promptText, seed: UInt64(seed), steps: steps,
+      // comfybox#401 (review round 3, ruling 1): no --guidance flag; each
+      // chunk's generateI2V call above is never given a guidance override,
+      // so pipelineConfig.guidance is the value actually used.
+      guidance: pipelineConfig.guidance,
       model: VideoGenerationRecord.basename(transformerPath.path),
       width: width, height: height, frames: allFrames.count, fps: fps,
       resolvedWidth: width, resolvedHeight: height,
