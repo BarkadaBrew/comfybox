@@ -108,10 +108,10 @@ final class LocalVideoRequestDecodeTests: XCTestCase {
   // the single, non-bypassable path from a decoded request to the
   // constructed request's `.tuning`.
 
-  private func buildRequest(_ json: String) throws -> LTX2VideoRequest {
+  private func buildRequest(_ json: String, preset: ImagePreset? = nil) throws -> LTX2VideoRequest {
     let req = try decodeLocalVideoRequest(json)
     return WarmServer.buildLocalVideoRequest(
-      req: req, videoPreset: nil,
+      req: req, videoPreset: preset,
       effectivePrompt: req.prompt, effectiveInitImage: nil,
       renderWidth: 704, renderHeight: 448,
       foldedFramesPerChunk: 97, foldedExtendSeconds: 0,
@@ -132,5 +132,28 @@ final class LocalVideoRequestDecodeTests: XCTestCase {
   func testBuildLocalVideoRequestNestedTuningStillWinsOnConflict() throws {
     let request = try buildRequest(#"{"prompt":"x","two_pass":true,"tuning":{"two_stage":false}}"#)
     XCTAssertEqual(request.tuning?.twoStage, false)
+  }
+
+  // MARK: - comfybox#401 review round 3, ruling 1: guidance preset fallback
+  // — the SAME pattern `steps`/`seed` already use above, and the actual
+  // behavior bug the ruling flagged: without this, a video preset's
+  // declared `guidance` was silently ignored by the render itself, not just
+  // by the generation record.
+
+  func testBuildLocalVideoRequestHonorsPresetGuidanceWhenRequestHasNone() throws {
+    let preset = ImagePreset(id: "kira-video", name: "Kira Video", guidance: 4.5)
+    let request = try buildRequest(#"{"prompt":"x"}"#, preset: preset)
+    XCTAssertEqual(request.guidance, 4.5, "the preset's declared guidance must reach the constructed request")
+  }
+
+  func testBuildLocalVideoRequestExplicitGuidanceWinsOverPreset() throws {
+    let preset = ImagePreset(id: "kira-video", name: "Kira Video", guidance: 4.5)
+    let request = try buildRequest(#"{"prompt":"x","guidance":2.0}"#, preset: preset)
+    XCTAssertEqual(request.guidance, 2.0, "an explicit request guidance must win over the preset's")
+  }
+
+  func testBuildLocalVideoRequestNoGuidanceAnywhereLeavesItNil() throws {
+    let request = try buildRequest(#"{"prompt":"x"}"#, preset: nil)
+    XCTAssertNil(request.guidance, "no request override, no preset — the generator falls back to pipeline.config.guidance itself")
   }
 }
