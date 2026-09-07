@@ -5953,6 +5953,12 @@ public final class WarmServer {
       _ = try RecipeNameResolver.resolve(
         scheduler: stage2.scheduler, sigmaSchedule: stage2.sigmaSchedule)
     }
+    // PR #420 review B1: the detail-pass switch is settled HERE, on the
+    // expanded payload — `detail_pass: true` that found no stage (no preset
+    // named, or the preset named one and the seam already 400'd) and
+    // `detail_pass: false` beside a request `stage2` are both refused before
+    // anything is enqueued. `stage2Gate` runs the same check at dispatch.
+    if let error = GeneratePayload.detailPassGate(expanded) { throw error }
     // PR #418 re-review (item 2): an EXPLICIT `loras` entry that is an
     // absolute path on a removable volume is refused here — a 400 on the
     // live routes, a dropped-and-recorded job on queue recovery — without a
@@ -6152,7 +6158,13 @@ public final class WarmServer {
           var object = (try? JSONSerialization.jsonObject(with: original)) as? [String: Any]
     else { return original }
     var changed = false
-    if let loras = payload.loras, object["loras"] == nil {
+    // PR #420 review (nit): a JSON `null` deserialises to `NSNull`, which is
+    // not `nil` — an explicit `"eta": null` rendered with the preset's eta
+    // but would have replayed without it. A null key is ABSENT here for the
+    // whole loop, the pre-existing model/steps/guidance/vae/shift/style keys
+    // included (a null there always meant "nothing sent" to the decoder too).
+    func absent(_ key: String) -> Bool { object[key] == nil || object[key] is NSNull }
+    if let loras = payload.loras, absent("loras") {
       object["loras"] = loras.map { entry -> [String: Any] in
         var row: [String: Any] = ["path": entry.path, "scale": entry.scale ?? 1.0]
         if let role = entry.role { row["role"] = role }
@@ -6172,7 +6184,7 @@ public final class WarmServer {
       // that dropped it would render the job WITHOUT the look it was accepted
       // with. (`style` needs no snake_case rewrite; it is one word.)
       ("style", payload.style as Any?),
-    ] where object[key] == nil {
+    ] where absent(key) {
       if let value {
         object[key] = value
         changed = true
@@ -6184,7 +6196,7 @@ public final class WarmServer {
     // snake_case keys; a request that sent the field under EITHER spelling
     // (`.convertFromSnakeCase` accepts both, and `sampler` aliases
     // `scheduler`) is left alone, since the request's value already won.
-    func present(_ keys: [String]) -> Bool { keys.contains { object[$0] != nil } }
+    func present(_ keys: [String]) -> Bool { keys.contains { !absent($0) } }
     let recipe: [(keys: [String], value: Any?)] = [
       (["scheduler", "sampler"], payload.scheduler as Any?),
       (["sigma_schedule", "sigmaSchedule"], payload.sigmaSchedule as Any?),
@@ -6202,6 +6214,9 @@ public final class WarmServer {
         changed = true
       }
     }
+    // An explicit `stage2: null` / `detail_pass: false` stays in the body as
+    // sent (a null key is left untouched above, and `payload.stage2` is nil),
+    // so the replay switches the stage off exactly as the accepted job did.
     if let stage2 = payload.stage2, !present(["stage2"]) {
       var stage: [String: Any] = ["steps": stage2.steps, "denoise": stage2.denoise]
       if let scheduler = stage2.scheduler { stage["scheduler"] = scheduler }
@@ -7890,6 +7905,8 @@ public struct ImageJobStatus: Codable, Sendable {
   public let presetStackMismatch: Bool?
   /// #419: `preset_recipe_applied`, the same list the sync response carries.
   public let presetRecipeApplied: [String]?
+  /// PR #420 review: `preset_recipe_skipped`, likewise.
+  public let presetRecipeSkipped: [String]?
   /// #22 (PR #363 review, C1b): the same memory-advisory numbers the sync
   /// response carries, set at accept time (before the job runs).
   public let memoryEstimateBytes: UInt64?
@@ -7923,6 +7940,7 @@ public struct ImageJobStatus: Codable, Sendable {
     applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil,
     presetUnresolved: String? = nil, presetUnresolvedReason: String? = nil,
     presetStackMismatch: Bool? = nil, presetRecipeApplied: [String]? = nil,
+       presetRecipeSkipped: [String]? = nil,
     memoryEstimateBytes: UInt64? = nil, memoryAvailableBytes: UInt64? = nil,
     loraStackOrigin: String? = nil,
     warmDefaultSkipped: String? = nil, loraReload: Bool? = nil,
@@ -7943,6 +7961,7 @@ public struct ImageJobStatus: Codable, Sendable {
     self.presetUnresolvedReason = presetUnresolvedReason
     self.presetStackMismatch = presetStackMismatch
     self.presetRecipeApplied = presetRecipeApplied
+    self.presetRecipeSkipped = presetRecipeSkipped
     self.memoryEstimateBytes = memoryEstimateBytes
     self.memoryAvailableBytes = memoryAvailableBytes
     self.loraStackOrigin = loraStackOrigin
@@ -7976,6 +7995,7 @@ private final class ImageJob: @unchecked Sendable {
   var presetStackMismatch: Bool?
   /// #419: the preset-sourced recipe keys, set from the result on success.
   var presetRecipeApplied: [String]?
+  var presetRecipeSkipped: [String]?
   /// #22: set at accept time from the payload (before the job runs) — see
   /// `job.memoryEstimateBytes = payload.memoryEstimateBytes` at submit.
   var memoryEstimateBytes: UInt64?
@@ -8005,6 +8025,7 @@ private final class ImageJob: @unchecked Sendable {
       appliedLoras: appliedLoras, presetUnresolved: presetUnresolved,
       presetUnresolvedReason: presetUnresolvedReason,
       presetStackMismatch: presetStackMismatch, presetRecipeApplied: presetRecipeApplied,
+      presetRecipeSkipped: presetRecipeSkipped,
       memoryEstimateBytes: memoryEstimateBytes, memoryAvailableBytes: memoryAvailableBytes,
       loraStackOrigin: loraStackOrigin,
       warmDefaultSkipped: warmDefaultSkipped, loraReload: loraReload,
@@ -8098,6 +8119,7 @@ final class ImageJobTracker: @unchecked Sendable {
     // #419: same posture — which recipe fields the preset supplied is
     // decided at expansion, so the 202 can already say so.
     job.presetRecipeApplied = payload.presetRecipeApplied
+    job.presetRecipeSkipped = payload.presetRecipeSkipped
     // #22: same "known at submit" posture as the preset flags above.
     job.memoryEstimateBytes = payload.memoryEstimateBytes
     job.memoryAvailableBytes = payload.memoryAvailableBytes
@@ -8170,6 +8192,7 @@ final class ImageJobTracker: @unchecked Sendable {
       job.presetUnresolvedReason = result.presetUnresolvedReason ?? job.presetUnresolvedReason
       job.presetStackMismatch = result.presetStackMismatch ?? job.presetStackMismatch
       job.presetRecipeApplied = result.presetRecipeApplied ?? job.presetRecipeApplied
+      job.presetRecipeSkipped = result.presetRecipeSkipped ?? job.presetRecipeSkipped
       job.loraStackOrigin = result.loraStackOrigin ?? job.loraStackOrigin
       job.warmDefaultSkipped = result.warmDefaultSkipped ?? job.warmDefaultSkipped
       job.loraReload = result.loraReload ?? job.loraReload
@@ -11422,6 +11445,7 @@ private actor WarmServerCoordinator {
           presetUnresolvedReason: payload.presetUnresolvedReason,
           presetStackMismatch: payload.presetStackMismatch,
           presetRecipeApplied: payload.presetRecipeApplied,
+          presetRecipeSkipped: payload.presetRecipeSkipped,
           memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
           loraStackOrigin: payload.loraStackOrigin,
           warmDefaultSkipped: payload.warmDefaultSkipped,
@@ -11541,6 +11565,7 @@ private actor WarmServerCoordinator {
           presetUnresolvedReason: payload.presetUnresolvedReason,
           presetStackMismatch: payload.presetStackMismatch,
           presetRecipeApplied: payload.presetRecipeApplied,
+          presetRecipeSkipped: payload.presetRecipeSkipped,
           memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
           loraStackOrigin: payload.loraStackOrigin,
           warmDefaultSkipped: payload.warmDefaultSkipped,
@@ -11881,6 +11906,7 @@ private actor WarmServerCoordinator {
         presetUnresolvedReason: payload.presetUnresolvedReason,
         presetStackMismatch: payload.presetStackMismatch,
         presetRecipeApplied: payload.presetRecipeApplied,
+          presetRecipeSkipped: payload.presetRecipeSkipped,
         memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
         loraStackOrigin: payload.loraStackOrigin,
         warmDefaultSkipped: payload.warmDefaultSkipped,
@@ -11966,6 +11992,7 @@ private actor WarmServerCoordinator {
           presetUnresolvedReason: payload.presetUnresolvedReason,
           presetStackMismatch: payload.presetStackMismatch,
           presetRecipeApplied: payload.presetRecipeApplied,
+          presetRecipeSkipped: payload.presetRecipeSkipped,
           memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
           loraStackOrigin: payload.loraStackOrigin,
           warmDefaultSkipped: payload.warmDefaultSkipped,
@@ -12050,6 +12077,7 @@ private actor WarmServerCoordinator {
           presetUnresolvedReason: payload.presetUnresolvedReason,
           presetStackMismatch: payload.presetStackMismatch,
           presetRecipeApplied: payload.presetRecipeApplied,
+          presetRecipeSkipped: payload.presetRecipeSkipped,
           memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
           loraStackOrigin: payload.loraStackOrigin,
           warmDefaultSkipped: payload.warmDefaultSkipped,
@@ -13202,6 +13230,21 @@ struct GeneratePayload: Sendable {
   /// `detail_denoise` without `detail_pass` is an orphan (Addendum A.2 → C3),
   /// NaN included. `Double` for the same reason `stage2.denoise` is.
   let detailDenoise: Double?
+  /// PR #420 review B1: the wire carried `"stage2": null` — an explicit OFF,
+  /// distinct from an absent key (which lets a named preset's stage2 in).
+  /// Decoded with `contains` + `decodeNil`, never `!= nil`.
+  let stage2Null: Bool
+  /// PR #420 review B1: the request's explicit stage-2 OFF switch, as the
+  /// label the skipped record carries — `"detail_pass=false"` or
+  /// `"stage2=null"` — or nil when the request said nothing about it.
+  /// `detail_pass: false` is the MCP tool schema's own spelling of "no
+  /// detail pass" and is accepted as exactly that; `detail_pass: true` still
+  /// needs a stage from somewhere (`detailPassGate`).
+  var stage2ExplicitlyOff: String? {
+    if detailPass == false { return "detail_pass=false" }
+    if stage2Null { return "stage2=null" }
+    return nil
+  }
 
   /// Projector-scale text-conditioning gain (wire: `projector_scale`). Krea 2
   /// only; 1.0/absent = neutral. Forwarded verbatim to Krea2Pipeline.Request.
@@ -13233,6 +13276,11 @@ struct GeneratePayload: Sendable {
   /// and `vae_source` give the stack and the VAE: a request field that was
   /// sent is never in this list, because it always won.
   var presetRecipeApplied: [String]?
+  /// PR #420 review (B1/B2): set by the engine, never by the wire — declared
+  /// preset recipe fields the expansion decided NOT to adopt, with the reason
+  /// (`PresetExpansion.skipped`). Reaches the response as
+  /// `preset_recipe_skipped`, so a dropped field is visible, never silent.
+  var presetRecipeSkipped: [String]?
   /// Default memberwise init for bridge-created payloads.
   init(
     prompt: String, negativePrompt: String? = nil,
@@ -13269,6 +13317,8 @@ struct GeneratePayload: Sendable {
     self.implicitSteps = implicitSteps
     self.c2 = c2
     self.presetRecipeApplied = nil
+    self.presetRecipeSkipped = nil
+    self.stage2Null = false
     self.source = source
     self.preset = nil
     self.contentMode = contentMode
@@ -13426,7 +13476,10 @@ extension GeneratePayload: Decodable {
     vae = try c.decodeIfPresent(String.self, forKey: .vae)
     // #285: engine-set, never decoded from the wire — see its doc comment.
     presetVAEApplied = nil
-    stage2 = try c.decodeIfPresent(Stage2Payload.self, forKey: .stage2)
+    // PR #420 review B1: `"stage2": null` is an explicit OFF and must be told
+    // apart from an absent key — `decodeIfPresent` returns nil for both.
+    stage2Null = c.contains(.stage2) && ((try? c.decodeNil(forKey: .stage2)) ?? false)
+    stage2 = stage2Null ? nil : try c.decodeIfPresent(Stage2Payload.self, forKey: .stage2)
     detailPass = try c.decodeIfPresent(Bool.self, forKey: .detailPass)
     detailDenoise = try c.decodeIfPresent(Double.self, forKey: .detailDenoise)
     noiseType = try c.decodeIfPresent(String.self, forKey: .noiseType)
@@ -13437,6 +13490,7 @@ extension GeneratePayload: Decodable {
     // replayed persisted body carries the accepted recipe as explicit fields,
     // so it decodes here as request-owned (the `presetStackApplied` rule).
     presetRecipeApplied = nil
+    presetRecipeSkipped = nil
   }
 
   /// Validate the `shift` field for the family that will render it.
@@ -14033,17 +14087,9 @@ extension GeneratePayload: Decodable {
   /// family — the detail-pass keys are wrong everywhere, and `stage2` is a
   /// Krea 2 field that no other family's loop could honour.
   static func stage2Gate(_ payload: GeneratePayload, family: WarmModelFamily) -> WarmServerError? {
-    // The tool-schema keys first: they are wrong on every family, and a request
-    // carrying both them and `stage2` should be told about the spelling rather
-    // than about the family.
-    if payload.detailPass != nil {
-      return .unsupportedRecipeField(
-        field: "detail_pass", value: "\(payload.detailPass ?? false)", family: family.rawValue,
-        reason: "`detail_pass` is the MCP tool schema's spelling; the client expands it into the "
-          + "engine's `stage2` object from its family policy table (AC-68a). The engine holds no "
-          + "such table and will not invent a sampler, schedule or step count — send "
-          + "`stage2: {steps, denoise, scheduler, sigma_schedule, …}`")
-    }
+    // The tool-schema keys first: a request carrying them and `stage2` should
+    // be told about the spelling rather than about the family.
+    if let error = detailPassGate(payload) { return error }
     if let detailDenoise = payload.detailDenoise {
       return .orphanField(
         field: "detail_denoise", requires: "detail_pass",
@@ -14108,6 +14154,43 @@ extension GeneratePayload: Decodable {
           + "stage 2 runs '\(effectiveSampler.rawValue)', which is not one of them. Send "
           + "stage2.eta 0, or a stage2 sampler from res_2s / res_3s / ralston_2s / ralston_3s / "
           + "ralston_4s / deis_2m / deis_3m / deis_4m")
+    }
+    return nil
+  }
+
+  /// PR #420 review B1: the `detail_pass` switch.
+  ///
+  /// `detail_pass: false` is accepted as the explicit OFF (no stage 2 runs and
+  /// no preset stage is adopted — `PresetLoRAStack.decide` reads it through
+  /// `stage2ExplicitlyOff`); beside a request `stage2` it is a contradiction.
+  /// `detail_pass: true` is still not a recipe: it needs a stage from the
+  /// request or from a named preset, and with neither it is the original 400
+  /// — the engine holds no policy table and will not invent a sampler,
+  /// schedule or step count (AC-68a). Runs at decode (on the expanded
+  /// payload) and again at dispatch.
+  static func detailPassGate(_ payload: GeneratePayload) -> WarmServerError? {
+    guard let detailPass = payload.detailPass else { return nil }
+    if detailPass {
+      if payload.stage2Null {
+        return .mutuallyExclusive(
+          "detail_pass=true and stage2=null disagree — one asks for a second stage, the other "
+            + "switches it off; send one")
+      }
+      if payload.stage2 == nil {
+        return .unsupportedRecipeField(
+          field: "detail_pass", value: "true", family: "any",
+          reason: "`detail_pass` is the MCP tool schema's spelling; the client expands it into the "
+            + "engine's `stage2` object from its family policy table (AC-68a). The engine holds no "
+            + "such table and will not invent a sampler, schedule or step count — send "
+            + "`stage2: {steps, denoise, scheduler, sigma_schedule, …}`, or name a preset that "
+            + "declares a stage2")
+      }
+      return nil
+    }
+    if payload.stage2 != nil {
+      return .mutuallyExclusive(
+        "detail_pass=false and a `stage2` object disagree — one switches the second stage off, "
+          + "the other spells it out; send one")
     }
     return nil
   }
@@ -14230,6 +14313,12 @@ struct GenerateResponse: Encodable, Sendable {
   /// `applied.vae_source` give the stack and the VAE; the VALUES are in
   /// `applied` (Krea 2) as they always were.
   let presetRecipeApplied: [String]?
+  /// PR #420 review (B1/B2): `preset_recipe_skipped` — declared preset recipe
+  /// fields the expansion did NOT adopt, each with its reason: the request's
+  /// explicit stage-2 off switch, or a preset eta left off because the
+  /// effective sampler is not RES4LYF (the daemon's #1797 rule). Absent when
+  /// nothing was skipped.
+  let presetRecipeSkipped: [String]?
 
   /// #22 (PR #363 review, C1b): the render's estimated peak activation
   /// memory and the live free memory at the moment it was estimated —
@@ -14301,6 +14390,7 @@ struct GenerateResponse: Encodable, Sendable {
        applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil,
        presetUnresolved: String? = nil, presetUnresolvedReason: String? = nil,
        presetStackMismatch: Bool? = nil, presetRecipeApplied: [String]? = nil,
+       presetRecipeSkipped: [String]? = nil,
        memoryEstimateBytes: UInt64? = nil, memoryAvailableBytes: UInt64? = nil,
        loraStackOrigin: String? = nil,
        warmDefaultSkipped: String? = nil, loraReload: Bool? = nil,
@@ -14316,6 +14406,7 @@ struct GenerateResponse: Encodable, Sendable {
     self.presetUnresolvedReason = presetUnresolvedReason
     self.presetStackMismatch = presetStackMismatch
     self.presetRecipeApplied = presetRecipeApplied
+    self.presetRecipeSkipped = presetRecipeSkipped
     self.memoryEstimateBytes = memoryEstimateBytes
     self.memoryAvailableBytes = memoryAvailableBytes
     self.loraStackOrigin = loraStackOrigin

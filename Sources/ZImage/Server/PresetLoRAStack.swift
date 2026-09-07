@@ -287,13 +287,17 @@ public enum PresetLoRAStack: Sendable, Equatable {
     }
 
     // --- Declared sampler recipe (#419) — DECLARED, per field, only where
-    // the request said nothing. No family gate: names are family-agnostic
-    // and every family-specific refusal (capability matrix, eta/bongmath by
-    // sampler, `stage2` on a non-krea2 family, the T3 stage2.bongmath stub)
-    // runs at dispatch on the EXPANDED payload, so a preset that declares
-    // `euler + eta 0.5` on Krea 2 gets the same 400 an explicit request
-    // does. Before #419 every one of these was silently ignored and the
-    // render used the engine default under the preset's name. -------------
+    // the request said nothing. No family gate for the NAMES: sampler /
+    // schedule are family-agnostic and the capability matrix, the bongmath
+    // sampler gate, the `stage2` family gate and the T3 stage2.bongmath stub
+    // all run at dispatch on the EXPANDED payload, so a preset naming a
+    // combination its family refuses gets the same 400 an explicit request
+    // does. `eta` has its own rule below (B2). `noise_type` / `noise_alpha` /
+    // `implicit_steps` / `c2` / `projector_scale` are read by the Krea 2 loop
+    // only; the other families do not gate them for a request today and do
+    // not for a preset either. Before #419 every one of these was silently
+    // ignored and the render used the engine default under the preset's
+    // name. -----------------------------------------------------------------
 
     if requestRecipe.sampler == nil,
        let sampler = nonEmpty(declared.sampler) ?? nonEmpty(declared.scheduler) {
@@ -302,13 +306,45 @@ public enum PresetLoRAStack: Sendable, Equatable {
     if requestRecipe.sigmaSchedule == nil, let schedule = nonEmpty(declared.sigmaSchedule) {
       expansion.sigmaSchedule = schedule
     }
-    if requestRecipe.eta == nil, let eta = declared.eta { expansion.eta = eta }
+    // PR #420 review B2 — the daemon's #1797 rule, engine-side: on the Krea 2
+    // family a PRESET-sourced non-zero eta is adopted only when the EFFECTIVE
+    // stage-1 sampler (the request's, else the preset's, else the family
+    // default euler) is RES4LYF; otherwise it is left off and recorded. Not
+    // a 400: the preset is the only layer that asked for it, and refusing
+    // the render would make every `{preset}` caller pay for a request-side
+    // sampler override. A request-sourced eta is not touched here and still
+    // hits `validateKrea2TierGates`. Z-Image `eta` is a different, shipped
+    // parameter (DDIM η) and is adopted as declared.
+    let family = declaredFamily(declared) ?? (asked.isEmpty ? nil : modelFamily(asked))
+    let effectiveSamplerName = requestRecipe.sampler ?? expansion.sampler
+    let effectiveSampler = resolvedSampler(effectiveSamplerName)
+    if requestRecipe.eta == nil, let eta = declared.eta {
+      if family == "krea2", eta != 0, !effectiveSampler.isRES4LYFFamily {
+        expansion.skipped.append("eta (non-RES4LYF sampler '\(effectiveSampler.rawValue)')")
+      } else {
+        expansion.eta = eta
+      }
+    }
     if requestRecipe.bongmath == nil, let bongmath = declared.bongmath { expansion.bongmath = bongmath }
     // `stage2` is adopted as ONE object: a request that sent its own stage
     // keeps it whole (no field-wise merge across the two sources — that would
     // build a stage nobody declared). An all-nil `{}` is not a declaration.
-    if !requestRecipe.stage2Declared, let stage2 = declared.stage2, !isEmptyStage(stage2) {
-      expansion.stage2 = stage2
+    // PR #420 review B1: a request that switched stage 2 OFF explicitly
+    // (`detail_pass: false` / `stage2: null`) is honoured and recorded.
+    if let stage2 = declared.stage2, !isEmptyStage(stage2) {
+      if let off = requestRecipe.stage2Off {
+        expansion.skipped.append("stage2 (\(off))")
+      } else if !requestRecipe.stage2Declared {
+        var stage = stage2
+        // B2 again, for the stage: the effective stage-2 sampler is the
+        // stage's own, else the render's (`stage2Gate`'s fallback).
+        let stageSampler = nonEmpty(stage.sampler).map(resolvedSampler) ?? effectiveSampler
+        if family == "krea2", let eta = stage.eta, eta != 0, !stageSampler.isRES4LYFFamily {
+          stage.eta = nil
+          expansion.skipped.append("stage2.eta (non-RES4LYF sampler '\(stageSampler.rawValue)')")
+        }
+        expansion.stage2 = stage
+      }
     }
     if requestRecipe.noiseType == nil, let noiseType = nonEmpty(declared.noiseType) {
       expansion.noiseType = noiseType
@@ -338,6 +374,11 @@ public enum PresetLoRAStack: Sendable, Equatable {
     public var bongmath: Bool?
     /// The request carried a `stage2` object (whatever it said).
     public var stage2Declared: Bool
+    /// PR #420 review B1: the request switched stage 2 OFF explicitly —
+    /// `"detail_pass=false"` or `"stage2=null"` (the label the skipped record
+    /// carries), nil when it said nothing. A preset's stage is then not
+    /// adopted, and the refusal is recorded rather than silent.
+    public var stage2Off: String?
     public var noiseType: String?
     public var noiseAlpha: Double?
     public var implicitSteps: Int?
@@ -347,6 +388,7 @@ public enum PresetLoRAStack: Sendable, Equatable {
     public init(
       sampler: String? = nil, sigmaSchedule: String? = nil,
       eta: Double? = nil, bongmath: Bool? = nil, stage2Declared: Bool = false,
+      stage2Off: String? = nil,
       noiseType: String? = nil, noiseAlpha: Double? = nil,
       implicitSteps: Int? = nil, c2: Double? = nil, projectorScale: Double? = nil
     ) {
@@ -355,6 +397,7 @@ public enum PresetLoRAStack: Sendable, Equatable {
       self.eta = eta
       self.bongmath = bongmath
       self.stage2Declared = stage2Declared
+      self.stage2Off = stage2Off
       self.noiseType = noiseType
       self.noiseAlpha = noiseAlpha
       self.implicitSteps = implicitSteps
@@ -368,6 +411,15 @@ public enum PresetLoRAStack: Sendable, Equatable {
     guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
           !trimmed.isEmpty else { return nil }
     return trimmed
+  }
+
+  /// The sampler a name resolves to for the B2 rule, with the family default
+  /// (euler) for an absent name. A name the resolver does not know also reads
+  /// as euler HERE only so the eta decision is total; the name itself is
+  /// refused by name at the `/v1/generate` seam before anything renders.
+  static func resolvedSampler(_ name: String?) -> SchedulerKind {
+    guard let name else { return .euler }
+    return (try? RecipeNameResolver.resolveSchedulerKind(name)) ?? .euler
   }
 
   /// A `stage2: {}` with nothing in it declares nothing.
@@ -473,12 +525,16 @@ public struct PresetExpansion: Sendable, Equatable {
   public var shift: Double?
   /// #419: the preset's declared stage-1 SAMPLER RECIPE, each field adopted
   /// only where the request omitted its own — the `shift` rule, applied to
-  /// every other dial a preset can declare. Unlike `shift` there is NO
-  /// family gate here: sampler / schedule names are family-agnostic and the
-  /// family capability matrix, the eta/bongmath sampler gates and the
-  /// `stage2` gate all run at DISPATCH on the expanded payload, so a preset
-  /// declaring a combination its family cannot honour is refused by the same
-  /// 400 an explicit request gets — never rendered on the engine default.
+  /// every other dial a preset can declare. Unlike `shift` there is no
+  /// family gate at expansion for the NAMES: sampler / schedule are
+  /// family-agnostic and the family capability matrix, the bongmath sampler
+  /// gate and the `stage2` family gate all run at DISPATCH on the expanded
+  /// payload, so a preset declaring a combination its family refuses gets the
+  /// same 400 an explicit request does. `eta` is the one field with an
+  /// expansion-time rule (``skipped``, PR #420 review B2). `noise_type` /
+  /// `noise_alpha` / `implicit_steps` / `c2` / `projector_scale` are Krea 2
+  /// dials that the other families' loops do not read — for a request OR a
+  /// preset, today, unchanged here.
   ///
   /// `sampler` is `declared.sampler ?? declared.scheduler` — the legacy
   /// `scheduler` key is the same field under its older name (the daemon
@@ -499,6 +555,17 @@ public struct PresetExpansion: Sendable, Equatable {
   public var implicitSteps: Int?
   public var c2: Double?
   public var projectorScale: Double?
+  /// PR #420 review (B1/B2): declared recipe fields the expansion decided
+  /// NOT to adopt, each with its reason — never a silent drop. Reaches the
+  /// response as `preset_recipe_skipped`. Two sources today: the request
+  /// switched stage 2 off explicitly (`detail_pass: false` / `stage2: null`)
+  /// while the preset declares one, and the daemon's #1797 rule mirrored
+  /// engine-side — a PRESET-sourced non-zero `eta` (stage 1 or 2) whose
+  /// EFFECTIVE sampler (request's, else preset's; stage 2 falls back to
+  /// stage 1) is not RES4LYF on the Krea 2 family is left off rather than
+  /// turned into a 400, because the preset is the only layer that asked for
+  /// it. A REQUEST-sourced eta is untouched and still hits the existing gate.
+  public var skipped: [String] = []
   /// C2: the engine could not expand this preset. It behaves as the label it
   /// always was, and this reaches the response as `preset_unresolved` (the
   /// preset's name) plus `preset_unresolved_reason` (the machine-readable
@@ -611,6 +678,7 @@ extension GeneratePayload {
         sampler: payload.scheduler, sigmaSchedule: payload.sigmaSchedule,
         eta: payload.eta.map(Double.init), bongmath: payload.bongmath,
         stage2Declared: payload.stage2 != nil,
+        stage2Off: payload.stage2ExplicitlyOff,
         noiseType: payload.noiseType, noiseAlpha: payload.noiseAlpha.map(Double.init),
         implicitSteps: payload.implicitSteps, c2: payload.c2.map(Double.init),
         projectorScale: payload.projectorScale.map(Double.init)),
@@ -745,6 +813,25 @@ extension GeneratePayload {
     if let c2 = expansion.c2 { self.c2 = Float(c2); applied.append("c2") }
     if let projectorScale = expansion.projectorScale {
       self.projectorScale = Float(projectorScale); applied.append("projector_scale")
+    }
+
+    // PR #420 review B1: `detail_pass: true` with no stage of its own asks
+    // for THE PRESET's second stage. The preset declares none (or the request
+    // also said `stage2: null`, a contradiction `detailPassGate` names) — a
+    // 400 naming the preset, never a silently single-stage render.
+    if detailPass == true, stage2 == nil, stage2ExplicitlyOff == nil {
+      throw WarmServerError.presetRecipeInvalid(
+        preset: id, field: "stage2",
+        reason: "`detail_pass: true` asks for the preset's second stage, and preset '\(id)' "
+          + "declares no stage2. Declare stage2 (steps + denoise) on the preset, send `stage2` "
+          + "on the request, or drop detail_pass")
+    }
+
+    if !expansion.skipped.isEmpty {
+      presetRecipeSkipped = expansion.skipped
+      for entry in expansion.skipped {
+        log("Preset '\(id)': NOT applying its declared \(entry) — recorded in preset_recipe_skipped")
+      }
     }
 
     guard !applied.isEmpty else { return }

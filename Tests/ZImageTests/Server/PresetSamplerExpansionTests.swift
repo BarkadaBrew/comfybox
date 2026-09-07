@@ -123,7 +123,15 @@ final class PresetSamplerExpansionTests: XCTestCase {
         e.stage2 != nil, e.noiseType != nil, e.noiseAlpha != nil, e.implicitSteps != nil,
         e.c2 != nil, e.projectorScale != nil,
       ].filter { $0 }.count
-      XCTAssertEqual(adopted, 9, "\(field): exactly the other nine fields still come from the preset")
+      if field == "sampler" {
+        // B2: the request's `euler` makes the preset's eta 0.5 undefined —
+        // left off and recorded, so eight of the other nine come through.
+        XCTAssertEqual(adopted, 8, "\(field): eta is skipped under the request's euler")
+        XCTAssertEqual(e.skipped, ["eta (non-RES4LYF sampler 'euler')"])
+      } else {
+        XCTAssertEqual(adopted, 9, "\(field): exactly the other nine fields still come from the preset")
+        XCTAssertEqual(e.skipped, [], field)
+      }
     }
   }
 
@@ -379,35 +387,238 @@ final class PresetSamplerExpansionTests: XCTestCase {
 
   // MARK: - Family gates run on the EXPANDED values
 
-  /// THE proof the ticket asks for: a preset declaring `euler + eta 0.5` on
-  /// Krea 2 is refused by the existing eta gate, exactly as the explicit
-  /// request is — never rendered euler with the eta silently dropped, and
-  /// never rendered with an SDE the sampler does not define.
-  func testPresetEulerPlusEtaOnKrea2IsRefusedByTheExistingEtaGate() throws {
+  private func krea2Gate(_ payload: GeneratePayload) -> WarmServerError? {
+    do {
+      try payload.validateKrea2TierGates(try payload.validateRecipeNames())
+      return nil
+    } catch { return error as? WarmServerError }
+  }
+
+  // MARK: PR #420 review B2 — the daemon's #1797 rule, engine-side
+
+  /// A preset declaring `euler + eta 0.5` on Krea 2, with nothing on the
+  /// request: the preset is the only layer that asked for the eta, so it is
+  /// left OFF and recorded — the render goes ahead single-layer euler, it is
+  /// NOT a 400 (the daemon does the same), and it is not silent.
+  func testPresetEulerPlusEtaAloneRendersWithTheEtaSkippedAndRecorded() throws {
     let preset = fullRecipePreset(
       sampler: "euler", sigmaSchedule: nil, eta: 0.5, bongmath: nil, stage2: nil,
       noiseType: nil, noiseAlpha: nil, implicitSteps: nil, c2: nil, projectorScale: nil)
-    let fromPreset = try expand(#"{"prompt":"x","preset":"krea-clown"}"#, preset)
-    XCTAssertEqual(fromPreset.scheduler, "euler")
-    XCTAssertEqual(fromPreset.eta, 0.5)
+    let out = try expand(#"{"prompt":"x","preset":"krea-clown"}"#, preset)
+    XCTAssertEqual(out.scheduler, "euler")
+    XCTAssertNil(out.eta, "the preset's eta is not adopted under euler")
+    XCTAssertEqual(out.presetRecipeApplied, ["scheduler"])
+    XCTAssertEqual(out.presetRecipeSkipped, ["eta (non-RES4LYF sampler 'euler')"])
+    XCTAssertNil(krea2Gate(out), "no eta on the payload ⇒ the eta gate has nothing to refuse")
+    XCTAssertEqual(try out.krea2RecipeFields().eta, 0)
+  }
 
-    func gate(_ payload: GeneratePayload) -> WarmServerError? {
-      do {
-        try payload.validateKrea2TierGates(try payload.validateRecipeNames())
-        return nil
-      } catch { return error as? WarmServerError }
-    }
-    guard case .unsupportedRecipeField(let field, let value, let family, _)? = gate(fromPreset)
-    else { return XCTFail("the preset's euler + eta must hit the eta gate") }
-    XCTAssertEqual(field, "eta")
-    XCTAssertEqual(value, "0.5")
-    XCTAssertEqual(family, "krea2")
+  /// Preset `res_2s + eta 0.5`, request overrides the sampler to `euler`:
+  /// the EFFECTIVE sampler is the request's, the preset's eta is undefined
+  /// against it, so it is left off and recorded; the render proceeds.
+  func testRequestSamplerOverrideToEulerSkipsThePresetEta() throws {
+    let preset = fullRecipePreset(
+      sampler: "res_2s", sigmaSchedule: "beta57", eta: 0.5, bongmath: nil, stage2: nil,
+      noiseType: nil, noiseAlpha: nil, implicitSteps: nil, c2: nil, projectorScale: nil)
+    let out = try expand(#"{"prompt":"x","preset":"krea-clown","sampler":"euler"}"#, preset)
+    XCTAssertEqual(out.scheduler, "euler")
+    XCTAssertNil(out.eta)
+    XCTAssertEqual(out.sigmaSchedule, "beta57")
+    XCTAssertEqual(out.presetRecipeApplied, ["sigma_schedule"])
+    XCTAssertEqual(out.presetRecipeSkipped, ["eta (non-RES4LYF sampler 'euler')"])
+    XCTAssertNil(krea2Gate(out))
+    // Alias / prefix normalisation: a RES4LYF spelling the resolver accepts
+    // keeps the eta.
+    let kept = try expand(#"{"prompt":"x","preset":"krea-clown","sampler":"res_2s"}"#, preset)
+    XCTAssertEqual(kept.eta, 0.5)
+    XCTAssertNil(kept.presetRecipeSkipped)
+  }
 
-    // …and it is the SAME refusal the explicit request gets.
+  /// A REQUEST-sourced eta on euler is untouched: still the existing 400.
+  func testRequestSourcedEtaOnEulerIsStillRefused() throws {
     let explicit = try decode(#"{"prompt":"x","scheduler":"euler","eta":0.5}"#)
-    XCTAssertEqual(
-      gate(explicit)?.errorDescription, gate(fromPreset)?.errorDescription)
-    XCTAssertEqual(WarmServer.errorResponse(for: gate(fromPreset)!).status, 400)
+    guard case .unsupportedRecipeField(let field, let value, let family, _)? = krea2Gate(explicit)
+    else { return XCTFail("a request eta on euler must hit the eta gate") }
+    XCTAssertEqual(field, "eta"); XCTAssertEqual(value, "0.5"); XCTAssertEqual(family, "krea2")
+    // …also when a preset is named that would have kept it (the request's
+    // eta is the request's, whatever the preset says).
+    let withPreset = try expand(
+      #"{"prompt":"x","preset":"krea-clown","scheduler":"euler","eta":0.5}"#,
+      fullRecipePreset(stage2: nil))
+    XCTAssertEqual(withPreset.eta, 0.5)
+    XCTAssertNil(withPreset.presetRecipeSkipped)
+    XCTAssertNotNil(krea2Gate(withPreset))
+  }
+
+  /// A zero eta is adopted whatever the sampler — it asks for nothing.
+  func testZeroPresetEtaIsAdoptedUnderEuler() throws {
+    let preset = fullRecipePreset(sampler: "euler", eta: 0, stage2: nil)
+    let out = try expand(#"{"prompt":"x","preset":"krea-clown"}"#, preset)
+    XCTAssertEqual(out.eta, 0)
+    XCTAssertNil(out.presetRecipeSkipped)
+  }
+
+  /// The rule is Krea 2's: on Z-Image `eta` is a shipped DDIM η and a preset's
+  /// `euler + eta` is adopted as declared.
+  func testZImagePresetEtaIsAdoptedUnderEuler() throws {
+    let preset = ImagePreset(
+      id: "zeta", name: "Zeta", mediaKind: "image", model: "z-image-zeta-chroma", loras: [],
+      checkpointFamily: "zimage-base", sampler: "euler", eta: 0.5)
+    let out = try expand(#"{"prompt":"x","preset":"zeta"}"#, preset)
+    XCTAssertEqual(out.eta, 0.5)
+    XCTAssertNil(out.presetRecipeSkipped)
+  }
+
+  /// Same rule for `stage2.eta` against the EFFECTIVE stage-2 sampler: the
+  /// stage's own, else the render's (the `stage2Gate` fallback).
+  func testPresetStage2EtaIsSkippedAgainstTheEffectiveStage2Sampler() throws {
+    // Stage names euler itself → its eta is undefined → stage adopted, eta off.
+    let own = fullRecipePreset(
+      stage2: PresetStage(sampler: "euler", steps: 6, denoise: 0.4, eta: 0.3))
+    let a = try expand(#"{"prompt":"x","preset":"krea-clown"}"#, own)
+    XCTAssertEqual(a.stage2, Stage2Payload(steps: 6, denoise: 0.4, scheduler: "euler"))
+    XCTAssertEqual(a.presetRecipeSkipped, ["stage2.eta (non-RES4LYF sampler 'euler')"])
+    XCTAssertTrue(a.presetRecipeApplied?.contains("stage2") ?? false)
+
+    // Stage names no sampler → falls back to the render's res_2s → eta kept.
+    let inherit = fullRecipePreset(stage2: PresetStage(steps: 6, denoise: 0.4, eta: 0.3))
+    let b = try expand(#"{"prompt":"x","preset":"krea-clown"}"#, inherit)
+    XCTAssertEqual(b.stage2?.eta, 0.3)
+    XCTAssertNil(b.presetRecipeSkipped)
+    XCTAssertNil(GeneratePayload.stage2Gate(b, family: .krea2))
+
+    // …and the render's sampler is the REQUEST's when it sent one.
+    let c = try expand(#"{"prompt":"x","preset":"krea-clown","sampler":"euler"}"#, inherit)
+    XCTAssertNil(c.stage2?.eta)
+    XCTAssertEqual(c.presetRecipeSkipped, [
+      "eta (non-RES4LYF sampler 'euler')", "stage2.eta (non-RES4LYF sampler 'euler')",
+    ])
+    XCTAssertNil(GeneratePayload.stage2Gate(c, family: .krea2))
+  }
+
+  // MARK: PR #420 review B1 — the explicit stage-2 OFF switch
+
+  func testDetailPassFalseSwitchesThePresetStageOffAndRecordsIt() throws {
+    let out = try expand(#"{"prompt":"x","preset":"krea-clown","detail_pass":false}"#, fullRecipePreset())
+    XCTAssertNil(out.stage2, "single stage")
+    XCTAssertEqual(out.detailPass, false)
+    XCTAssertEqual(out.presetRecipeSkipped, ["stage2 (detail_pass=false)"])
+    XCTAssertFalse(out.presetRecipeApplied?.contains("stage2") ?? false)
+    XCTAssertEqual(out.scheduler, "res_2s", "the rest of the recipe is unaffected")
+    XCTAssertNil(GeneratePayload.detailPassGate(out))
+    XCTAssertNil(GeneratePayload.stage2Gate(out, family: .krea2))
+    XCTAssertNil(GeneratePayload.stage2Gate(out, family: .flux1), "detail_pass=false is fine everywhere")
+  }
+
+  func testStage2NullSwitchesThePresetStageOffAndRecordsIt() throws {
+    let out = try expand(#"{"prompt":"x","preset":"krea-clown","stage2":null}"#, fullRecipePreset())
+    XCTAssertNil(out.stage2)
+    XCTAssertTrue(out.stage2Null)
+    XCTAssertEqual(out.stage2ExplicitlyOff, "stage2=null")
+    XCTAssertEqual(out.presetRecipeSkipped, ["stage2 (stage2=null)"])
+    XCTAssertNil(GeneratePayload.detailPassGate(out))
+    XCTAssertNil(GeneratePayload.stage2Gate(out, family: .krea2))
+  }
+
+  /// Omission is NOT off: `{preset}` alone still adopts the stage (unchanged).
+  func testOmittedStage2StillAdoptsThePresetStage() throws {
+    let out = try expand(#"{"prompt":"x","preset":"krea-clown"}"#, fullRecipePreset())
+    XCTAssertNotNil(out.stage2)
+    XCTAssertFalse(out.stage2Null)
+    XCTAssertNil(out.stage2ExplicitlyOff)
+    XCTAssertNil(out.presetRecipeSkipped)
+  }
+
+  /// The off switch records nothing when the preset declares no stage — there
+  /// was nothing to skip.
+  func testOffSwitchAgainstAPresetWithoutStage2RecordsNothing() throws {
+    let out = try expand(
+      #"{"prompt":"x","preset":"krea-clown","detail_pass":false}"#, fullRecipePreset(stage2: nil))
+    XCTAssertNil(out.stage2)
+    XCTAssertNil(out.presetRecipeSkipped)
+  }
+
+  func testDetailPassTrueAdoptsThePresetStage() throws {
+    let out = try expand(#"{"prompt":"x","preset":"krea-clown","detail_pass":true}"#, fullRecipePreset())
+    XCTAssertEqual(out.stage2?.steps, 6)
+    XCTAssertNil(GeneratePayload.detailPassGate(out))
+  }
+
+  func testDetailPassTrueAgainstAPresetWithoutStage2Is400NamingThePreset() throws {
+    XCTAssertThrowsError(
+      try expand(#"{"prompt":"x","preset":"krea-clown","detail_pass":true}"#, fullRecipePreset(stage2: nil))
+    ) { error in
+      guard case .presetRecipeInvalid(let id, let field, let reason)? = error as? WarmServerError
+      else { return XCTFail("expected .presetRecipeInvalid, got \(error)") }
+      XCTAssertEqual(id, "krea-clown")
+      XCTAssertEqual(field, "stage2")
+      XCTAssertTrue(reason.contains("declares no stage2"), reason)
+      XCTAssertEqual(WarmServer.errorResponse(for: error).status, 400)
+    }
+  }
+
+  func testDetailPassTrueBesideStage2NullIsAContradiction() throws {
+    let out = try expand(
+      #"{"prompt":"x","preset":"krea-clown","detail_pass":true,"stage2":null}"#, fullRecipePreset())
+    guard case .mutuallyExclusive? = GeneratePayload.detailPassGate(out)
+    else { return XCTFail("detail_pass=true + stage2=null must be refused") }
+  }
+
+  func testDetailPassFalseBesideARequestStage2IsAContradiction() throws {
+    let payload = try decode(#"{"prompt":"x","detail_pass":false,"stage2":{"steps":3,"denoise":0.2}}"#)
+    guard case .mutuallyExclusive? = GeneratePayload.detailPassGate(payload)
+    else { return XCTFail("detail_pass=false + a stage2 object must be refused") }
+    XCTAssertNotNil(GeneratePayload.stage2Gate(payload, family: .krea2))
+  }
+
+  /// No preset, `detail_pass: true`, no stage: the original AC-68a 400.
+  func testDetailPassTrueWithNothingToExpandIsTheOriginal400() throws {
+    let payload = try decode(#"{"prompt":"x","detail_pass":true}"#)
+    guard case .unsupportedRecipeField(let field, _, _, _)? = GeneratePayload.detailPassGate(payload)
+    else { return XCTFail("bare detail_pass=true must still be refused") }
+    XCTAssertEqual(field, "detail_pass")
+  }
+
+  /// Replay: the off switch is carried faithfully — `detail_pass: false` /
+  /// `stage2: null` stay in the body and no stage is written.
+  func testRewrittenReplayBodyKeepsTheOffSwitch() throws {
+    for body in [
+      #"{"prompt":"x","preset":"krea-clown","detail_pass":false}"#,
+      #"{"prompt":"x","preset":"krea-clown","stage2":null}"#,
+    ] {
+      let original = Data(body.utf8)
+      let payload = try expand(body, fullRecipePreset())
+      let object = try XCTUnwrap(
+        try JSONSerialization.jsonObject(with: WarmServer.rawBody(original, expandedWith: payload))
+          as? [String: Any])
+      if body.contains("detail_pass") {
+        XCTAssertEqual(object["detail_pass"] as? Bool, false, body)
+        XCTAssertNil(object["stage2"], body)
+      } else {
+        XCTAssertTrue(object["stage2"] is NSNull, "stage2=null must survive: \(body)")
+      }
+      XCTAssertEqual(object["scheduler"] as? String, "res_2s", "the rest still replays: \(body)")
+      // The replay decodes to the same OFF decision.
+      let replayed = try decode(String(decoding: WarmServer.rawBody(original, expandedWith: payload), as: UTF8.self))
+      XCTAssertNil(replayed.stage2, body)
+      XCTAssertNotNil(replayed.stage2ExplicitlyOff, body)
+    }
+  }
+
+  // MARK: PR #420 review nit — a JSON null is ABSENT for the replay merge
+
+  /// `"eta": null` decodes as no eta, so the preset's eta applies; the replay
+  /// body must carry that eta rather than leave the null in place.
+  func testExplicitNullIsAbsentForTheReplayMerge() throws {
+    let body = #"{"prompt":"x","preset":"krea-clown","eta":null,"steps":null}"#
+    let payload = try expand(body, fullRecipePreset())
+    XCTAssertEqual(payload.eta, 0.5)
+    XCTAssertEqual(payload.steps, 12)
+    let object = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: WarmServer.rawBody(Data(body.utf8), expandedWith: payload))
+        as? [String: Any])
+    XCTAssertEqual((object["eta"] as? NSNumber)?.floatValue, 0.5)
+    XCTAssertEqual(object["steps"] as? Int, 12, "the pre-existing keys take the same rule")
   }
 
   /// `bongmath: true` from a preset on a non-RES4LYF sampler: same gate.
@@ -580,9 +791,13 @@ final class PresetSamplerExpansionTests: XCTestCase {
     XCTAssertEqual((object["stage2"] as? [String: Any])?["steps"] as? Int, 3)
     XCTAssertEqual((object["projectorScale"] as? NSNumber)?.floatValue, 1)
     XCTAssertNil(object["projector_scale"])
-    // The preset-sourced remainder IS written.
-    XCTAssertEqual((object["eta"] as? NSNumber)?.floatValue, 0.5)
+    // The preset-sourced remainder IS written…
     XCTAssertEqual(object["noise_type"] as? String, "fractal")
+    XCTAssertEqual(object["bongmath"] as? Bool, true)
+    // …except the eta, which B2 left off under the request's `euler` — so the
+    // replay body carries no eta either, and the skip is on the record.
+    XCTAssertNil(object["eta"])
+    XCTAssertEqual(payload.presetRecipeSkipped, ["eta (non-RES4LYF sampler 'euler')"])
   }
 
   // MARK: - `preset_recipe_applied` on the response
@@ -595,25 +810,31 @@ final class PresetSamplerExpansionTests: XCTestCase {
     let quietJSON = try XCTUnwrap(
       try JSONSerialization.jsonObject(with: encoder.encode(quiet)) as? [String: Any])
     XCTAssertNil(quietJSON["preset_recipe_applied"])
+    XCTAssertNil(quietJSON["preset_recipe_skipped"])
 
     let sourced = GenerateResponse(
       success: true, outputPath: "/tmp/a.png", durationMs: 10,
-      presetRecipeApplied: ["scheduler", "sigma_schedule"])
+      presetRecipeApplied: ["scheduler", "sigma_schedule"],
+      presetRecipeSkipped: ["eta (non-RES4LYF sampler 'euler')"])
     let sourcedJSON = try XCTUnwrap(
       try JSONSerialization.jsonObject(with: encoder.encode(sourced)) as? [String: Any])
     XCTAssertEqual(sourcedJSON["preset_recipe_applied"] as? [String], ["scheduler", "sigma_schedule"])
+    XCTAssertEqual(sourcedJSON["preset_recipe_skipped"] as? [String], ["eta (non-RES4LYF sampler 'euler')"])
   }
 
   func testImageJobStatusCarriesPresetRecipeAppliedAndDecodesWithoutIt() throws {
     let status = ImageJobStatus(
       jobId: "j-1", status: .succeeded, source: "api", outputPath: "/tmp/a.png",
       durationMs: 10, error: nil, elapsedMs: 12, preemptRefused: nil, etaSec: nil,
-      presetRecipeApplied: ["eta"])
+      presetRecipeApplied: ["eta"], presetRecipeSkipped: ["stage2 (detail_pass=false)"])
     XCTAssertEqual(status.presetRecipeApplied, ["eta"])
+    XCTAssertEqual(status.presetRecipeSkipped, ["stage2 (detail_pass=false)"])
     let legacy = #"""
     {"jobId":"j-1","status":"succeeded","source":"api","outputPath":"/tmp/a.png",
      "durationMs":10,"elapsedMs":12}
     """#.data(using: .utf8)!
-    XCTAssertNil(try JSONDecoder().decode(ImageJobStatus.self, from: legacy).presetRecipeApplied)
+    let decoded = try JSONDecoder().decode(ImageJobStatus.self, from: legacy)
+    XCTAssertNil(decoded.presetRecipeApplied)
+    XCTAssertNil(decoded.presetRecipeSkipped)
   }
 }
