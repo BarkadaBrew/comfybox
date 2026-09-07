@@ -401,6 +401,71 @@ already refuses every non-Z-Image family with `controlNetNotSupported`, so on
 that path the client sees that error instead.) See
 `bridge-developer-guide.md`.
 
+## Style packs — `style` / `phone_look` (comfybox#399)
+
+A **style pack** is a named, deterministic, engine-applied post-process: a pure
+CPU pass over the decoded RGB buffer, run **after VAE decode and before save**,
+in `runKrea2Generate`. It is not part of the recipe — it never touches the
+model, the LoRA stack, the sampler, the sigma grid or the seed — so the same
+request with and without a style renders the same latents and only differs in
+the pixels written to disk. `Sources/ZImage/Server/StylePack.swift` holds the
+registry and every recipe's numbers.
+
+**The v1 pack.**
+
+| `style` | What it is |
+|---|---|
+| `phone` | The accel-distill colour correction (`PhoneLook.swift`). Percentile auto-levels (P0.5/P99.5, guarded), S-contrast ×1.15, adaptive saturation toward a 0.32 mean capped at ×1.25, unsharp mask (σ 1.6 / 45% / threshold 2/255). Restores "a reasonable mobile phone look" on 4-step distills, which quit before the denoise steps that settle dynamic range. |
+| `trix-bw` | Guaranteed monochrome pushed film. Panchromatic channel mix (0.35/0.55/0.10), percentile levels, contrast ×1.3, soft highlight shoulder from 0.82 at 55%. Prompts alone rendered "Kodak Tri-X" in colour; the style makes B&W deterministic. Grain stays the model's job. |
+| `hp5-soft` | The gentler classic-gradation emulsion: same mono mix and levels, contrast ×1.08, lower/softer shoulder (0.75 at 70%). |
+
+Names are matched trimmed and case-insensitively. An **unknown** name is a
+**400** at the generate decode naming the known set — never a silent no-op at
+save time — and a preset that declares an unknown style is refused at
+`POST /v1/presets` upsert for the same reason.
+
+**Wire fields (additive; both optional, both absent = no post-process at all).**
+
+```json
+{"prompt": "…", "style": "hp5-soft"}
+{"prompt": "…", "phone_look": true}
+```
+
+`phone_look` is the **legacy alias** for `style: "phone"` and is kept because
+the daemon already sends it (intent.md: version or shim, never silently
+change). `phone_look: false` is a statement, not an absence: it asks for no
+look. A preset may declare the same two fields (`style`, `phone_look`) and they
+round-trip through `presets.json`.
+
+**Precedence — explicit request > preset > nothing**, the same rule
+`steps`/`guidance` (#286), `vae` (#285) and `shift` (#154) follow. `phone_look`
+is consulted per side only when *that* side named no `style`, so a preset's own
+`style` is never overruled by its own historical `phone_look`.
+
+| # | Source | When it wins |
+|---|---|---|
+| 1 | the request's own `style` | whenever the key is present and non-blank |
+| 2 | the request's own `phone_look: true` | when the request sent no `style` |
+| 3 | the named `preset`'s declared `style` | when the request declared neither |
+| 4 | the named `preset`'s declared `phone_look: true` | when the request declared neither and the preset named no `style` |
+| 5 | **no post-process** | the default — nothing is applied, and the render is byte-identical to the pre-#399 engine |
+
+Resolution happens once, in `WarmServer.decodedGeneratePayload`, so
+`/v1/generate`, `/v1/generate/async` and crash-recovery replay all agree; a
+preset-owned style is written into the persisted replay body beside the
+preset-owned `model`/`steps`/`guidance`/`vae`/`shift`, so a replayed job keeps
+the look it was accepted with.
+
+**A style survives a preset the engine cannot expand.** Unlike the recipe
+fields, a declared `style` is adopted even when the preset comes back
+`preset_unresolved` (a video preset on the image path, a non-local engine, …).
+"Expand the recipe as a whole or not at all" exists to stop a preset's adapters
+landing on the wrong base; a post-process has no base to land on.
+
+**Read from the DECLARED preset, never from `ResolvedPreset`** — the same rule
+as `steps`/`guidance`/`vae`/`shift` — so `PresetDefaults` can never manufacture
+a look nobody asked for.
+
 ## Gallery output filenames
 
 Default render filenames (no `output_path` in the request) are built by
