@@ -70,6 +70,34 @@ final class LoRACompatibilityFamilyGuardTests: XCTestCase {
     XCTAssertEqual(decision.loraFamilies, ["krea2"])
   }
 
+  // MARK: - Fix round 1, Critical 2: the flux1/krea2 scanner ambiguity
+
+  /// A LoRA whose ONLY declared family is "flux1" against a krea2 target is
+  /// ambiguous (Krea 2 is Flux-derived; the scanner used to confidently
+  /// mistag some Flux 2 Klein LoRAs "flux1" — fixed in this same PR) and
+  /// must warn, never throw.
+  func testFlux1OnlyTagOnKrea2TargetIsAmbiguousAllowedWithWarning() {
+    let decision = LoRACompatibility.checkFamily(modelCompatibility: ["flux1"], targetFamily: "krea2")
+    XCTAssertTrue(decision.allowed)
+    XCTAssertNotNil(decision.warning)
+  }
+
+  /// The exception is scoped to a BARE "flux1" tag — a LoRA that ALSO
+  /// declares a confidently different, unrelated family (e.g. ltx) is a
+  /// real mismatch, not covered by the ambiguity carve-out.
+  func testFlux1PlusUnrelatedTagOnKrea2TargetStillRejects() {
+    let decision = LoRACompatibility.checkFamily(modelCompatibility: ["flux1", "ltx"], targetFamily: "krea2")
+    XCTAssertFalse(decision.allowed)
+  }
+
+  /// The ambiguity carve-out is krea2-specific — a "flux1" tag against the
+  /// z-image target (a genuinely different, unrelated architecture) is
+  /// still a confident, real mismatch.
+  func testFlux1TagOnZImageTargetStillRejects() {
+    let decision = LoRACompatibility.checkFamily(modelCompatibility: ["flux1"], targetFamily: "z-image")
+    XCTAssertFalse(decision.allowed)
+  }
+
   /// Unknown compatibility (absent, or the explicit "unknown" value, or a
   /// string this build doesn't recognize) is ALWAYS allowed, with a warning
   /// — never a refusal (ruling 2).

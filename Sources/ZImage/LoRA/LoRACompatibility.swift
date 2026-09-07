@@ -362,6 +362,23 @@ public enum LoRACompatibility {
     if groups.contains(targetFamily) {
       return GuardDecision(allowed: true)
     }
+    // #402 fix round 1 (Critical 2, review of PR #411): the scanner's
+    // "flux1" tag is unreliable against a krea2 target specifically — Krea 2
+    // is ITSELF Flux-derived, and a Flux 2 Klein LoRA whose modelspec carries
+    // no klein_9b/klein_4b marker used to be confidently mistagged "flux1"
+    // by the SAME bug the scanner fix in this PR corrects
+    // (`LoRAScanner.detectCompatibility`). Until every already-scanned
+    // library entry has been rescanned with that fix, a bare "flux1" tag
+    // (and ONLY that — a LoRA that ALSO declares a confidently different,
+    // unrelated family such as "ltx" is not covered by this exception) stays
+    // ambiguous against krea2: warn, don't 400.
+    if Set(groups) == ["flux1"], targetFamily == "krea2" {
+      return GuardDecision(
+        allowed: true,
+        warning: "declares \"flux1\" — ambiguous against a krea2 target (Krea 2 is Flux-derived; "
+          + "the scanner cannot yet distinguish real Flux.1 from a mistagged Krea-2-compatible "
+          + "adapter) — allowing with a warning until the library is rescanned")
+    }
     return GuardDecision(allowed: false, loraFamilies: Array(Set(groups)).sorted())
   }
 

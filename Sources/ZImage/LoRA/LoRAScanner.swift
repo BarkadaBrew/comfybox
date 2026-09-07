@@ -167,9 +167,14 @@ public enum LoRAScanner {
       // — underscore, not one of the two forms this switch recognized.
       case "zimage", "z-image", "z_image", "lumina2":
         return ["z-image"]
-      case "flux_klein_9b":
+      // #402 fix round 1 (Critical 2, coffeeshop-server#1681 review): a real
+      // vault file (FK_adrianoanal.safetensors) writes
+      // `ss_base_model_version: "flux2_klein_9b"` — this switch only knew
+      // `flux_klein_9b` (no "2"), so it fell through to the modelspec
+      // fallback below, which used to confidently mistag it `["flux1"]`.
+      case "flux_klein_9b", "flux2_klein_9b":
         return ["klein-9b"]
-      case "flux_klein_4b":
+      case "flux_klein_4b", "flux2_klein_4b":
         return ["klein-4b"]
       case "flux1":
         // Could be Chroma or generic Flux 1 — check keys for Chroma patterns
@@ -209,7 +214,18 @@ public enum LoRAScanner {
       if lower.contains("ltx") {
         return ["ltx"]
       }
-      if lower.contains("flux") {
+      // #402 fix round 1 (Critical 2): "flux-2/lora" (Flux 2 Klein, no
+      // klein_9b/klein_4b marker in ITS modelspec — the real bug: the
+      // ss_base_model_version switch above should have caught it first, and
+      // now does) used to fall into a BARE `contains("flux")` check here and
+      // come out a confident `["flux1"]` — the wrong architecture, and the
+      // #402 guard makes a confident wrong tag fatal at swap/generate/preset
+      // time. `"flux"` alone (flux2, flux-2, flux.2, or an unqualified
+      // mention) is no longer enough for a CONFIDENT "flux1" — only an
+      // explicit Flux.1 marker is. Anything else falls through to the
+      // key-pattern heuristics below (step 3), which end in `["unknown"]`
+      // rather than a guess when they too come up empty.
+      if lower.contains("flux1") || lower.contains("flux.1") || lower.contains("flux-1") || lower.contains("flux_1") {
         return ["flux1"]
       }
     }

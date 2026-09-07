@@ -1101,10 +1101,20 @@ public final class PresetStore: @unchecked Sendable {
   /// checkpointFamily, no video mediaKind) is a legitimate answer — the #402
   /// ruling requires it to warn, never refuse.
   static func resolvedLoRAFamily(for preset: ImagePreset) -> String? {
-    if preset.mediaKind?.lowercased() == "video" { return "ltx" }
-    if resolvesToKrea2Family(preset) { return "krea2" }
-    if let family = preset.checkpointFamily, zimageCheckpointFamilies.contains(family) { return "z-image" }
-    if let model = preset.model, !model.isEmpty,
+    resolvedLoRAFamily(
+      checkpointFamily: preset.checkpointFamily, model: preset.model, mediaKind: preset.mediaKind)
+  }
+
+  /// #402 fix round 1 (Critical 1): the pure core of `resolvedLoRAFamily(for:)`,
+  /// over the three raw fields directly rather than an `ImagePreset` — so
+  /// `POST /v1/lora/swap` (whose payload has no `ImagePreset` to hand in) can
+  /// resolve its OWN declared target family through the identical table
+  /// (`WarmServer.loraSwapTargetFamily`).
+  static func resolvedLoRAFamily(checkpointFamily: String?, model: String?, mediaKind: String? = nil) -> String? {
+    if mediaKind?.lowercased() == "video" { return "ltx" }
+    if resolvesToKrea2Family(checkpointFamily: checkpointFamily, model: model) { return "krea2" }
+    if let family = checkpointFamily, zimageCheckpointFamilies.contains(family) { return "z-image" }
+    if let model, !model.isEmpty,
        let canonical = SamplingRecipeCatalog.canonicalFamily(model),
        let warmFamily = WarmModelFamily(rawValue: canonical) {
       return warmFamily.loraCompatibilityFamily
@@ -1131,15 +1141,20 @@ public final class PresetStore: @unchecked Sendable {
     for lora in preset.loras {
       let name = (lora.filename as NSString).lastPathComponent
       let declared = lookup(lora.filename) ?? lookup(name)
-      let decision = LoRACompatibility.checkFamily(
-        modelCompatibility: declared?.modelCompatibility ?? [], targetFamily: targetFamily)
+      let rawTags = declared?.modelCompatibility ?? []
+      let decision = LoRACompatibility.checkFamily(modelCompatibility: rawTags, targetFamily: targetFamily)
       if let warning = decision.warning {
         log("preset \"\(preset.id)\" loras[\(name)]: \(warning)")
       }
       guard decision.allowed else {
+        // #402 fix round 1 (ruling 5): name the full path, the raw declared
+        // tag(s), the normalized group(s), the library id (when scanned),
+        // and the target family — everything a caller needs to fix the
+        // request without a second round trip.
+        let idPart = declared.map { " (library id '\($0.id)')" } ?? ""
         throw PresetStoreError.validation(
-          "preset \"\(preset.id)\": LoRA \"\(name)\" is compatible with "
-            + "\(decision.loraFamilies.joined(separator: "/")), not \"\(targetFamily)\" "
+          "preset \"\(preset.id)\": LoRA \"\(lora.filename)\"\(idPart) declares model_compatibility "
+            + "\(rawTags) (\(decision.loraFamilies.joined(separator: "/"))), not \"\(targetFamily)\" "
             + "— remove it or target a compatible family")
       }
     }
@@ -1161,10 +1176,17 @@ public final class PresetStore: @unchecked Sendable {
   /// `kroma-v0.2-turbo`, config `krea2Models`), or an existing directory that
   /// `Krea2ModelDetection.detect` recognises. Never a filename guess (F3).
   public static func resolvesToKrea2Family(_ preset: ImagePreset) -> Bool {
-    if let family = preset.checkpointFamily {
-      return krea2CheckpointFamilies.contains(family)
+    resolvesToKrea2Family(checkpointFamily: preset.checkpointFamily, model: preset.model)
+  }
+
+  /// The pure core of `resolvesToKrea2Family(_:)` — see
+  /// `resolvedLoRAFamily(checkpointFamily:model:mediaKind:)`'s doc for why
+  /// this is split out over the raw fields.
+  static func resolvesToKrea2Family(checkpointFamily: String?, model: String?) -> Bool {
+    if let checkpointFamily {
+      return krea2CheckpointFamilies.contains(checkpointFamily)
     }
-    guard let model = preset.model, !model.isEmpty else { return false }
+    guard let model, !model.isEmpty else { return false }
     if Krea2ModelDetection.isKnownKrea2Model(model) { return true }
     let expanded = (model as NSString).expandingTildeInPath
     var isDir: ObjCBool = false

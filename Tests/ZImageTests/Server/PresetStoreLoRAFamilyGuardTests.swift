@@ -115,19 +115,35 @@ final class PresetStoreLoRAFamilyGuardTests: XCTestCase {
       naming: ["sulphur-video.safetensors", "ltx", "z-image"])
   }
 
-  /// comfybox#393: a real-Flux.1 LoRA on a krea2 preset — "flux1" the tag is
-  /// NOT the same thing as this engine's `flux1`-named Z-Image family, and
-  /// it is not krea2 either, so it must be rejected either way.
-  func testRealFlux1LoRAOnKrea2PresetIsRejected() throws {
+  /// Fix round 1, Critical 2 (review of PR #411): a "flux1"-tagged LoRA on a
+  /// krea2 preset is AMBIGUOUS, not a confident mismatch — Krea 2 is itself
+  /// Flux-derived, and the scanner used to confidently mistag some Flux 2
+  /// Klein LoRAs "flux1" (fixed in `LoRAScanner`, same PR). Allow with a
+  /// warning, never a 400, until the library is rescanned.
+  func testFlux1TaggedLoRAOnKrea2PresetIsAllowedWithWarning() throws {
     let store = PresetStore(path: try makeTempPath(), seedDefaults: false)
     let entry = makeEntry(id: "civitai-flux-style", compat: ["flux1"])
     let preset = ImagePreset(
       id: "krea2-preset", name: "Krea2",
       loras: [LoraReference(filename: "civitai-flux-style.safetensors", scale: 1.0)],
       checkpointFamily: "raw-accel")
+    XCTAssertNoThrow(try store.upsert(preset, loraLookup: { _ in entry }))
+    XCTAssertNotNil(store.get("krea2-preset"))
+  }
+
+  /// The z-image target is unaffected by the krea2-specific ambiguity
+  /// carve-out — a "flux1"-tagged LoRA on a z-image preset is still a
+  /// confident, real mismatch (Z-Image/Lumina2 shares nothing with Flux.1).
+  func testFlux1TaggedLoRAOnZImagePresetIsStillRejected() throws {
+    let store = PresetStore(path: try makeTempPath(), seedDefaults: false)
+    let entry = makeEntry(id: "civitai-flux-style-2", compat: ["flux1"])
+    let preset = ImagePreset(
+      id: "zimage-preset", name: "ZImage",
+      loras: [LoraReference(filename: "civitai-flux-style-2.safetensors", scale: 1.0)],
+      checkpointFamily: "zimage-turbo")
     expectValidationRefusal(
       store, preset, loraLookup: { _ in entry },
-      naming: ["civitai-flux-style.safetensors", "flux1", "krea2"])
+      naming: ["civitai-flux-style-2.safetensors", "flux1", "z-image"])
   }
 
   /// Unknown/unscanned compatibility never refuses — only warns.
