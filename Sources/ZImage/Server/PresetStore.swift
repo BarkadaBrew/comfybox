@@ -1201,6 +1201,15 @@ public final class PresetStore: @unchecked Sendable {
     if let vae = preset.vae, vae.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       throw PresetStoreError.validation("preset \"\(preset.id)\": vae is empty — omit it for the model directory's VAE")
     }
+    // #399: a preset that names a look this engine does not have is refused at
+    // upsert, in the same breath as an unknown sampler above — a style that
+    // silently did nothing on every render would be far worse than a 400 here.
+    if let style = preset.style, !style.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+       StylePack.named(style) == nil {
+      throw PresetStoreError.validation(
+        "preset \"\(preset.id)\": unknown style \"\(style)\" — known styles: "
+          + StylePack.knownNames.joined(separator: ", "))
+    }
     if let stage2 = preset.stage2 {
       if let steps = stage2.steps, steps <= 0 {
         throw PresetStoreError.validation("preset \"\(preset.id)\": stage2.steps must be positive (got \(steps))")

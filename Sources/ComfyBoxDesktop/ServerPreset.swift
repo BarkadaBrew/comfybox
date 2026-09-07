@@ -131,6 +131,13 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
     public var eta: Double?
     public var bongmath: Bool?
     public var stage2: ServerPresetStage?
+    /// #399: the engine-applied post-process look this preset declares
+    /// (`phone` | `trix-bw` | `hp5-soft`), and its legacy boolean alias.
+    /// Passthrough for the same reason as every field above: an upsert
+    /// REPLACES the stored document, so a desktop save that omitted them
+    /// would silently erase a declared look.
+    public var style: String?
+    public var phoneLook: Bool?
 
     // Read-only validity flag the engine attaches on GET (WP-E20, AC-44c).
     // Never sent back: the engine recomputes it on every save.
@@ -187,7 +194,9 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         shift: Double? = nil,
         eta: Double? = nil,
         bongmath: Bool? = nil,
-        stage2: ServerPresetStage? = nil
+        stage2: ServerPresetStage? = nil,
+        style: String? = nil,
+        phoneLook: Bool? = nil
     ) {
         self.id = id
         self.name = name
@@ -227,6 +236,8 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         self.eta = eta
         self.bongmath = bongmath
         self.stage2 = stage2
+        self.style = style
+        self.phoneLook = phoneLook
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -240,6 +251,9 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         case bypass
         case invalid, invalidReason
         case kromaDeprecated, migrationNotes
+        // #399: the StylePack dials — listed here AND encoded AND decoded, or
+        // a desktop save drops the preset's look.
+        case style, phoneLook
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -287,6 +301,8 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         try c.encodeIfPresent(eta, forKey: .eta)
         try c.encodeIfPresent(bongmath, forKey: .bongmath)
         try c.encodeIfPresent(stage2, forKey: .stage2)
+        try c.encodeIfPresent(style, forKey: .style)
+        try c.encodeIfPresent(phoneLook, forKey: .phoneLook)
         // `invalid` / `invalidReason` are deliberately NOT encoded.
     }
 
@@ -330,6 +346,8 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         eta = try c.decodeIfPresent(Double.self, forKey: .eta)
         bongmath = try c.decodeIfPresent(Bool.self, forKey: .bongmath)
         stage2 = try c.decodeIfPresent(ServerPresetStage.self, forKey: .stage2)
+        style = try c.decodeIfPresent(String.self, forKey: .style)
+        phoneLook = try c.decodeIfPresent(Bool.self, forKey: .phoneLook)
         invalid = try c.decodeIfPresent(Bool.self, forKey: .invalid)
         invalidReason = try c.decodeIfPresent(String.self, forKey: .invalidReason)
         kromaDeprecated = try c.decodeIfPresent(Bool.self, forKey: .kromaDeprecated)

@@ -33,6 +33,7 @@ final class StylePackTests: XCTestCase {
   func testRegistryResolvesKnownNamesAndRejectsUnknown() {
     XCTAssertNotNil(StylePack.named("phone"))
     XCTAssertNotNil(StylePack.named("trix-bw"))
+    XCTAssertNotNil(StylePack.named("hp5-soft"))
     XCTAssertNil(StylePack.named("sepia-dreams"))
   }
 

@@ -11188,7 +11188,7 @@ private actor WarmServerCoordinator {
         // rather than looking like a family that has no record (round 2, C4).
         appliedSlot: AppliedRecordSlot(record: record)
       )
-      if let styleName = payload.style, let style = StylePack.named(styleName) {
+      if let style = StylePack.resolved(payload.style) {
         // Engine-applied style pack (Todd 2026-08-24): pure CPU pass — see
         // StylePack.swift for the recipes and their numbers. The decode
         // validated the name; phoneLook:true arrives here as style "phone".

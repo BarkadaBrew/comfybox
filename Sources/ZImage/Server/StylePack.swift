@@ -37,6 +37,22 @@ public enum StylePack: String, CaseIterable, Sendable {
     return StylePack(rawValue: key)
   }
 
+  /// #399 — THE post-decode gate, as one pure function.
+  ///
+  /// `runKrea2Generate` asks this and nothing else before it touches the
+  /// decoded image: nil ⇒ the pixel buffer is never read out of MLX, never
+  /// rebuilt, never written to — the render is byte-identical to the
+  /// pre-StylePack engine. So "a request without a style pack changes
+  /// nothing" is a property of a function a unit test can call, not of a
+  /// branch buried in a weights-loading actor (`StylePackParityTests`).
+  ///
+  /// nil in ⇒ nil out. An unknown name also returns nil, but it can never
+  /// reach here: `validate(_:)` refused it at the decode with a 400.
+  public static func resolved(_ name: String?) -> StylePack? {
+    guard let name else { return nil }
+    return named(name)
+  }
+
   /// Every name this engine answers to, for error messages and `/v1/styles`.
   public static var knownNames: [String] { allCases.map(\.rawValue) }
 
