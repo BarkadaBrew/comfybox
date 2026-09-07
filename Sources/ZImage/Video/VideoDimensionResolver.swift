@@ -1,13 +1,13 @@
 // VideoDimensionResolver.swift — the ONE place LTX-2 render dims are decided.
 //
-// comfybox#405: i2v ignored the source image's aspect and emitted landscape
-// (704x448 at "480p"), so a 9:16 portrait source rendered squeezed. The aspect
+// comfybox#405: i2v could emit landscape for a portrait source. The aspect
 // derivation existed (`WarmServer.deriveVideoDims`) but it was reachable only
-// from one inline branch of `prepareLocalVideo`, it chased the pixel BUDGET
-// hard enough to overshoot the requested resolution label, and a request that
-// named neither a resolution nor explicit
-// dims fell all the way through to the hard-coded 704x448 landscape default
-// with nothing recorded about why.
+// from one inline branch of `prepareLocalVideo`: it ran only when the init
+// image's pixel size could be read, the MCP tool could not size an i2v render
+// at all (it dropped caller width/height whenever `image_path` was set), a
+// t2v request naming an orientation but no dims fell through to the
+// hard-coded 704x448 landscape default, and nothing anywhere recorded what
+// was resolved or why.
 //
 // This file is deliberately dependency-free (Foundation only) and pure: every
 // decision is a value in, a value out, so the sizes callers ACTUALLY send can
@@ -22,18 +22,26 @@
 //     is a production contract.
 //  2. Shape (aspect):
 //       - i2v: the SOURCE image's aspect wins, fitted into the budget's pixel
-//         area (reason `.sourceAspect`);
+//         area (reason `.sourceAspect`), by the SAME search the engine runs
+//         today — every currently-produced shape is byte-identical;
 //       - t2v whose budget carries no orientation of its own (no explicit
-//         dims, no resolution label): an `aspect_ratio` label decides the
-//         shape (reason `.explicit`) instead of rendering the landscape
-//         default sideways;
+//         dims, no resolution label): an `aspect_ratio` label swaps the budget
+//         axes (reason `.explicit`) instead of rendering the landscape default
+//         sideways. Pixel count preserved exactly;
 //       - otherwise the budget keeps its own shape, /64-snapped (reason
-//         `.explicit` when the caller sent dims, else `.default`). Every t2v
-//         request that reached a shape before #405 is byte-identical.
+//         `.explicit` when the caller sent dims, else `.default`).
 //  3. Both axes are multiples of 64 with a floor of 256. LTX-2 renders at
 //     32-multiples that are NOT 64-multiples (e.g. 480) exhibit progressive
 //     haze/ghosting (#219) — every clean render in the 07-13 bisect used /64
 //     dims, every hazy one used 480.
+//  4. An upper safety clamp (max long edge, max pixels — the engine's
+//     existing `imageMemoryCaps`, PR #363) so a degenerate source cannot hand
+//     the pipeline an absurd allocation.
+//
+// NOTHING MAY SHRINK. The first cut of this file tightened the fit's area cap
+// from 1.25x to 1.0x; a replay over all 474 `I2V: adjusted` lines in the
+// production log showed 62 renders (13%) losing 17-35% of their pixels. The
+// cap is back at 1.25x and the search is the original one, verbatim.
 //
 // Why a neighbourhood SEARCH and not per-axis rounding: rounding each axis to
 // /64 independently compounds error in opposite directions. A 1664x896 source
@@ -71,11 +79,17 @@ public struct ResolvedVideoDimensions: Equatable, Sendable {
   /// The i2v source image size, when one was supplied and readable.
   public let sourceWidth: Int?
   public let sourceHeight: Int?
+  /// The dims actually handed to the generator when two-stage is on — the
+  /// refine doubles them back to `width`x`height`. nil for a single-scale
+  /// render, where the generator and the output agree.
+  public let stage1Width: Int?
+  public let stage1Height: Int?
 
   public init(
     width: Int, height: Int, reason: VideoDimensionReason,
     budgetWidth: Int, budgetHeight: Int,
-    sourceWidth: Int? = nil, sourceHeight: Int? = nil
+    sourceWidth: Int? = nil, sourceHeight: Int? = nil,
+    stage1Width: Int? = nil, stage1Height: Int? = nil
   ) {
     self.width = width
     self.height = height
@@ -84,6 +98,8 @@ public struct ResolvedVideoDimensions: Equatable, Sendable {
     self.budgetHeight = budgetHeight
     self.sourceWidth = sourceWidth
     self.sourceHeight = sourceHeight
+    self.stage1Width = stage1Width
+    self.stage1Height = stage1Height
   }
 
   /// True when the resolver moved the dims off the requested budget — the
@@ -123,13 +139,22 @@ public enum VideoDimensionResolver {
 
   /// Fit `aspect` into the pixel-area budget on the /64 grid.
   ///
-  /// The candidate must not exceed the budget area (the label means what it
-  /// says: a "480p" request should not silently render 15% more pixels than
-  /// 480p). The single exception is the small-budget pathology: below ~2x the
-  /// 256 floor the cap can pin one axis and force a badly stretched pair
-  /// (a halved two-stage budget once hit 19% distortion that way), so if the
-  /// best in-budget candidate is still more than 10% off the target aspect,
-  /// a larger clip is preferred over a distorted one.
+  /// This is the pre-#405 `WarmServer.deriveVideoDims` search, moved here
+  /// UNCHANGED — same +/-1 neighbourhood, same 1.25x area cap, same relaxation,
+  /// same ranking (aspect error first, pixel budget as the tie-break). #405 is
+  /// an ASPECT ticket: a review replay over all 474 `I2V: adjusted` lines in
+  /// the production log showed that tightening the cap to 1.0 cost 62 renders
+  /// (13%) 17-35% of their pixels — an undisclosed quality regression, and
+  /// Todd's standing rule is quality over speed. So every source whose aspect
+  /// was already being honoured keeps the EXACT dims it gets today; only the
+  /// paths where no aspect was applied at all change.
+  ///
+  /// Rounding each axis to /64 independently compounds error in opposite
+  /// directions: a 1664x896 source (aspect 1.857) at a 448x704 budget produced
+  /// 768x384 (aspect 2.000) — the height's ideal 412.1 sat almost exactly on a
+  /// 64-boundary midpoint and rounded DOWN while the width rounded up, a 7.7%
+  /// distortion that visibly squashes the subject (2026-08-01). Searching the
+  /// /64 neighbourhood and keeping the pair whose aspect is closest fixes that.
   public static func fit(
     aspect: Double, budgetWidth: Int, budgetHeight: Int
   ) -> (width: Int, height: Int) {
@@ -142,36 +167,34 @@ public enum VideoDimensionResolver {
     let baseW = Int((idealW / 64.0).rounded())
     let baseH = Int((idealH / 64.0).rounded())
 
-    // Aspect fidelity dominates, but area is not free: without the small area
-    // term a candidate a third of the requested size wins on a 0.7-point
-    // aspect gain (576x1024 at a 480p budget picked 384x704 — 270k px — over
-    // 448x768 — 344k px). The weight is bounded by that pair: it must stay
-    // small enough that a 0.6-point aspect gain never buys a 7-point area
-    // loss, and large enough to break near-ties toward the requested budget.
-    let areaWeight = 0.05
-    func search(areaCap: Double) -> (w: Int, h: Int, aspectErr: Double, score: Double)? {
-      var best: (w: Int, h: Int, aspectErr: Double, score: Double)?
-      for dw in -2...2 {
-        for dh in -2...2 {
+    func search(areaCap: Double) -> (w: Int, h: Int, aspectErr: Double, areaErr: Double)? {
+      var best: (w: Int, h: Int, aspectErr: Double, areaErr: Double)?
+      for dw in -1...1 {
+        for dh in -1...1 {
           let w = max(256, (baseW + dw) * 64)
           let h = max(256, (baseH + dh) * 64)
           let area = Double(w * h)
           guard area <= budget * areaCap else { continue }
           let aspectErr = abs(Double(w) / Double(h) - aspect) / aspect
           let areaErr = abs(area - budget) / budget
-          let score = aspectErr + areaWeight * areaErr
-          guard let b = best else { best = (w, h, aspectErr, score); continue }
-          if score < b.score - 1e-12 { best = (w, h, aspectErr, score) }
+          if let b = best {
+            let better = aspectErr < b.aspectErr - 1e-9
+              || (abs(aspectErr - b.aspectErr) <= 1e-9 && areaErr < b.areaErr)
+            if better { best = (w, h, aspectErr, areaErr) }
+          } else {
+            best = (w, h, aspectErr, areaErr)
+          }
         }
       }
       return best
     }
 
-    // Stay inside the requested budget by default. Only a badly distorted
-    // in-budget best (the 256-floor pathology) justifies overshooting it.
-    var pick = search(areaCap: 1.0)
-    if pick == nil || pick!.aspectErr > 0.10,
-       let relaxed = search(areaCap: 1.6),
+    // Prefer staying near the budget; but at small budgets the 256 floor pins
+    // one axis and the tight cap can force a badly stretched pair (a halved
+    // two-stage budget hit 19% that way), so allow a larger clip rather than
+    // distort.
+    var pick = search(areaCap: 1.25)
+    if pick == nil || pick!.aspectErr > 0.03, let relaxed = search(areaCap: 1.6),
        relaxed.aspectErr < (pick?.aspectErr ?? .infinity) - 1e-9 {
       pick = relaxed
     }
@@ -179,6 +202,42 @@ public enum VideoDimensionResolver {
       return (snap64(Int(idealW.rounded())), snap64(Int(idealH.rounded())))
     }
     return (chosen.w, chosen.h)
+  }
+
+  /// Upper safety clamp: no render may exceed `maxLongEdge` on its longer axis
+  /// or `maxPixels` in total. Defaults are the engine's existing
+  /// `imageMemoryCaps` (PR #363) — 4096 / 4096^2 — which no video render has
+  /// ever approached, so this never touches a real request; it exists so a
+  /// degenerate source (a 10x9999 strip, a corrupt EXIF size) cannot hand the
+  /// pipeline a 256x17792 allocation.
+  ///
+  /// Aspect is preserved by scaling BOTH axes by one factor and flooring each
+  /// to /64 (flooring, not rounding, so the result cannot land back above the
+  /// cap). The 256 floor still wins — at 256x256 the caps are satisfied by any
+  /// sane configuration.
+  public static func clamp(
+    width: Int, height: Int,
+    maxLongEdge: Int = 4096, maxPixels: Int = 16_777_216
+  ) -> (width: Int, height: Int) {
+    let edgeCap = max(256, maxLongEdge)
+    let pixelCap = max(256 * 256, maxPixels)
+    guard max(width, height) > edgeCap || width * height > pixelCap else {
+      return (width, height)
+    }
+    let edgeScale = Double(edgeCap) / Double(max(width, height))
+    let pixelScale = (Double(pixelCap) / Double(width * height)).squareRoot()
+    let scale = min(edgeScale, pixelScale)
+    func floor64(_ v: Double) -> Int { max(256, Int(v / 64.0) * 64) }
+    var w = floor64(Double(width) * scale)
+    var h = floor64(Double(height) * scale)
+    // The 256 floor can push an axis back over a cap on a degenerate strip.
+    // Step the LONGER axis down until both caps hold or it hits the floor.
+    var guardCount = 0
+    while (max(w, h) > edgeCap || w * h > pixelCap) && max(w, h) > 256 && guardCount < 1024 {
+      if w >= h { w = max(256, w - 64) } else { h = max(256, h - 64) }
+      guardCount += 1
+    }
+    return (w, h)
   }
 
   /// The pixel-area budget, by the production priority chain:
@@ -203,6 +262,7 @@ public enum VideoDimensionResolver {
   ///     t2v (or an unreadable image — in which case the budget's own shape is
   ///     kept, exactly as before #405).
   ///   - aspectRatio: the caller's `aspect_ratio` label.
+  ///   - maxLongEdge/maxPixels: the upper safety clamp (see `clamp`).
   ///
   /// Why `aspectRatio` does NOT override the source image on i2v: real
   /// traffic sends a DEFAULTED `"16:9"` alongside an i2v request (the MCP
@@ -214,18 +274,23 @@ public enum VideoDimensionResolver {
   ///
   /// Where the label DOES decide the shape is a t2v request whose budget came
   /// from neither explicit dims nor a named resolution — i.e. it fell through
-  /// to a preset / server default / the 704x448 engine default. Today that
-  /// request renders landscape no matter what orientation it asked for. This
-  /// case is purely additive: any request carrying explicit width/height or a
-  /// resolution label already has the orientation baked into its budget by
-  /// `videoDims`, and is left byte-identical (comfybox#405 ruling 3).
+  /// to a preset / server default / the 704x448 engine default, which is
+  /// landscape. That request renders landscape today no matter what
+  /// orientation it asked for. It is corrected by ORIENTING the budget (the
+  /// axes are swapped, the pixel count is preserved exactly — 704x448 with
+  /// "9:16" becomes 448x704, the same dims the MCP tool already synthesizes
+  /// client-side), never by refitting: nothing may shrink. Any request that
+  /// carries explicit width/height or a resolution label already has its
+  /// orientation baked into the budget by `videoDims`, and is left
+  /// byte-identical (comfybox#405 review ruling 1).
   public static func resolve(
     requestWidth: Int?, requestHeight: Int?,
     namedWidth: Int? = nil, namedHeight: Int? = nil,
     presetWidth: Int? = nil, presetHeight: Int? = nil,
     configWidth: Int? = nil, configHeight: Int? = nil,
     sourceWidth: Int? = nil, sourceHeight: Int? = nil,
-    aspectRatio: String? = nil
+    aspectRatio: String? = nil,
+    maxLongEdge: Int = 4096, maxPixels: Int = 16_777_216
   ) -> ResolvedVideoDimensions {
     let budgetDims = budget(
       requestWidth: requestWidth, requestHeight: requestHeight,
@@ -238,37 +303,60 @@ public enum VideoDimensionResolver {
     let budgetAlreadyOriented =
       callerSizedBudget || namedWidth != nil || namedHeight != nil
 
+    func answer(
+      _ dims: (width: Int, height: Int), _ reason: VideoDimensionReason
+    ) -> ResolvedVideoDimensions {
+      let capped = clamp(
+        width: dims.width, height: dims.height,
+        maxLongEdge: maxLongEdge, maxPixels: maxPixels)
+      return ResolvedVideoDimensions(
+        width: capped.width, height: capped.height, reason: reason,
+        budgetWidth: budgetDims.width, budgetHeight: budgetDims.height,
+        sourceWidth: hasSource ? sourceWidth : nil,
+        sourceHeight: hasSource ? sourceHeight : nil)
+    }
+
     // i2v: the source image is ground truth for the SHAPE; the budget only
     // decides the magnitude.
     if hasSource {
-      let sw = sourceWidth!, sh = sourceHeight!
-      let fitted = fit(
-        aspect: Double(sw) / Double(sh),
-        budgetWidth: budgetDims.width, budgetHeight: budgetDims.height)
-      return ResolvedVideoDimensions(
-        width: fitted.width, height: fitted.height,
-        reason: .sourceAspect,
-        budgetWidth: budgetDims.width, budgetHeight: budgetDims.height,
-        sourceWidth: sw, sourceHeight: sh)
+      return answer(
+        fit(aspect: Double(sourceWidth!) / Double(sourceHeight!),
+            budgetWidth: budgetDims.width, budgetHeight: budgetDims.height),
+        .sourceAspect)
     }
 
-    // t2v with an orientation the budget does not already carry: honour it
-    // instead of rendering the landscape default sideways.
+    // t2v with an orientation the budget does not already carry: orient the
+    // budget rather than render the landscape default sideways. Axis swap
+    // only — the pixel count is preserved exactly.
     if !budgetAlreadyOriented, let target = aspect(fromLabel: aspectRatio) {
-      let fitted = fit(
-        aspect: target,
-        budgetWidth: budgetDims.width, budgetHeight: budgetDims.height)
-      return ResolvedVideoDimensions(
-        width: fitted.width, height: fitted.height,
-        reason: .explicit,
-        budgetWidth: budgetDims.width, budgetHeight: budgetDims.height)
+      let budgetIsPortrait = budgetDims.height > budgetDims.width
+      let wantPortrait = target < 1.0
+      if budgetIsPortrait != wantPortrait, target != 1.0 {
+        return answer(
+          (snap64(budgetDims.height), snap64(budgetDims.width)), .explicit)
+      }
     }
 
     // t2v (or an unreadable source): keep the budget's own shape, /64-snapped.
-    return ResolvedVideoDimensions(
-      width: snap64(budgetDims.width), height: snap64(budgetDims.height),
-      reason: callerSizedBudget ? .explicit : .default,
-      budgetWidth: budgetDims.width, budgetHeight: budgetDims.height,
-      sourceWidth: nil, sourceHeight: nil)
+    return answer(
+      (snap64(budgetDims.width), snap64(budgetDims.height)),
+      callerSizedBudget ? .explicit : .default)
+  }
+
+  /// The FINAL output dims for a render, after the two-stage convention has
+  /// mutated the request dims (`WarmServer.prepareLocalVideo`).
+  ///
+  /// With two-stage on, the request dims handed to the generator are the
+  /// STAGE-1 dims and the refine doubles them back — in both branches: when
+  /// the request halved, and when it was below the stage-1 floor and was
+  /// therefore treated as stage-1 dims outright ("output will be 1408x896").
+  /// So what a caller receives is always 2x what the generator was handed.
+  /// Pure so the reported `resolved_width`/`resolved_height` can be tested
+  /// with two-stage ON, which is the configuration that actually ships
+  /// (comfybox#405 review ruling 2).
+  public static func outputDims(
+    generatorWidth: Int, generatorHeight: Int, twoStage: Bool
+  ) -> (width: Int, height: Int) {
+    twoStage ? (generatorWidth * 2, generatorHeight * 2) : (generatorWidth, generatorHeight)
   }
 }

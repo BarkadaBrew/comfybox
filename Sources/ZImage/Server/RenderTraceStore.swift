@@ -185,6 +185,9 @@ public final class RenderTraceStore: @unchecked Sendable {
     public let dimensionReason: String?
     public let dimensionBudget: String?
     public let sourceSize: String?
+    /// Non-nil only for a two-stage render: the dims stage 1 painted at
+    /// (`resolvedWidth`/`resolvedHeight` are the doubled OUTPUT dims).
+    public let stage1Size: String?
   }
 
   public func recentSummaries(limit: Int = 50) -> [TraceSummary] {
@@ -217,7 +220,8 @@ public final class RenderTraceStore: @unchecked Sendable {
         resolvedHeight: submitted?.payload["resolved_height"],
         dimensionReason: submitted?.payload["dimension_reason"],
         dimensionBudget: submitted?.payload["dimension_budget"],
-        sourceSize: submitted?.payload["source_size"]
+        sourceSize: submitted?.payload["source_size"],
+        stage1Size: submitted?.payload["stage1_size"]
       )
     }
     return summaries
