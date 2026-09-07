@@ -106,6 +106,19 @@ public enum PresetEffectiveRecipePresenter {
     "Name a model on this preset (Make Expandable fills it in from the engine) — "
       + "checkpoint_family alone will not expand it."
 
+  /// #419: one line for the panel's "Detail pass" row — "2 steps · denoise
+  /// 0.2 · dpmpp_2m / karras · eta 0.5" — naming only the fields the stage
+  /// pins (an unstated sampler/schedule inherits the render's).
+  public static func stage2Summary(_ stage2: PresetStage) -> String {
+    var parts: [String] = []
+    if let steps = stage2.steps { parts.append("\(steps) steps") }
+    if let denoise = stage2.denoise { parts.append("denoise " + String(format: "%g", denoise)) }
+    let recipe = [stage2.sampler, stage2.sigmaSchedule].compactMap { $0 }.joined(separator: " / ")
+    if !recipe.isEmpty { parts.append(recipe) }
+    if let eta = stage2.eta, eta != 0 { parts.append("eta " + String(format: "%g", eta)) }
+    return parts.isEmpty ? "on" : parts.joined(separator: " · ")
+  }
+
   /// Compute the effective recipe purely from the declared preset — no
   /// network round trip needed: `ResolvedPreset(preset:)` and
   /// `PresetLoRAStack.decide` are exactly what the engine runs for

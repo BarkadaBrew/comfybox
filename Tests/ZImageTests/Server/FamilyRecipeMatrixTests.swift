@@ -247,4 +247,79 @@ final class FamilyRecipeMatrixTests: XCTestCase {
       SamplingRecipeCatalog.supports(
         sampler: "uni_pc", sigmaSchedule: nil, forModelFamily: "krea2"))
   }
+
+  // MARK: - #419: the family gates the desktop editor enables knobs from
+
+  /// `isRES4LYFSampler` must agree with `SchedulerKind.isRES4LYFFamily` for
+  /// every kind AND accept the alias / prefixed spellings the resolver
+  /// accepts — a preset stored as `exponential/res_2s` is the same sampler.
+  func testCatalogRES4LYFSamplerMatchesTheEnum() {
+    for kind in SchedulerKind.allCases {
+      XCTAssertEqual(
+        SamplingRecipeCatalog.isRES4LYFSampler(kind.rawValue), kind.isRES4LYFFamily, kind.rawValue)
+    }
+    XCTAssertTrue(SamplingRecipeCatalog.isRES4LYFSampler("exponential/res_2s"))
+    XCTAssertTrue(SamplingRecipeCatalog.isRES4LYFSampler("multistep/deis_3m"))
+    XCTAssertFalse(SamplingRecipeCatalog.isRES4LYFSampler("dpmpp_2m"))
+    // nil / empty = model default (euler) — never RES4LYF.
+    XCTAssertFalse(SamplingRecipeCatalog.isRES4LYFSampler(nil))
+    XCTAssertFalse(SamplingRecipeCatalog.isRES4LYFSampler(""))
+    XCTAssertFalse(SamplingRecipeCatalog.isRES4LYFSampler("uni_pc"))
+  }
+
+  /// eta/bongmath, the noise recipe, stage 2 and the VAE override are Krea 2
+  /// dispatch-time fields; shift is krea2 + flux1. An UNKNOWN family answers
+  /// permissively (the editable-while-disconnected rule the catalog already
+  /// follows for sampler names).
+  func testCatalogFamilyGatesMirrorTheEngine() {
+    for family in WarmModelFamily.allCases {
+      let raw = family.rawValue
+      let isKrea2 = family == .krea2
+      XCTAssertEqual(SamplingRecipeCatalog.supportsRES4LYFTiers(forModelFamily: raw), isKrea2, raw)
+      XCTAssertEqual(SamplingRecipeCatalog.supportsRES4LYFNoise(forModelFamily: raw), isKrea2, raw)
+      XCTAssertEqual(SamplingRecipeCatalog.supportsStage2(forModelFamily: raw), isKrea2, raw)
+      XCTAssertEqual(SamplingRecipeCatalog.supportsVAEOverride(forModelFamily: raw), isKrea2, raw)
+      XCTAssertEqual(
+        SamplingRecipeCatalog.acceptsShift(forModelFamily: raw),
+        family == .krea2 || family == .flux1, raw)
+      // The gate must agree with the engine's own answer for a positive shift.
+      XCTAssertEqual(
+        SamplingRecipeCatalog.acceptsShift(forModelFamily: raw),
+        GeneratePayload.validateShift(1.15, family: family) == nil, raw)
+    }
+    for gate in [
+      SamplingRecipeCatalog.supportsRES4LYFTiers(forModelFamily: nil),
+      SamplingRecipeCatalog.supportsRES4LYFNoise(forModelFamily: nil),
+      SamplingRecipeCatalog.supportsStage2(forModelFamily: nil),
+      SamplingRecipeCatalog.supportsVAEOverride(forModelFamily: nil),
+      SamplingRecipeCatalog.acceptsShift(forModelFamily: nil),
+      SamplingRecipeCatalog.acceptsShift(forModelFamily: "/Models/mystery.safetensors"),
+    ] {
+      XCTAssertTrue(gate)
+    }
+    XCTAssertEqual(SamplingRecipeCatalog.shiftLabel(forModelFamily: "krea2-raw"), "Shift (mu)")
+    XCTAssertEqual(SamplingRecipeCatalog.shiftLabel(forModelFamily: "Tongyi-MAI/Z-Image-Turbo"), "Shift (linear)")
+    XCTAssertEqual(SamplingRecipeCatalog.shiftLabel(forModelFamily: nil), "Shift")
+  }
+
+  /// `shiftIsHonoured` is `GeneratePayload.validateShiftSchedule` seen from
+  /// the UI: on flux1 every schedule the family can build agrees with the
+  /// engine gate, the two mu-defined grids are refused, and Krea 2 (whose
+  /// shift IS mu) is left alone.
+  func testCatalogShiftScheduleGateMatchesTheEngine() {
+    for schedule in SigmaScheduleKind.allCases {
+      XCTAssertEqual(
+        SamplingRecipeCatalog.shiftIsHonoured(sigmaSchedule: schedule.rawValue, forModelFamily: "flux1"),
+        GeneratePayload.validateShiftSchedule(1.5, sigmaSchedule: schedule, family: .flux1) == nil,
+        schedule.rawValue)
+      XCTAssertTrue(
+        SamplingRecipeCatalog.shiftIsHonoured(sigmaSchedule: schedule.rawValue, forModelFamily: "krea2"),
+        schedule.rawValue)
+    }
+    XCTAssertFalse(SamplingRecipeCatalog.shiftIsHonoured(sigmaSchedule: "krea2", forModelFamily: "flux1"))
+    XCTAssertFalse(SamplingRecipeCatalog.shiftIsHonoured(sigmaSchedule: "bong_tangent", forModelFamily: "flux1"))
+    XCTAssertTrue(SamplingRecipeCatalog.shiftIsHonoured(sigmaSchedule: "beta", forModelFamily: "flux1"))
+    XCTAssertTrue(SamplingRecipeCatalog.shiftIsHonoured(sigmaSchedule: nil, forModelFamily: "flux1"))
+    XCTAssertTrue(SamplingRecipeCatalog.shiftIsHonoured(sigmaSchedule: "", forModelFamily: "flux1"))
+  }
 }

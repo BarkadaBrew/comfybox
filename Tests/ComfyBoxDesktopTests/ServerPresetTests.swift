@@ -240,6 +240,83 @@ struct ServerPresetTests {
         #expect(dict?["phone_look"] as? Bool == true)
     }
 
+    /// #419: `videoTuning` — the field whose erasure named this whole
+    /// regression class — finally round-trips through the desktop mirror.
+    /// Typed as the engine's own `LTX2VideoTuning`, so the block survives
+    /// verbatim (every key, including ones the desktop has never heard of
+    /// by name) and stays absent when absent.
+    @Test("a desktop save does not erase the preset's video_tuning block")
+    func roundTripPreservesVideoTuning() throws {
+        let wire = #"""
+        {"id":"kira-video","name":"Kira Video","media_kind":"video",
+         "video_tuning":{"guidance_rescale":0.7,"cfg_schedule":[3.5,3.0],"two_stage":true,
+                         "refine_scale":1.5,"delivery_short_edge":480,"sampler":"res_multistep",
+                         "nag_scale":2.5,"reanchor_interval":3}}
+        """#
+        var p = try snakeDecoder().decode(ServerPreset.self, from: Data(wire.utf8))
+        let tuning = try #require(p.videoTuning)
+        #expect(tuning.guidanceRescale == 0.7)
+        #expect(tuning.cfgSchedule == [3.5, 3.0])
+        #expect(tuning.twoStage == true)
+        #expect(tuning.refineScale == 1.5)
+        #expect(tuning.deliveryShortEdge == 480)
+        #expect(tuning.sampler == "res_multistep")
+        #expect(tuning.nagScale == 2.5)
+        #expect(tuning.reanchorInterval == 3)
+
+        p.name = "Renamed"
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let dict = try #require(JSONSerialization.jsonObject(with: encoder.encode(p)) as? [String: Any])
+        let encoded = try #require(dict["video_tuning"] as? [String: Any],
+                                   "a desktop save dropped `video_tuning` — the LTX lane's preset overrides are erased")
+        #expect(encoded["guidance_rescale"] as? Double == 0.7)
+        #expect(encoded["two_stage"] as? Bool == true)
+        #expect(encoded["delivery_short_edge"] as? Int == 480)
+        #expect(encoded["reanchor_interval"] as? Int == 3)
+        #expect((encoded["cfg_schedule"] as? [Double]) == [3.5, 3.0])
+
+        // The panel's ImagePreset carries it too.
+        #expect(p.toImagePreset().videoTuning == tuning)
+
+        // Absent stays absent.
+        let bare = try snakeDecoder().decode(ServerPreset.self, from: Data(#"{"id":"a","name":"A"}"#.utf8))
+        #expect(bare.videoTuning == nil)
+        let bareDict = try #require(JSONSerialization.jsonObject(with: encoder.encode(bare)) as? [String: Any])
+        #expect(bareDict["video_tuning"] == nil)
+    }
+
+    /// #419: Apply carries the SDE / bongmath / shift trio onto Generate —
+    /// the live krea-kira shape (res_2s + eta 0.5 + shift 1.15) used to
+    /// arrive as a plain ODE render at the default shift.
+    @Test("toGenerationPreset carries eta, bongmath and shift")
+    func toGenerationPresetCarriesRecipeTrio() {
+        let p = ServerPreset(
+            id: "krea-kira", name: "Krea-Kira", model: "krea2-raw",
+            sampler: "res_2s", sigmaSchedule: "beta57", shift: 1.15, eta: 0.5, bongmath: true)
+        let g = p.toGenerationPreset()
+        #expect(g.sampler == "res_2s")
+        #expect(g.sigmaSchedule == "beta57")
+        #expect(g.shift == 1.15)
+        #expect(g.eta == 0.5)
+        #expect(g.bongmath == true)
+
+        // Absent stays absent — nil, never a manufactured default.
+        let bare = ServerPreset(id: "b", name: "B").toGenerationPreset()
+        #expect(bare.shift == nil)
+        #expect(bare.eta == nil)
+        #expect(bare.bongmath == nil)
+    }
+
+    /// The panel's `ImagePreset` must see the declared look too (it was
+    /// silently dropped before #419), or the effective recipe lies.
+    @Test("toImagePreset carries style and phone_look")
+    func toImagePresetCarriesStyle() {
+        let p = ServerPreset(id: "k", name: "K", style: "hp5-soft", phoneLook: true)
+        #expect(p.toImagePreset().style == "hp5-soft")
+        #expect(p.toImagePreset().phoneLook == true)
+    }
+
     /// A preset that declares no look stays that way — the additive fields
     /// must never appear in the body a desktop save PUTs back.
     @Test("a preset with no style encodes no style keys")

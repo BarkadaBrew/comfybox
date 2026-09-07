@@ -24,6 +24,14 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
     public var noiseAlpha: Float?
     public var implicitSteps: Int?
     public var c2: Float?
+    /// #419: the RES4LYF SDE / bongmath / schedule-shift trio an applied
+    /// server preset carries onto Generate. Optional so presets written
+    /// before them still decode; nil = model default. Double, like the
+    /// server preset they come from, so a declared 1.15 round-trips as
+    /// 1.15 rather than as Float's 1.1499999761581421.
+    public var eta: Double?
+    public var bongmath: Bool?
+    public var shift: Double?
     public var width: Int
     public var height: Int
     public var sampler: String?
@@ -49,6 +57,9 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         noiseAlpha: Float? = nil,
         implicitSteps: Int? = nil,
         c2: Float? = nil,
+        eta: Double? = nil,
+        bongmath: Bool? = nil,
+        shift: Double? = nil,
         width: Int = 1024,
         height: Int = 1024,
         sampler: String? = nil,
@@ -71,6 +82,9 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         self.noiseAlpha = noiseAlpha
         self.implicitSteps = implicitSteps
         self.c2 = c2
+        self.eta = eta
+        self.bongmath = bongmath
+        self.shift = shift
         self.width = width
         self.height = height
         self.sampler = sampler
@@ -122,6 +136,9 @@ public final class PresetManager {
         noiseAlpha: Float? = nil,
         implicitSteps: Int? = nil,
         c2: Float? = nil,
+        eta: Double? = nil,
+        bongmath: Bool? = nil,
+        shift: Double? = nil,
         width: Int,
         height: Int,
         sampler: String? = nil,
@@ -140,6 +157,9 @@ public final class PresetManager {
             noiseAlpha: noiseAlpha,
             implicitSteps: implicitSteps,
             c2: c2,
+            eta: eta,
+            bongmath: bongmath,
+            shift: shift,
             width: width,
             height: height,
             sampler: sampler,

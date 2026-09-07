@@ -468,6 +468,25 @@ private struct ServerPresetEditor: View {
     @State private var editableLoras: [EditableLora]
     @State private var sampler: String
     @State private var sigmaSchedule: String
+    // #419: the rest of the recipe. Neutral sentinels (eta 0, bongmath off,
+    // gaussian, alpha 0, implicit 0, c2 0.5, projector 1.0, shift nil,
+    // vae "") mean "model default" and are written back as nil — the store
+    // never gets today's default frozen into a preset.
+    @State private var shift: Double?
+    @State private var eta: Double
+    @State private var bongmath: Bool
+    @State private var noiseType: String
+    @State private var noiseAlpha: Double
+    @State private var implicitSteps: Double
+    @State private var c2: Double
+    @State private var projectorScale: Double
+    @State private var vae: String
+    @State private var stage2Enabled: Bool
+    @State private var stage2StepsText: String
+    @State private var stage2DenoiseText: String
+    @State private var stage2Sampler: String
+    @State private var stage2SigmaSchedule: String
+    @State private var stage2Eta: Double
     @State private var saveAsName: String = ""
     @State private var showingSaveAs = false
 
@@ -494,23 +513,75 @@ private struct ServerPresetEditor: View {
             .map { EditableLora(filename: $0.filename, scale: $0.scale, role: $0.role) })
         _sampler = State(initialValue: original.sampler ?? original.scheduler ?? "")
         _sigmaSchedule = State(initialValue: original.sigmaSchedule ?? "")
+        _shift = State(initialValue: original.shift)
+        _eta = State(initialValue: original.eta ?? 0)
+        _bongmath = State(initialValue: original.bongmath ?? false)
+        _noiseType = State(initialValue: original.noiseType ?? "gaussian")
+        _noiseAlpha = State(initialValue: original.noiseAlpha ?? 0)
+        _implicitSteps = State(initialValue: Double(original.implicitSteps ?? 0))
+        _c2 = State(initialValue: original.c2 ?? 0.5)
+        _projectorScale = State(initialValue: original.projectorScale ?? 1.0)
+        _vae = State(initialValue: original.vae ?? "")
+        _stage2Enabled = State(initialValue: original.stage2 != nil)
+        _stage2StepsText = State(initialValue: original.stage2?.steps.map(String.init) ?? "")
+        _stage2DenoiseText = State(initialValue: original.stage2?.denoise.map { String(format: "%g", $0) } ?? "")
+        _stage2Sampler = State(initialValue: original.stage2?.sampler ?? "")
+        _stage2SigmaSchedule = State(initialValue: original.stage2?.sigmaSchedule ?? "")
+        _stage2Eta = State(initialValue: original.stage2?.eta ?? 0)
     }
 
+    /// The family the sampling gates key on. #419: the engine's own answer
+    /// for the current `model` text (`GET /v1/model/family`, kept fresh by
+    /// `.task(id: model)`) wins when it has one — a bare custom path such as
+    /// `/Models/foo.safetensors` names no family the catalog can read, and
+    /// the gates would otherwise fall back to "unknown = permissive". Until
+    /// the answer arrives (or offline) the text itself is what the catalog
+    /// infers from.
     private var samplingModelFamily: String? {
+        if let family = detectedModelFamily?.family, !family.isEmpty { return family }
         let edited = model.trimmingCharacters(in: .whitespacesAndNewlines)
         if !edited.isEmpty { return edited }
         return original.customModelPath ?? original.model
     }
 
+    /// #419: the whole recipe as the editor currently holds it, with the
+    /// neutral sentinels already collapsed to nil. `buildPreset()` writes
+    /// exactly this; `samplingValidationError` validates exactly this.
+    private var samplingDraft: PresetSamplingDraft {
+        let trimmedVAE = vae.trimmingCharacters(in: .whitespacesAndNewlines)
+        return PresetSamplingDraft(
+            modelFamily: samplingModelFamily,
+            sampler: sampler,
+            sigmaSchedule: sigmaSchedule,
+            shift: shift,
+            eta: eta == 0 ? nil : eta,
+            bongmath: bongmath ? true : nil,
+            noiseType: noiseType == "gaussian" ? nil : noiseType,
+            noiseAlpha: noiseAlpha == 0 ? nil : noiseAlpha,
+            implicitSteps: implicitSteps == 0 ? nil : Int(implicitSteps),
+            c2: c2 == 0.5 ? nil : c2,
+            projectorScale: projectorScale == 1.0 ? nil : projectorScale,
+            vae: trimmedVAE.isEmpty ? nil : trimmedVAE,
+            stage2Enabled: stage2Enabled,
+            stage2Steps: Int(stage2StepsText.trimmingCharacters(in: .whitespaces)),
+            stage2Denoise: Double(stage2DenoiseText.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")),
+            stage2Sampler: stage2Sampler,
+            stage2SigmaSchedule: stage2SigmaSchedule,
+            stage2Eta: stage2Eta == 0 ? nil : stage2Eta
+        )
+    }
+
+    /// nil = the engine would accept this recipe on the preset's family.
+    /// Non-nil blocks Save (and Save as New). Every rule is an engine gate
+    /// mirrored in `PresetSamplingValidator`, so the store never receives a
+    /// recipe that only fails once Bree renders it.
     private var samplingValidationError: String? {
-        guard !sampler.isEmpty || !sigmaSchedule.isEmpty else { return nil }
-        guard !SamplingRecipeCatalog.supports(
-            sampler: sampler.isEmpty ? nil : sampler,
-            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
-            forModelFamily: samplingModelFamily
-        ) else { return nil }
-        let family = SamplingRecipeCatalog.canonicalFamily(samplingModelFamily) ?? "this model"
-        return "The selected sampler/scheduler pair is not supported by \(family)."
+        PresetSamplingValidator.validationError(samplingDraft)
+    }
+
+    private var stage2SDEAllowed: Bool {
+        SamplingGate.stage2SDEAllowed(
+            modelFamily: samplingModelFamily, stage2Sampler: stage2Sampler, stage1Sampler: sampler)
     }
 
     var body: some View {
@@ -537,12 +608,12 @@ private struct ServerPresetEditor: View {
                         TextField("Guidance", text: $guidanceText).frame(width: 90)
                         Spacer()
                     }
-                    SamplingRecipePicker(
-                        sampler: $sampler,
-                        sigmaSchedule: $sigmaSchedule,
-                        modelFamily: samplingModelFamily,
-                        showsExplanation: true
-                    )
+                }
+                Section("Sampling") {
+                    samplingSection
+                }
+                Section("Detail pass (stage 2)") {
+                    stage2Section
                 }
                 Section("LoRAs") {
                     loraRows
@@ -571,7 +642,7 @@ private struct ServerPresetEditor: View {
             }
             .padding()
         }
-        .frame(minWidth: 560, idealWidth: 620, minHeight: 590, idealHeight: 680)
+        .frame(minWidth: 560, idealWidth: 640, minHeight: 720, idealHeight: 860)
         .task {
             // #277 / review r2 (I5): cross-check against the live engine
             // once per sheet appearance, by actually COMPARING its resolved
@@ -636,6 +707,100 @@ private struct ServerPresetEditor: View {
         }
     }
 
+    // MARK: - Sampling (#419)
+
+    /// Sampler + schedule (the existing family-aware picker), then the shared
+    /// RES4LYF knobs — the SAME `SamplingAdvancedControls` the Generate panel
+    /// shows, so the eta/bongmath gate exists once — plus the Krea 2 VAE
+    /// override. Each control disables (and resets to neutral) where the
+    /// family or sampler does not honour it; `samplingValidationError` is the
+    /// backstop that blocks Save on anything the engine would refuse.
+    @ViewBuilder
+    private var samplingSection: some View {
+        SamplingRecipePicker(
+            sampler: $sampler,
+            sigmaSchedule: $sigmaSchedule,
+            modelFamily: samplingModelFamily,
+            showsExplanation: true
+        )
+        SamplingAdvancedControls(
+            shift: $shift,
+            projectorScale: $projectorScale,
+            eta: $eta,
+            bongmath: $bongmath,
+            noiseType: $noiseType,
+            noiseAlpha: $noiseAlpha,
+            implicitSteps: $implicitSteps,
+            c2: $c2,
+            sampler: sampler,
+            sigmaSchedule: sigmaSchedule,
+            modelFamily: samplingModelFamily
+        )
+        if SamplingGate.vaeAllowed(modelFamily: samplingModelFamily) {
+            TextField("VAE (path; empty = model directory's VAE)", text: $vae)
+                .help("Krea 2 decode VAE override — e.g. the Wan 2.1 VAE. Empty = the model directory's own VAE.")
+        }
+        // The pair error is the picker's own to show (above); this label
+        // covers every OTHER rule so a refusal is never reported twice.
+        if let error = samplingValidationError, pairIsSupported {
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+        }
+    }
+
+    private var pairIsSupported: Bool {
+        SamplingRecipeCatalog.supports(
+            sampler: sampler.isEmpty ? nil : sampler,
+            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
+            forModelFamily: samplingModelFamily)
+    }
+
+    /// The optional second stage (WP-E17, Krea 2 only): re-noises the latent
+    /// to the stretched tail and solves again. Needs steps AND denoise; its
+    /// sampler/schedule default to the render's; `stage2.eta` follows the
+    /// RES4LYF rule on whichever sampler the stage actually runs.
+    /// `stage2.bongmath` is deliberately not offered — the engine 400s it as
+    /// unimplemented (tier T3).
+    @ViewBuilder
+    private var stage2Section: some View {
+        let allowed = SamplingGate.stage2Allowed(modelFamily: samplingModelFamily)
+        Toggle("Run a detail pass after the main render", isOn: $stage2Enabled)
+            .disabled(!allowed)
+            .onChange(of: allowed, initial: true) { _, allowed in
+                if !allowed { stage2Enabled = false }
+            }
+        if !allowed {
+            Text("A detail pass is a Krea 2 mechanism; \(SamplingRecipeCatalog.canonicalFamily(samplingModelFamily) ?? "this model") has no such seam.")
+                .font(.caption2).foregroundStyle(.tertiary)
+        } else if stage2Enabled {
+            HStack {
+                TextField("Steps", text: $stage2StepsText).frame(width: 90)
+                TextField("Denoise (0–1]", text: $stage2DenoiseText).frame(width: 110)
+                Spacer()
+            }
+            Text("Steps and denoise are both required. Denoise is the fraction of the schedule the stage re-runs (e.g. 0.2).")
+                .font(.caption2).foregroundStyle(.tertiary)
+            SamplingRecipePicker(
+                sampler: $stage2Sampler,
+                sigmaSchedule: $stage2SigmaSchedule,
+                modelFamily: samplingModelFamily,
+                showsExplanation: false
+            )
+            Text("Model Default here means the main render's sampler / scheduler.")
+                .font(.caption2).foregroundStyle(.tertiary)
+            NumericSliderField(label: "Eta (SDE)", value: $stage2Eta, range: 0...1, step: 0.05, fractionDigits: 2)
+                .disabled(!stage2SDEAllowed)
+                .onChange(of: stage2SDEAllowed, initial: true) { _, allowed in
+                    if !allowed { stage2Eta = 0 }
+                }
+            if !stage2SDEAllowed {
+                Text("Stage 2 eta needs a RES4LYF sampler on the stage (its own, or the main render's when left at Model Default).")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+    }
+
     // MARK: - Effective recipe (#277)
 
     /// What `POST /v1/generate {"preset": id}` would actually run for the
@@ -674,6 +839,20 @@ private struct ServerPresetEditor: View {
                 let recipeLine = [recipe.sampler, recipe.sigmaSchedule].compactMap { $0 }.joined(separator: " / ")
                 if !recipeLine.isEmpty {
                     LabeledContent("Sampler / schedule", value: recipeLine)
+                }
+                // #419: the rest of the recipe `ResolvedPreset` carries.
+                if let shift = recipe.shift {
+                    LabeledContent(SamplingRecipeCatalog.shiftLabel(forModelFamily: samplingModelFamily),
+                                   value: String(format: "%g", shift))
+                }
+                if let eta = recipe.eta, eta != 0 {
+                    LabeledContent("Eta (SDE)", value: String(format: "%g", eta))
+                }
+                if recipe.bongmath == true {
+                    LabeledContent("Bongmath", value: "on")
+                }
+                if let stage2 = recipe.stage2 {
+                    LabeledContent("Detail pass", value: PresetEffectiveRecipePresenter.stage2Summary(stage2))
                 }
                 if recipe.loraStack.isEmpty {
                     Text("No LoRAs applied").font(.caption2).foregroundStyle(.secondary)
@@ -888,6 +1067,30 @@ private struct ServerPresetEditor: View {
         // Keep the legacy sampler spelling synchronized for older preset
         // consumers; modern engine validation and Generate use `sampler`.
         p.scheduler = p.sampler
+        // #419: the rest of the recipe, from the same draft the validator
+        // sees — neutral sentinels are already nil there, so a preset never
+        // has today's default frozen into it.
+        let draft = samplingDraft
+        p.shift = draft.shift
+        p.eta = draft.eta
+        p.bongmath = draft.bongmath
+        p.noiseType = draft.noiseType
+        p.noiseAlpha = draft.noiseAlpha
+        p.implicitSteps = draft.implicitSteps
+        p.c2 = draft.c2
+        p.projectorScale = draft.projectorScale
+        p.vae = draft.vae
+        // `stage2.bongmath` is never written: the engine 400s it as
+        // unimplemented (tier T3), so the editor does not offer it.
+        p.stage2 = draft.stage2Enabled
+            ? ServerPresetStage(
+                sampler: draft.stage2Sampler.isEmpty ? nil : draft.stage2Sampler,
+                sigmaSchedule: draft.stage2SigmaSchedule.isEmpty ? nil : draft.stage2SigmaSchedule,
+                steps: draft.stage2Steps,
+                denoise: draft.stage2Denoise,
+                eta: draft.stage2Eta,
+                bongmath: nil)
+            : nil
         // Todd 2026-09-04: kroma is a regular LoRA — `loras[]` (editableLoras)
         // is the single source. Review r2, C1 (Critical): `p.kroma` is a
         // DEPRECATED, derived, read-only echo — carrying `original.kroma`
@@ -922,6 +1125,12 @@ struct SavePresetSheet: View {
     var height: Int
     var sampler: String = ""
     var sigmaSchedule: String = ""
+    /// #419: the RES4LYF knobs the Generate panel already holds — shown so
+    /// the user sees they are part of what gets saved. 0 / false / nil =
+    /// model default (not shown).
+    var eta: Double = 0
+    var bongmath: Bool = false
+    var shift: Double? = nil
     /// (name, negativePrompt) — the sheet lets the user edit the negative
     /// prompt before saving, so the callback returns the edited value.
     var onSave: (String, String) -> Void
@@ -953,6 +1162,15 @@ struct SavePresetSheet: View {
                     LabeledContent("Resolution", value: "\(width) x \(height)")
                     LabeledContent("Sampler", value: sampler.isEmpty ? "Model Default" : sampler)
                     LabeledContent("Scheduler", value: sigmaSchedule.isEmpty ? "Model Default" : sigmaSchedule)
+                    if let shift {
+                        LabeledContent("Shift", value: String(format: "%g", shift))
+                    }
+                    if eta != 0 {
+                        LabeledContent("Eta (SDE)", value: String(format: "%g", eta))
+                    }
+                    if bongmath {
+                        LabeledContent("Bongmath", value: "on")
+                    }
                     if let model = modelId {
                         LabeledContent("Model", value: model)
                     }
@@ -988,7 +1206,7 @@ struct SavePresetSheet: View {
             }
             .padding()
         }
-        .frame(width: 420, height: 440)
+        .frame(width: 420, height: 500)
         .onAppear {
             if !didSeedNegative {
                 editedNegative = negativePrompt

@@ -47,6 +47,24 @@ struct PresetEffectiveRecipeTests {
         #expect(recipe.loraStack[1].scale == 0.6)
     }
 
+    /// #419: the panel now shows bongmath and the detail pass — both were
+    /// already on `EffectiveRecipe`, just never rendered.
+    @Test("bongmath and stage2 are carried through, and summarised for the panel")
+    func bongmathAndStage2Carried() throws {
+        var preset = Self.kreaKira
+        preset.bongmath = true
+        preset.stage2 = PresetStage(sampler: "dpmpp_2m", sigmaSchedule: "karras", steps: 2, denoise: 0.2, eta: 0.5)
+        let recipe = PresetEffectiveRecipePresenter.compute(declared: preset)
+        #expect(recipe.bongmath == true)
+        #expect(recipe.stage2?.steps == 2)
+        #expect(recipe.stage2?.denoise == 0.2)
+        let summary = PresetEffectiveRecipePresenter.stage2Summary(try #require(recipe.stage2))
+        #expect(summary == "2 steps · denoise 0.2 · dpmpp_2m / karras · eta 0.5")
+        // Only pinned fields are named; a bare declaration reads "on".
+        #expect(PresetEffectiveRecipePresenter.stage2Summary(PresetStage()) == "on")
+        #expect(PresetEffectiveRecipePresenter.stage2Summary(PresetStage(steps: 3, denoise: 0.3)) == "3 steps · denoise 0.3")
+    }
+
     @Test("no model and no checkpoint_family: unresolved no_model, with the #359 hint")
     func noModelIsUnresolvedWithHint() {
         let preset = ImagePreset(

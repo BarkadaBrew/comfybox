@@ -49,6 +49,11 @@ public struct GenerationRequest: Sendable {
     public var implicitSteps: Int
     /// RES4LYF `res_2s` / `res_3s` substep location.
     public var c2: Float
+    /// Explicit schedule shift (#419): Krea 2 reads it as `mu`, Z-Image as a
+    /// linear sigma warp. nil = the model's resolution-dependent default —
+    /// what an applied preset's `shift` (e.g. krea-kira's 1.15) needs to
+    /// survive the Generate path instead of being dropped on the floor.
+    public var shift: Float?
 
     public init(
         prompt: String = "",
@@ -64,6 +69,7 @@ public struct GenerationRequest: Sendable {
         noiseAlpha: Float = 0.0,
         implicitSteps: Int = 0,
         c2: Float = 0.5,
+        shift: Float? = nil,
         sampler: String? = nil,
         sigmaSchedule: String? = nil,
         seed: UInt64 = 0,
@@ -94,6 +100,7 @@ public struct GenerationRequest: Sendable {
         self.noiseAlpha = noiseAlpha
         self.implicitSteps = implicitSteps
         self.c2 = c2
+        self.shift = shift
     }
 }
 
@@ -658,6 +665,12 @@ public final class EngineService {
         }
         if request.c2 != 0.5 {
             payloadDict["c2"] = request.c2
+        }
+        // #419: an explicit schedule shift (preset-applied or typed). Absent
+        // = the engine's resolution-dependent default, byte-identical to
+        // before this field existed.
+        if let shift = request.shift, shift.isFinite, shift > 0 {
+            payloadDict["shift"] = shift
         }
 
         return attachingContentMode(payloadDict, mode: contentMode)
