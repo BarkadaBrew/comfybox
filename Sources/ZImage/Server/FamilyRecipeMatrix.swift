@@ -45,17 +45,26 @@ struct FamilyRecipeCapability: Sendable {
   let pairIsSupported: @Sendable (SchedulerKind, SigmaScheduleKind) -> Bool
   /// Why a rejected pair is rejected — appended to the 400.
   let pairRejectionReason: String
+  /// #399: does this family's save path run the ``StylePack`` post-process?
+  ///
+  /// The pass lives in `runKrea2Generate` and nowhere else, so on every other
+  /// family a `style` (or `phone_look`) would be accepted, reported, and then
+  /// silently skipped — the exact class of silence this whole table exists to
+  /// end. A family that grows the pass flips this flag in the same commit.
+  let appliesStylePack: Bool
 
   init(
     samplers: Set<SchedulerKind>,
     sigmaSchedules: Set<SigmaScheduleKind>,
     pairIsSupported: @escaping @Sendable (SchedulerKind, SigmaScheduleKind) -> Bool = { _, _ in true },
-    pairRejectionReason: String = ""
+    pairRejectionReason: String = "",
+    appliesStylePack: Bool = false
   ) {
     self.samplers = samplers
     self.sigmaSchedules = sigmaSchedules
     self.pairIsSupported = pairIsSupported
     self.pairRejectionReason = pairRejectionReason
+    self.appliesStylePack = appliesStylePack
   }
 
   func isPairSupported(sampler: SchedulerKind, schedule: SigmaScheduleKind) -> Bool {
@@ -80,7 +89,9 @@ enum FamilyRecipeMatrix {
   /// only one that builds the `krea2` and `bong_tangent` grids.
   private static let krea2 = FamilyRecipeCapability(
     samplers: Set(SchedulerKind.allCases),
-    sigmaSchedules: Set(SigmaScheduleKind.allCases))
+    sigmaSchedules: Set(SigmaScheduleKind.allCases),
+    // #399: the StylePack post-process pass is in `runKrea2Generate` only.
+    appliesStylePack: true)
 
   /// Chroma's three native modes collapse a sampler and a schedule into one
   /// `ChromaSchedulerType`: euler = flow grid + euler step, heun = flow grid +
@@ -120,6 +131,34 @@ enum FamilyRecipeMatrix {
   /// Only EXPLICIT fields are gated — `names.scheduler`/`names.sigmaSchedule`
   /// are `nil` when the caller sent nothing, and each family's own default
   /// then applies untouched.
+  /// #399 — `nil` when this family's save path runs the ``StylePack`` pass or
+  /// the request asked for no look; otherwise the 400 to return.
+  ///
+  /// `style` here is the RESOLVED name (`WarmServer.decodedGeneratePayload`
+  /// has already collapsed `phone_look` and the preset's declaration onto it
+  /// and refused an unknown one), so this gate answers exactly one question:
+  /// can the family that is about to render actually apply it?
+  static func validateStyle(_ style: String?, family: WarmModelFamily) -> WarmServerError? {
+    guard let style, !style.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+          !capability(for: family).appliesStylePack
+    else { return nil }
+    return .unsupportedRecipeField(
+      field: "style", value: style, family: family.rawValue,
+      reason: "engine-applied style packs are a Krea 2 post-process (#399) — this family's save "
+        + "path has no such pass, so the look would have been accepted and then silently skipped. "
+        + "Supported here: " + stylePackFamilyNames().joined(separator: ", ")
+        + ". Remove `style` / `phone_look`, or render on one of those")
+  }
+
+  /// Families whose save path runs the pass — named in the 400 above and in
+  /// `docs/PARITY.md`, from this one table rather than a hand-kept list.
+  static func stylePackFamilyNames() -> [String] {
+    WarmModelFamily.allCases
+      .filter { capability(for: $0).appliesStylePack }
+      .map(\.rawValue)
+      .sorted()
+  }
+
   static func validate(
     _ names: ResolvedRecipeNames, family: WarmModelFamily
   ) -> WarmServerError? {

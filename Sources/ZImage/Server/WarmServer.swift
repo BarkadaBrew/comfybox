@@ -5514,9 +5514,21 @@ public final class WarmServer {
     // wrong base, and there is no such hazard here. That also preserves the
     // lane's shipped behaviour, where the look was read straight off the
     // preset with no expansion involved.
+    //
+    // (PR #407 review, ruling 2): `lookup` returns the preset AND its validity
+    // flag (WP-E20 / AC-44c). A preset the store flagged INVALID contributes
+    // NOTHING — not its stack, not its model, and not its look. Reading only
+    // `.0` here would have adopted a look off a document the engine has
+    // already refused to trust; an invalid preset is treated exactly like an
+    // unresolvable one, and the response still carries
+    // `preset_unresolved_reason: "invalid_preset"` from the expansion above.
     let declaredPreset: ImagePreset? = payload.preset
       .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-      .flatMap { $0.isEmpty ? nil : store.lookup($0).0 }
+      .flatMap { id -> ImagePreset? in
+        guard !id.isEmpty else { return nil }
+        let (found, invalidReason) = store.lookup(id)
+        return invalidReason == nil ? found : nil
+      }
     expanded.style = StylePack.resolveName(
       requestStyle: payload.style, requestPhoneLook: payload.phoneLook,
       presetStyle: declaredPreset?.style, presetPhoneLook: declaredPreset?.phoneLook)
@@ -10699,6 +10711,14 @@ private actor WarmServerCoordinator {
       continuation.resume(throwing: error)
       return
     }
+    // #399 (PR #407 review, ruling 1): a style pack must never be a silent
+    // no-op. The pass runs in `runKrea2Generate` only, so every other arm of
+    // the dispatch below refuses the look here instead of dropping it.
+    if let error = GeneratePayload.styleGate(payload, family: currentModelFamily) {
+      lastError = error.localizedDescription ?? "unsupported style"
+      continuation.resume(throwing: error)
+      return
+    }
 
     switch currentModelFamily {
     case .chroma:
@@ -11137,6 +11157,37 @@ private actor WarmServerCoordinator {
       // loop just counted. `steps`/`guidance` above are NOT consulted here.
       // Fail CLOSED on an incomplete read-back: a record naming two of three
       // adapters is worse than no record, because it reads as complete.
+      // #399 — the engine-applied style pack (Todd 2026-08-24): a pure CPU
+      // pass over the decoded RGB buffer. Runs HERE, before the provenance
+      // record is built (PR #407 review, ruling 3), so `applied.style` and
+      // the PNG's `style` name the look that was actually applied rather than
+      // the one the request asked for — every other field of that record is a
+      // read-back and this one is too.
+      //
+      // An ABSENT style skips the whole block: `image` is never read out of
+      // MLX, never rebuilt, never written, so a render that asked for no look
+      // is byte-identical to the pre-#399 engine (`StylePackParityTests`).
+      // The name was validated at the decode and the FAMILY was gated at
+      // dispatch (`GeneratePayload.styleGate`), so reaching here with a look
+      // means this save path can apply it.
+      //
+      // DTYPE (ruling 4): `asArray(Float.self)` widens whatever the decoder
+      // produced to float32 and `MLXArray(px, …)` would rebuild it as float32.
+      // The rebuild is cast back to the decoder's own dtype, so a styled
+      // render hands `saveImage` an array of the SAME dtype an unstyled one
+      // does — the post-process changes the pixels, never the buffer's type.
+      // (The recipes are defined on [0,1] floats; the widening is internal to
+      // the pass and does not survive it.)
+      var appliedStyle: String?
+      if let style = StylePack.resolved(payload.style) {
+        let hDim = image.dim(0), wDim = image.dim(1)
+        let decodedDType = image.dtype
+        var px: [Float] = image.asArray(Float.self)
+        style.apply(pixels: &px, width: wDim, height: hDim)
+        image = MLXArray(px, [hDim, wDim, 3]).asType(decodedDType)
+        appliedStyle = style.rawValue
+        logger.info("Krea2: applied style pack '\(style.rawValue)' after decode")
+      }
       let loraReadBacks = RenderRecipe.loRAReadBacks(
         configs: k2.loadedLoRAConfigs, reports: k2.loadedLoRAReports,
         // I6: the relativity the guard ENFORCED, so `relative_to` names what
@@ -11163,7 +11214,9 @@ private actor WarmServerCoordinator {
           // D4 / WP-E17: every stage that ran, so `applied.stages[]` and
           // `model_evals_total` describe the whole render rather than its
           // first half.
-          traces: traces))
+          traces: traces,
+          // #399: the look this render actually carries out of the save path.
+          style: appliedStyle))
       }
       // Sink 2 — the PNG. The negative comes from the TRACE (K-FIX-1 / I4):
       // absent when CFG never ran (AC-61), and an applied `""` is written as
@@ -11186,19 +11239,13 @@ private actor WarmServerCoordinator {
         loras: k2.loadedLoRAConfigs,
         // The SLOT, so a refused record writes `"applied": null` in the file
         // rather than looking like a family that has no record (round 2, C4).
-        appliedSlot: AppliedRecordSlot(record: record)
+        appliedSlot: AppliedRecordSlot(record: record),
+        // #399: a top-level `style` too, not only `applied.style` — the record
+        // can be REFUSED (`loraReadBacks == nil` writes `"applied": null`) and
+        // the file would then carry no trace of a look that was applied to
+        // its pixels.
+        style: appliedStyle
       )
-      if let style = StylePack.resolved(payload.style) {
-        // Engine-applied style pack (Todd 2026-08-24): pure CPU pass — see
-        // StylePack.swift for the recipes and their numbers. The decode
-        // validated the name; phoneLook:true arrives here as style "phone".
-        // An ABSENT style leaves `image` untouched, so a render that asked
-        // for no look is byte-identical to the pre-#399 engine.
-        let hDim = image.dim(0), wDim = image.dim(1)
-        var px: [Float] = image.asArray(Float.self)
-        style.apply(pixels: &px, width: wDim, height: hDim)
-        image = MLXArray(px, [hDim, wDim, 3])
-      }
       try QwenImageIO.saveImage(array: image.transposed(2, 0, 1), to: outputURL, metadata: metadata)
 
       let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
@@ -12844,6 +12891,26 @@ extension GeneratePayload: Decodable {
     return .unsupportedRecipeField(
       field: "vae", value: vae, family: family.rawValue,
       reason: "VAE selection is a Krea 2 request field (WP-E9); this family decodes through its own VAE and does not honour it — remove it")
+  }
+
+  /// #399, the same shape for `style` / `phone_look`: the ``StylePack``
+  /// post-process pass exists in `runKrea2Generate` and nowhere else, so on
+  /// any other family a resolved look would be accepted at the decode,
+  /// reported back, and then never applied. Refused at DISPATCH (D18: family
+  /// gates live where the family is known, not at the decoder), which is the
+  /// one point `/v1/generate`, `/v1/generate/async`, crash-recovery replay,
+  /// preemption and the ComfyUI bridge all funnel through — every one of them
+  /// reaches the render via `enqueueGenerate` → `runGenerate`.
+  ///
+  /// `phoneLook` is read too, not just `style`: the decode collapses the
+  /// alias, but a payload built in-process (the bridge, a test) can carry the
+  /// boolean alone, and "the request asked for a look" is the thing being
+  /// gated.
+  static func styleGate(_ payload: GeneratePayload, family: WarmModelFamily) -> WarmServerError? {
+    let asked = StylePack.resolveName(
+      requestStyle: payload.style, requestPhoneLook: payload.phoneLook,
+      presetStyle: nil, presetPhoneLook: nil)
+    return FamilyRecipeMatrix.validateStyle(asked, family: family)
   }
 
   /// K-FIX-1 / Codex I5: refuse a sampler / sigma schedule the ACTIVE FAMILY

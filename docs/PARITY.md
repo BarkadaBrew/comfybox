@@ -51,7 +51,7 @@
 |---|---|
 | ESRGAN / RRDBNet | ✅ Working (`upscale`) |
 | SeedVR2 super-resolution | 🟡 Working @1024px; 2048px experimental (OOM risk) |
-| Style packs — engine-applied post-process looks (`phone`, `trix-bw`, `hp5-soft`) | ✅ Working (#399) — pure CPU pass after decode, request/preset selected; ComfyUI has no equivalent single node (it is an image-op subgraph there) |
+| Style packs — engine-applied post-process looks (`phone`, `trix-bw`, `hp5-soft`) | ✅ Working (#399) — pure CPU pass after decode, request/preset selected, **Krea 2 only** (a 400 on every other family, never a silent skip); recorded as `applied.style` + the PNG's `style`. ComfyUI has no equivalent single node (it is an image-op subgraph there) |
 
 ## Samplers / schedulers
 | Capability | Status |

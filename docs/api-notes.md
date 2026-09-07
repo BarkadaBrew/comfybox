@@ -424,6 +424,17 @@ Names are matched trimmed and case-insensitively. An **unknown** name is a
 save time — and a preset that declares an unknown style is refused at
 `POST /v1/presets` upsert for the same reason.
 
+**Krea 2 only, and refused elsewhere.** The pass runs in the Krea 2 save path
+and nowhere else. A `style` (or `phone_look`) on a request that will render on
+`chroma`, `fibo`, `flux1` or `flux2` is a **400 at dispatch** naming the field,
+the value, the family and the family that can honour it — never accepted,
+reported back and then silently skipped. The capability is one flag
+(`appliesStylePack`) in `FamilyRecipeMatrix`, beside the sampler and
+sigma-schedule rows, so a family that grows the pass declares it in the same
+commit; the refusal runs at the single point `/v1/generate`,
+`/v1/generate/async`, crash-recovery replay, preemption and the ComfyUI bridge
+all funnel through (`enqueueGenerate` → `runGenerate`).
+
 **Wire fields (additive; both optional, both absent = no post-process at all).**
 
 ```json
@@ -464,7 +475,32 @@ landing on the wrong base; a post-process has no base to land on.
 
 **Read from the DECLARED preset, never from `ResolvedPreset`** — the same rule
 as `steps`/`guidance`/`vae`/`shift` — so `PresetDefaults` can never manufacture
-a look nobody asked for.
+a look nobody asked for. A preset the store flagged **invalid** (WP-E20,
+AC-44c) contributes nothing, its look included: `PresetStore.lookup` returns
+the preset *and* its validity flag, and both are read.
+
+**Provenance.** A styled render records the look it applied in two places, both
+read back after the pass rather than echoed from the request:
+
+* `applied.style` on the `/v1/generate` response, `/health.last_recipe` and the
+  PNG's embedded `applied` block — the `RenderRecipe` field;
+* a top-level `style` key in the PNG parameter JSON, because the provenance
+  record can be *refused* (`"applied": null` when the LoRA read-backs are
+  incomplete) and the file must still say which look its pixels carry.
+
+Both keys are **absent** when no look ran, so an unstyled render's response,
+record and PNG bytes are identical to the pre-#399 engine's.
+
+**Buffer dtype.** The pass reads the decoded image into a `[Float]`, applies a
+pure recipe, and rebuilds the MLX array **cast back to the decoder's own
+dtype** — a styled render hands the PNG writer an array of the same type an
+unstyled one does. The float32 widening is internal to the pass.
+
+**Spelling on disk vs on the wire.** `POST /v1/presets` decodes
+`.convertFromSnakeCase`, so a client sends `phone_look`. `~/.comfybox/presets.json`
+is written and read with a plain coder, so the file spells the same field
+`phoneLook` (`style` is one word either way). Both reach the same
+`ImagePreset` fields; a hand-edited presets.json must use the camelCase form.
 
 ## Gallery output filenames
 
