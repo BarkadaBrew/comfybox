@@ -312,4 +312,47 @@ struct AssetIngestorTests {
         #expect(doneValues.sorted() == [1, 2, 3, 4, 5])
         #expect(doneValues.last == 5)
     }
+
+    // MARK: - comfybox#401 review round 2, ruling 1: video generation-record
+    // sidecar parity fields (guidance, content_mode, source) read back
+    // through the real ingest pipeline, not just decoded in isolation.
+
+    /// The JSON literal below is the exact shape
+    /// `VideoGenerationRecord.encodeJSON()` (Sources/ZImage/LTX2/
+    /// VideoGenerationRecord.swift) produces — `.convertToSnakeCase`
+    /// applied to its properties — reproduced by hand here rather than
+    /// constructed via that type, because this test target does not depend
+    /// on ZImage (only on ComfyBoxDesktop, which does). `VideoGenerationRecordTests`
+    /// (ZImageTests) pins the encoder itself; this test pins the OTHER half
+    /// of the contract — that `AssetIngestor` actually reads what the
+    /// encoder writes. The seed exceeds Int32.max (ruling 4) so this test
+    /// also proves a real production-magnitude seed survives the full
+    /// sidecar -> readSidecar -> DAMAsset path, not just the isolated
+    /// `as? Int` cast `VideoGenerationRecordTests` checks.
+    @Test("a video's generation-record sidecar round-trips guidance/content_mode/source/seed into DAMAsset")
+    @MainActor
+    func videoSidecarCarriesGenerationRecordFieldsIntoDAMAsset() async throws {
+        let env = try await makeEnvironment()
+        let clipPath = writeFile("clip.mp4", in: env.watchDir, contents: "not-a-real-mp4")
+        _ = writeFile(
+            "clip.json", in: env.watchDir,
+            contents: """
+            {"prompt":"a fox running through snow","seed":5000000123,"steps":8,\
+            "guidance":3.5,"model":"transformer-distilled","content_mode":"apple",\
+            "source":"bree","kind":"i2v","width":704,"height":448,"frames":97,"fps":24,\
+            "resolved_width":704,"resolved_height":448,"two_pass":false,"refine":false,\
+            "audio":false,"loras":[{"name":"motion_v2","scale":0.8}]}
+            """)
+
+        let stored = try await env.ingestor.ingestFile(at: clipPath)
+
+        #expect(stored.kind == "video")
+        #expect(stored.prompt == "a fox running through snow")
+        #expect(stored.seed == 5_000_000_123, "a seed above Int32.max must not silently drop")
+        #expect(stored.steps == 8)
+        #expect(stored.guidance == 3.5)
+        #expect(stored.contentMode == "apple")
+        #expect(stored.source == "bree")
+        #expect(stored.modelFamily == "transformer-distilled")
+    }
 }

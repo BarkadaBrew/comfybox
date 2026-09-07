@@ -2661,7 +2661,15 @@ public final class WarmServer {
       tuning: Self.effectiveVideoTuning(for: req),
       presetTuning: videoPreset?.videoTuning,
       audio: req.audio ?? false,
-      beatSchedule: effectiveBeatSchedule
+      beatSchedule: effectiveBeatSchedule,
+      // comfybox#401 (review round 2, ruling 1): carried through only for
+      // the generation record — same values (and same absence-means-unset
+      // convention) as the PNG side's `source`/`content_mode`. `source`
+      // mirrors the `req.source ?? "api"` default `PreparedLocalVideo`
+      // resolves for the mode/audit fields, so the record and the job
+      // status agree on who submitted this render.
+      source: req.source ?? "api",
+      contentMode: req.contentMode
     )
   }
 
@@ -5271,11 +5279,38 @@ public final class WarmServer {
     auditLog.append(
       kind: "video.storyboard",
       message: "\(spec.shots.count) shots -> \(resolvedOutput)", metadata: [:])
+
+    // comfybox#401: each per-shot clip already got its own sidecar+atom via
+    // `LTX2VideoGenerator.render` (the storyboard's i2v shots go through the
+    // same `prepareLocalVideo` -> `generate` path every other video route
+    // does). The FINAL assembled clip does not — `MontageComposer` is a
+    // different writer (composition/export, not `LTX2PostProcess.writeMP4`)
+    // — so it gets its own aggregate record here. Sidecar only (ruling 2's
+    // "mandatory" half); no single request's seed/steps/model apply to an
+    // assembly of N independently-seeded shots, so those fields are absent
+    // rather than misleadingly picking one shot's.
+    let storyboardRecord = VideoGenerationRecord(
+      prompt: spec.shots.map(\.prompt).joined(separator: " / "),
+      model: "ltx2-storyboard",
+      width: spec.output.width, height: spec.output.height,
+      frames: montage.frameCount, fps: spec.output.fps,
+      // comfybox#401 (review round 2, ruling 3): the COMPOSED output's
+      // actual dims, not the requested budget — `MontageResult` reports
+      // what it encoded.
+      resolvedWidth: montage.width, resolvedHeight: montage.height,
+      twoPass: false, refine: false, audio: false,
+      kind: "storyboard",
+      loras: spec.loras.map {
+        VideoGenerationRecord.LoRAEntry(name: VideoGenerationRecord.basename($0.path), scale: $0.scale)
+      })
+    VideoSidecar.write(storyboardRecord, forMediaAt: montage.outputPath)
+
     return LTX2VideoResult(
       outputPath: montage.outputPath,
       frameCount: montage.frameCount,
       durationSeconds: Float(montage.durationS),
-      elapsedSeconds: Date().timeIntervalSince(started))
+      elapsedSeconds: Date().timeIntervalSince(started),
+      generationRecord: storyboardRecord)
   }
 
   // MARK: - Montage (#232)
@@ -5410,6 +5445,23 @@ public final class WarmServer {
     let elapsed = Int(Date().timeIntervalSince(start) * 1000)
     logger.info("Montage: wrote \(result.outputPath) (\(String(format: "%.2f", result.durationS))s, \(result.frameCount) frames) in \(elapsed)ms")
     auditLog.append(kind: "montage.compose", message: "\(segments.count) segments -> \(result.outputPath)", metadata: [:])
+
+    // comfybox#401 (review round 2, ruling 2): the plain `/v1/montage/compose`
+    // route is a different writer (`MontageComposer`, not
+    // `LTX2PostProcess.writeMP4`) and composites pre-rendered segments rather
+    // than running a model, so — like the storyboard assembly — it gets a
+    // sidecar-only aggregate record. `resolvedWidth`/`resolvedHeight` come
+    // from `result` (what the composer actually encoded), per ruling 3,
+    // though for this route they are always the same values as the request.
+    let montageRecord = VideoGenerationRecord(
+      prompt: "montage of \(segments.count) segment(s): "
+        + segments.map { ($0.path as NSString).lastPathComponent }.joined(separator: ", "),
+      model: "montage-composer",
+      width: width, height: height, frames: result.frameCount, fps: fps,
+      resolvedWidth: result.width, resolvedHeight: result.height,
+      twoPass: false, refine: false, audio: false, kind: "montage")
+    VideoSidecar.write(montageRecord, forMediaAt: result.outputPath)
+
     return result
   }
 
@@ -7660,6 +7712,8 @@ private final class LocalVideoJob: @unchecked Sendable {
   /// comfybox#307: set on success when `two_stage` was requested and the
   /// refine could not run — see `LTX2RefineGate`.
   var refineSkippedReason: String?
+  /// comfybox#401: set on success — see `VideoJobStatus.generationRecord`.
+  var generationRecord: VideoGenerationRecord?
 
   init(id: String, source: String, mode: VideoMode) {
     self.id = id
@@ -7687,7 +7741,8 @@ private final class LocalVideoJob: @unchecked Sendable {
       resolvedConfig: resolvedConfig,
       frameCount: frameCount,
       interrupted: interrupted ? true : nil,
-      refineSkipped: refineSkippedReason
+      refineSkipped: refineSkippedReason,
+      generationRecord: generationRecord
     )
   }
 }
@@ -7849,6 +7904,7 @@ final class VideoJobTracker: @unchecked Sendable {
       job.progressPercent = 100
       job.completedAt = Date()
       job.refineSkippedReason = result.refineSkippedReason
+      job.generationRecord = result.generationRecord
     }
     lock.unlock()
     var payload = [
