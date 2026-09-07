@@ -362,22 +362,28 @@ public enum LoRACompatibility {
     if groups.contains(targetFamily) {
       return GuardDecision(allowed: true)
     }
-    // #402 fix round 1 (Critical 2, review of PR #411): the scanner's
-    // "flux1" tag is unreliable against a krea2 target specifically — Krea 2
-    // is ITSELF Flux-derived, and a Flux 2 Klein LoRA whose modelspec carries
-    // no klein_9b/klein_4b marker used to be confidently mistagged "flux1"
-    // by the SAME bug the scanner fix in this PR corrects
-    // (`LoRAScanner.detectCompatibility`). Until every already-scanned
-    // library entry has been rescanned with that fix, a bare "flux1" tag
-    // (and ONLY that — a LoRA that ALSO declares a confidently different,
-    // unrelated family such as "ltx" is not covered by this exception) stays
-    // ambiguous against krea2: warn, don't 400.
-    if Set(groups) == ["flux1"], targetFamily == "krea2" {
+    // #402 fix round 2 (Critical 2 re-review of PR #411): a CONFIDENT
+    // "flux1" tag already sitting in library.json cannot be trusted against
+    // ANY Flux-derived target, not only krea2 — the same scanner bug this
+    // PR fixes (`LoRAScanner.detectCompatibility`'s ss_base_model_version
+    // switch and its modelspec.architecture fallback) could equally have
+    // mistagged a Flux 2 Klein or a Chroma LoRA "flux1" before the fix, and
+    // every entry scanned before this PR ships is a pre-fix entry. Fatal
+    // only against the two architectures Flux shares NOTHING with —
+    // z-image (Lumina2) and ltx (LTX-2's own transformer) — everything
+    // else warns until the library is rescanned. Round 1 scoped this to
+    // krea2 alone; round 2 review named the gap (fk-adrianoanal — actually
+    // Klein — would still 400 a klein-9b target; chroma-unlocked-v47 would
+    // still 400 a chroma target).
+    //
+    // Scoped to a BARE "flux1" tag only — a LoRA that ALSO declares a
+    // confidently different, unrelated family (e.g. "ltx") is not covered.
+    if Set(groups) == ["flux1"], !["z-image", "ltx"].contains(targetFamily) {
       return GuardDecision(
         allowed: true,
-        warning: "declares \"flux1\" — ambiguous against a krea2 target (Krea 2 is Flux-derived; "
-          + "the scanner cannot yet distinguish real Flux.1 from a mistagged Krea-2-compatible "
-          + "adapter) — allowing with a warning until the library is rescanned")
+        warning: "declares \"flux1\" — ambiguous against a Flux-derived target '\(targetFamily)' "
+          + "(the pre-fix scanner could confidently mistag a Flux 2 Klein, Chroma, or Krea 2 LoRA "
+          + "\"flux1\"; comfybox#402 fix round 2) — allowing with a warning until the library is rescanned")
     }
     return GuardDecision(allowed: false, loraFamilies: Array(Set(groups)).sorted())
   }

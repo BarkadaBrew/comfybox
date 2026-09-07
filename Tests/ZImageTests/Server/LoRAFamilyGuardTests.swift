@@ -255,35 +255,36 @@ final class LoRAFamilyGuardTests: XCTestCase {
     XCTAssertTrue(logged.contains { $0.contains("never-scanned-video.safetensors") })
   }
 
-  // MARK: - #402 fix round 1 (Critical 1): POST /v1/lora/swap
+  // MARK: - #402 fix round 1/2 (Critical 1): POST /v1/lora/swap
 
-  /// Cold swap: no declared family (checkpoint_family/model absent) and the
-  /// resident family is still `.flux1` (the code-level default, and
-  /// production's typical fresh-boot resident model) — a krea2-tagged LoRA
-  /// (a REAL library entry, e.g. Filipina_Pinay_Women.safetensors) must be
-  /// allowed with a warning, never a 400. This is the exact production
-  /// pattern SwapResidencyRestore (30735df) established: Kira's stack is
-  /// swapped BEFORE krea2 becomes resident.
-  func testColdSwapWithNoFamilyAndDefaultResidentIsAllowedWithWarning() throws {
+  /// Cold swap: no declared family (checkpoint_family/model absent) and
+  /// `hasLoadedModel` is false — nothing has EVER been loaded on this
+  /// coordinator. A krea2-tagged LoRA (a REAL library entry, e.g.
+  /// Filipina_Pinay_Women.safetensors) must be allowed with a warning,
+  /// never a 400. This is the exact production pattern SwapResidencyRestore
+  /// (30735df) established: Kira's stack is swapped BEFORE krea2 becomes
+  /// resident.
+  func testColdSwapWithNoFamilyAndNoModelEverLoadedIsAllowedWithWarning() throws {
     let krea2Entry = makeEntry(id: "Filipina_Pinay_Women", compat: ["krea2"])
     var logged: [String] = []
     XCTAssertNoThrow(
       try WarmServer.validateLoRASwapCompatibility(
         entries: [LoRAEntry(path: "Filipina_Pinay_Women.safetensors", scale: 1.0)],
-        checkpointFamily: nil, model: nil, residentFamily: .flux1,
+        checkpointFamily: nil, model: nil, residentFamily: .flux1, hasLoadedModel: false,
         lookup: { _ in krea2Entry }, log: { logged.append($0) }))
-    XCTAssertTrue(logged.contains { $0.contains("Filipina_Pinay_Women.safetensors") && $0.contains("default") })
+    XCTAssertTrue(
+      logged.contains { $0.contains("Filipina_Pinay_Women.safetensors") && $0.contains("ever been") })
   }
 
   /// Swap declares its OWN target family (checkpoint_family "raw-accel" →
-  /// krea2) even while `.flux1` is still resident: an ltx-tagged LoRA is
-  /// rejected against that DECLARED family, not silently skipped.
+  /// krea2) even on a cold coordinator: an ltx-tagged LoRA is rejected
+  /// against that DECLARED family, not silently skipped.
   func testSwapWithDeclaredKrea2FamilyRejectsLtxTaggedLoRA() {
     let ltxEntry = makeEntry(id: "sulphur-video-3", compat: ["ltx"])
     XCTAssertThrowsError(
       try WarmServer.validateLoRASwapCompatibility(
         entries: [LoRAEntry(path: "sulphur-video-3.safetensors", scale: 1.0)],
-        checkpointFamily: "raw-accel", model: nil, residentFamily: .flux1,
+        checkpointFamily: "raw-accel", model: nil, residentFamily: .flux1, hasLoadedModel: false,
         lookup: { _ in ltxEntry })
     ) { error in
       guard case WarmServerError.loraFamilyMismatch(_, _, _, let families, let target) = error else {
@@ -294,15 +295,15 @@ final class LoRAFamilyGuardTests: XCTestCase {
     }
   }
 
-  /// Once krea2 is genuinely resident (not the default), the swap route
-  /// trusts it even with no declared family — a z-image-tagged LoRA is
-  /// rejected.
+  /// Once krea2 is genuinely resident (`hasLoadedModel: true`), the swap
+  /// route trusts it even with no declared family — a z-image-tagged LoRA
+  /// is rejected.
   func testSwapAfterKrea2LoadedRejectsZImageTaggedLoRA() {
     let zImageEntry = makeEntry(id: "portrait-style-3", compat: ["z-image"])
     XCTAssertThrowsError(
       try WarmServer.validateLoRASwapCompatibility(
         entries: [LoRAEntry(path: "portrait-style-3.safetensors", scale: 1.0)],
-        checkpointFamily: nil, model: nil, residentFamily: .krea2,
+        checkpointFamily: nil, model: nil, residentFamily: .krea2, hasLoadedModel: true,
         lookup: { _ in zImageEntry })
     ) { error in
       guard case WarmServerError.loraFamilyMismatch(_, _, _, let families, let target) = error else {
@@ -313,22 +314,56 @@ final class LoRAFamilyGuardTests: XCTestCase {
     }
   }
 
-  /// `loraSwapTargetFamily` in isolation, for every input combination the
-  /// route can produce.
-  func testLoraSwapTargetFamilyResolution() {
-    XCTAssertNil(WarmServer.loraSwapTargetFamily(checkpointFamily: nil, model: nil, residentFamily: .flux1))
-    XCTAssertEqual(
-      WarmServer.loraSwapTargetFamily(checkpointFamily: nil, model: nil, residentFamily: .krea2), "krea2")
-    XCTAssertEqual(
-      WarmServer.loraSwapTargetFamily(checkpointFamily: "raw-accel", model: nil, residentFamily: .flux1), "krea2")
-    XCTAssertEqual(
-      WarmServer.loraSwapTargetFamily(checkpointFamily: nil, model: "krea2", residentFamily: .flux1), "krea2")
-    // A declared family wins even when the resident family disagrees.
-    XCTAssertEqual(
-      WarmServer.loraSwapTargetFamily(checkpointFamily: "raw-accel", model: nil, residentFamily: .flux2), "krea2")
+  /// Fix round 2 (Critical 1 re-review): a GENUINELY resident Z-Image
+  /// pipeline (`residentFamily: .flux1, hasLoadedModel: true` — NOT the
+  /// cold/never-loaded case, which shares the same `.flux1` value) must
+  /// still gate a krea2-tagged LoRA. Round 1's `residentFamily == .flux1 ?
+  /// nil` collapsed this into the cold case and left the guard silently
+  /// inert here — 89 of 135 live library entries are z-image-tagged.
+  func testSwapWithZImageGenuinelyLoadedRejectsKrea2TaggedLoRA() {
+    let krea2Entry = makeEntry(id: "some-krea2-lora", compat: ["krea2"])
+    XCTAssertThrowsError(
+      try WarmServer.validateLoRASwapCompatibility(
+        entries: [LoRAEntry(path: "some-krea2-lora.safetensors", scale: 1.0)],
+        checkpointFamily: nil, model: nil, residentFamily: .flux1, hasLoadedModel: true,
+        lookup: { _ in krea2Entry })
+    ) { error in
+      guard case WarmServerError.loraFamilyMismatch(_, _, _, let families, let target) = error else {
+        return XCTFail("expected .loraFamilyMismatch, got \(error)")
+      }
+      XCTAssertEqual(families, ["krea2"])
+      XCTAssertEqual(target, "z-image")
+    }
   }
 
-  // MARK: - #402 fix round 1 (Critical 2): flux1/krea2 ambiguity, wired
+  /// `loraSwapTargetFamily` in isolation, for every input combination the
+  /// route can produce — including the round-2 fix's core distinction:
+  /// `.flux1` resident with `hasLoadedModel: true` resolves to "z-image"
+  /// (trusted), while the SAME `.flux1` with `hasLoadedModel: false`
+  /// resolves to nil (skip).
+  func testLoraSwapTargetFamilyResolution() {
+    XCTAssertNil(
+      WarmServer.loraSwapTargetFamily(
+        checkpointFamily: nil, model: nil, residentFamily: .flux1, hasLoadedModel: false))
+    XCTAssertEqual(
+      WarmServer.loraSwapTargetFamily(
+        checkpointFamily: nil, model: nil, residentFamily: .flux1, hasLoadedModel: true), "z-image")
+    XCTAssertEqual(
+      WarmServer.loraSwapTargetFamily(
+        checkpointFamily: nil, model: nil, residentFamily: .krea2, hasLoadedModel: true), "krea2")
+    XCTAssertEqual(
+      WarmServer.loraSwapTargetFamily(
+        checkpointFamily: "raw-accel", model: nil, residentFamily: .flux1, hasLoadedModel: false), "krea2")
+    XCTAssertEqual(
+      WarmServer.loraSwapTargetFamily(
+        checkpointFamily: nil, model: "krea2", residentFamily: .flux1, hasLoadedModel: false), "krea2")
+    // A declared family wins even when the resident family disagrees.
+    XCTAssertEqual(
+      WarmServer.loraSwapTargetFamily(
+        checkpointFamily: "raw-accel", model: nil, residentFamily: .flux2, hasLoadedModel: true), "krea2")
+  }
+
+  // MARK: - #402 fix round 1/2 (Critical 2): flux1/Flux-derived ambiguity, wired
 
   /// The scanner-ambiguity exception (`LoRACompatibility.checkFamily`) flows
   /// through the shared guard unchanged: a "flux1"-tagged LoRA against a
@@ -341,5 +376,46 @@ final class LoRAFamilyGuardTests: XCTestCase {
         entries: [LoRAEntry(path: "ambiguous-flux1.safetensors", scale: 1.0)],
         targetFamily: "krea2", lookup: { _ in entry }, log: { logged.append($0) }))
     XCTAssertTrue(logged.contains { $0.contains("ambiguous-flux1.safetensors") && $0.contains("ambiguous") })
+  }
+
+  /// Fix round 2: the real case named in review — `fk-adrianoanal.safetensors`
+  /// was scanned (pre-fix) as `["flux1"]` but is actually Flux 2 Klein. A
+  /// klein-9b target must warn, not 400, until it's rescanned.
+  func testFlux1TaggedLoRAOnKlein9bTargetWarnsInsteadOfThrowing() throws {
+    let entry = makeEntry(id: "fk-adrianoanal", compat: ["flux1"])
+    var logged: [String] = []
+    XCTAssertNoThrow(
+      try WarmServer.validateLoRAFamilyCompatibility(
+        entries: [LoRAEntry(path: "fk-adrianoanal.safetensors", scale: 1.0)],
+        targetFamily: "flux2-klein", lookup: { _ in entry }, log: { logged.append($0) }))
+    XCTAssertTrue(logged.contains { $0.contains("fk-adrianoanal.safetensors") && $0.contains("ambiguous") })
+  }
+
+  /// Fix round 2: the other real case named in review — `chroma-unlocked-v47…`
+  /// carries `ss_base_model_version: "flux1"` (an explicit marker, so still
+  /// confidently "flux1" post-fix) but Chroma is itself Flux-derived. A
+  /// chroma target must warn, not 400.
+  func testFlux1TaggedLoRAOnChromaTargetWarnsInsteadOfThrowing() throws {
+    let entry = makeEntry(id: "chroma-unlocked-v47", compat: ["flux1"])
+    var logged: [String] = []
+    XCTAssertNoThrow(
+      try WarmServer.validateLoRAFamilyCompatibility(
+        entries: [LoRAEntry(path: "chroma-unlocked-v47.safetensors", scale: 1.0)],
+        targetFamily: "chroma", lookup: { _ in entry }, log: { logged.append($0) }))
+    XCTAssertTrue(logged.contains { $0.contains("chroma-unlocked-v47.safetensors") && $0.contains("ambiguous") })
+  }
+
+  /// The two architectures Flux genuinely shares nothing with — z-image and
+  /// ltx — are UNAFFECTED by the broadened carve-out: a bare "flux1" tag is
+  /// still a confident, real mismatch against either.
+  func testFlux1TaggedLoRAStillRejectsAgainstZImageAndLtx() {
+    for target in ["z-image", "ltx"] {
+      let entry = makeEntry(id: "still-fatal-\(target)", compat: ["flux1"])
+      XCTAssertThrowsError(
+        try WarmServer.validateLoRAFamilyCompatibility(
+          entries: [LoRAEntry(path: "still-fatal-\(target).safetensors", scale: 1.0)],
+          targetFamily: target, lookup: { _ in entry }),
+        "flux1 must still reject against \(target)")
+    }
   }
 }

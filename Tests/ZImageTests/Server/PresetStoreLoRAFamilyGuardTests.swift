@@ -131,9 +131,9 @@ final class PresetStoreLoRAFamilyGuardTests: XCTestCase {
     XCTAssertNotNil(store.get("krea2-preset"))
   }
 
-  /// The z-image target is unaffected by the krea2-specific ambiguity
-  /// carve-out — a "flux1"-tagged LoRA on a z-image preset is still a
-  /// confident, real mismatch (Z-Image/Lumina2 shares nothing with Flux.1).
+  /// The z-image target is unaffected by the broadened ambiguity carve-out
+  /// — a "flux1"-tagged LoRA on a z-image preset is still a confident, real
+  /// mismatch (Z-Image/Lumina2 shares nothing with Flux.1).
   func testFlux1TaggedLoRAOnZImagePresetIsStillRejected() throws {
     let store = PresetStore(path: try makeTempPath(), seedDefaults: false)
     let entry = makeEntry(id: "civitai-flux-style-2", compat: ["flux1"])
@@ -144,6 +144,34 @@ final class PresetStoreLoRAFamilyGuardTests: XCTestCase {
     expectValidationRefusal(
       store, preset, loraLookup: { _ in entry },
       naming: ["civitai-flux-style-2.safetensors", "flux1", "z-image"])
+  }
+
+  /// Fix round 2: a chroma-targeting preset with a "flux1"-tagged LoRA
+  /// warns instead of rejecting — the exact `chroma-unlocked-v47…` case
+  /// named in review (its `ss_base_model_version` is the explicit "flux1",
+  /// so it stays confidently "flux1" post-fix, but Chroma is itself
+  /// Flux-derived).
+  func testFlux1TaggedLoRAOnChromaPresetIsAllowedWithWarning() throws {
+    let store = PresetStore(path: try makeTempPath(), seedDefaults: false)
+    let entry = makeEntry(id: "chroma-unlocked-v47", compat: ["flux1"])
+    let preset = ImagePreset(
+      id: "chroma-preset", name: "Chroma", model: "chroma-unlocked",
+      loras: [LoraReference(filename: "chroma-unlocked-v47.safetensors", scale: 1.0)])
+    XCTAssertNoThrow(try store.upsert(preset, loraLookup: { _ in entry }))
+    XCTAssertNotNil(store.get("chroma-preset"))
+  }
+
+  /// Fix round 2: the other real case named in review — `fk-adrianoanal`
+  /// (pre-fix-scan, tagged `["flux1"]`, actually Flux 2 Klein) on a Klein
+  /// preset warns instead of rejecting.
+  func testFlux1TaggedLoRAOnKleinPresetIsAllowedWithWarning() throws {
+    let store = PresetStore(path: try makeTempPath(), seedDefaults: false)
+    let entry = makeEntry(id: "fk-adrianoanal", compat: ["flux1"])
+    let preset = ImagePreset(
+      id: "klein-preset", name: "Klein", model: "flux-2-klein-9b",
+      loras: [LoraReference(filename: "fk-adrianoanal.safetensors", scale: 1.0)])
+    XCTAssertNoThrow(try store.upsert(preset, loraLookup: { _ in entry }))
+    XCTAssertNotNil(store.get("klein-preset"))
   }
 
   /// Unknown/unscanned compatibility never refuses — only warns.
