@@ -2844,8 +2844,34 @@ public final class WarmServer {
     // the fix — see the resolver's `resolve` doc comment).
     let namedDims = Self.videoDims(resolution: req.resolution, aspectRatio: req.aspectRatio)
     let videoConfigDefaults = ServerConfigStore.shared.videoDefaults()
-    let resolvedVideoCeiling = LTX2ConfigResolver.resolveTyped(
-      request: effectiveTuning, preset: videoPreset?.videoTuning).maxLongEdge
+    // Single-pass fold (2026-08-02): continuation chunks DEGENERATE — chunk 2
+    // collapses into fragments (long-known for i2v, which is why the daemon
+    // sends explicit single-pass frames there; observed for T2V today the
+    // moment two-stage went live: chunk 1 clean, chunk 2 psychedelic). The
+    // daemon's rule only covers i2v, so fold ANY duration that fits the
+    // trained window (289f = 12s) into ONE chunk here, t2v included.
+    // FDD §3.3, D3: `videoDefaults.frames` (migrated from the desktop's
+    // `videoFrames`) slots between the request and the 97f engine default.
+    var foldedFramesPerChunk = Self.resolvedLTX2Frames(requestFrames: req.frames, videoConfigDefaults: videoConfigDefaults)
+    var foldedExtendSeconds = req.extendToSeconds
+      ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: foldedFramesPerChunk, fps: req.fps ?? 24)
+    if foldedExtendSeconds > 0 {
+      let fps = req.fps ?? 24
+      let targetFrames = Int((foldedExtendSeconds * Float(fps)).rounded())
+      if targetFrames <= 289 {
+        let singleFrames = min(289, ((max(targetFrames, 9) - 2) / 8) * 8 + 9)  // 1+8k covering target
+        foldedFramesPerChunk = max(foldedFramesPerChunk, singleFrames)
+        logger.info(
+          "LTX-2: folded \(foldedExtendSeconds)s request into a single \(foldedFramesPerChunk)f chunk (continuation chunks degenerate; ≤289f renders single-pass)")
+        foldedExtendSeconds = 0  // 0 = no continuation chunks
+      }
+    }
+
+    // comfybox#405: resolve the LTX-2 config ONCE — the ceiling, the two-stage
+    // flag, the refine scale and the refine gate's budget all come from it.
+    let resolvedVideoConfig = LTX2ConfigResolver.resolveTyped(
+      request: effectiveTuning, preset: videoPreset?.videoTuning)
+    let resolvedVideoCeiling = resolvedVideoConfig.maxLongEdge
     let sourceSize = effectiveInitImage.flatMap { Self.imagePixelSize(atPath: $0) }
     let resolvedDims = VideoDimensionResolver.resolve(
       requestWidth: req.width, requestHeight: req.height,
@@ -2883,8 +2909,6 @@ public final class WarmServer {
     // and matches all validated two-stage renders (stage 1 at 448x256 etc.).
     // Typed resolution honors request/preset tuning overrides (finding #18):
     // a request can enable two-stage without the plist knowing.
-    let resolvedVideoConfig = LTX2ConfigResolver.resolveTyped(
-      request: effectiveTuning, preset: videoPreset?.videoTuning)
     let resolvedTwoStage = resolvedVideoConfig.twoStage
     if resolvedTwoStage {
       let s1 = Self.stageOneDims(finalWidth: renderWidth, finalHeight: renderHeight)
@@ -2931,6 +2955,35 @@ public final class WarmServer {
     // are themselves under it. Clamping the PREDICTION alone would only make
     // the reported number wrong — the encoder would still write whatever it
     // wrote — so the reduction lands on the generator dims, where it binds.
+    // comfybox#405 (review round 3, item 1): whether the refine will actually
+    // RUN is a function of the FRAME COUNT, which is why the single-pass fold
+    // above was hoisted here — so this is the REAL gate verdict, not a
+    // defaulted `false`. `LTX2RefineGate.willSkip` is the same decision
+    // `LTX2Pipeline` applies, from the same inputs (the shared
+    // `preRefineVolume`), so the prediction and the render cannot disagree
+    // about whether a clip refines.
+    //
+    // The upsampler predicate mirrors the generator's own lazy load
+    // (`LTX2VideoGenerator`: non-empty `upsamplerPath` that exists on disk).
+    //
+    // One evaluation is enough for both the ceiling below and the prediction:
+    // the ceiling only ever REDUCES dims, and a smaller render can only turn a
+    // skip into a run, never a run into a skip. And when the refine is already
+    // skipping, the predicted output equals the generator dims, so the ceiling
+    // cannot fire at all (those dims were clamped at resolve time). The
+    // recomputation would therefore only ever return the same answer.
+    let upsamplerAvailable = !resolvedVideoConfig.upsamplerPath.isEmpty
+      && FileManager.default.fileExists(atPath: resolvedVideoConfig.upsamplerPath)
+    let refineWillSkip = LTX2RefineGate.willSkip(
+      twoStage: resolvedTwoStage, upsamplerAvailable: upsamplerAvailable,
+      width: renderWidth, height: renderHeight, frames: foldedFramesPerChunk,
+      refineScale: resolvedVideoConfig.refineScale,
+      refineMaxVolume: resolvedVideoConfig.refineMaxVol)
+    if resolvedTwoStage, refineWillSkip {
+      logger.info(
+        "LTX-2 dims: two-stage requested but the refine is gated off for this render — predicting the unrefined \(renderWidth)x\(renderHeight) (#405)")
+    }
+
     // `max_long_edge` (Tier B, default 2048 = LTX-2's trained spatial extent)
     // is overridable, so a deliberate high-resolution probe is not silently
     // shrunk (review round 3, item 2).
@@ -2938,6 +2991,7 @@ public final class WarmServer {
     let fitted = VideoDimensionResolver.generatorDimsFittingOutputCeiling(
       generatorWidth: renderWidth, generatorHeight: renderHeight,
       twoStage: resolvedTwoStage, refineScale: resolvedVideoConfig.refineScale,
+      refineWillSkip: refineWillSkip,
       maxLongEdge: videoCeiling, maxPixels: videoCeiling * videoCeiling)
     var ceilingPreClamp: (width: Int, height: Int)? = nil
     if fitted.width != renderWidth || fitted.height != renderHeight {
@@ -3047,50 +3101,6 @@ public final class WarmServer {
       if let suffix = preset.promptSuffix, !suffix.isEmpty { effectivePrompt = effectivePrompt + ", " + suffix }
     }
 
-    // Single-pass fold (2026-08-02): continuation chunks DEGENERATE — chunk 2
-    // collapses into fragments (long-known for i2v, which is why the daemon
-    // sends explicit single-pass frames there; observed for T2V today the
-    // moment two-stage went live: chunk 1 clean, chunk 2 psychedelic). The
-    // daemon's rule only covers i2v, so fold ANY duration that fits the
-    // trained window (289f = 12s) into ONE chunk here, t2v included.
-    // FDD §3.3, D3: `videoDefaults.frames` (migrated from the desktop's
-    // `videoFrames`) slots between the request and the 97f engine default.
-    var foldedFramesPerChunk = Self.resolvedLTX2Frames(requestFrames: req.frames, videoConfigDefaults: videoConfigDefaults)
-    var foldedExtendSeconds = req.extendToSeconds
-      ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: foldedFramesPerChunk, fps: req.fps ?? 24)
-    if foldedExtendSeconds > 0 {
-      let fps = req.fps ?? 24
-      let targetFrames = Int((foldedExtendSeconds * Float(fps)).rounded())
-      if targetFrames <= 289 {
-        let singleFrames = min(289, ((max(targetFrames, 9) - 2) / 8) * 8 + 9)  // 1+8k covering target
-        foldedFramesPerChunk = max(foldedFramesPerChunk, singleFrames)
-        logger.info(
-          "LTX-2: folded \(foldedExtendSeconds)s request into a single \(foldedFramesPerChunk)f chunk (continuation chunks degenerate; ≤289f renders single-pass)")
-        foldedExtendSeconds = 0  // 0 = no continuation chunks
-      }
-    }
-
-    // comfybox#405 (review round 3, item 1): the predicted output size needs
-    // to know whether the refine will actually RUN, and that gate is a
-    // function of the FRAME COUNT — so it is computed here, after the fold,
-    // not up with the dims. `LTX2RefineGate.willSkip` is the same decision
-    // `LTX2Pipeline` applies, from the same inputs (the shared
-    // `preRefineVolume`), so the prediction and the render cannot disagree
-    // about whether a clip refines.
-    //
-    // The upsampler predicate mirrors the generator's own lazy load
-    // (`LTX2VideoGenerator`: non-empty `upsamplerPath` that exists on disk).
-    let upsamplerAvailable = !resolvedVideoConfig.upsamplerPath.isEmpty
-      && FileManager.default.fileExists(atPath: resolvedVideoConfig.upsamplerPath)
-    let refineWillSkip = LTX2RefineGate.willSkip(
-      twoStage: resolvedTwoStage, upsamplerAvailable: upsamplerAvailable,
-      width: renderWidth, height: renderHeight, frames: foldedFramesPerChunk,
-      refineScale: resolvedVideoConfig.refineScale,
-      refineMaxVolume: resolvedVideoConfig.refineMaxVol)
-    if resolvedTwoStage, refineWillSkip {
-      logger.info(
-        "LTX-2 dims: two-stage requested but the refine is gated off for this render — predicting the unrefined \(renderWidth)x\(renderHeight) (#405)")
-    }
     let predicted = VideoDimensionResolver.predictedOutputDims(
       generatorWidth: renderWidth, generatorHeight: renderHeight,
       twoStage: resolvedTwoStage,
