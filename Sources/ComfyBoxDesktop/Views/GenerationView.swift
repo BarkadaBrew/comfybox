@@ -139,8 +139,13 @@ struct GenerationView: View {
     /// Persisted LoRA stack (JSON) so it survives leaving/returning to the tab.
     @SceneStorage("gen.lorasJSON") private var lorasJSON: String = ""
 
+    /// #419 (review): the ENGINE's `/health` model_family answer only —
+    /// never text inference from the model id (a path containing "chroma"
+    /// can be a Z-Image checkpoint, #154). nil while unknown = permissive,
+    /// same as the preset editor.
     private var samplingModelFamily: String? {
-        engine.currentModelFamily ?? engine.currentModel
+        guard let family = engine.currentModelFamily, !family.isEmpty else { return nil }
+        return family
     }
 
     /// #419: the same validator the preset editor uses — sampler/schedule
@@ -860,16 +865,22 @@ struct GenerationView: View {
             SamplingRecipePicker(
                 sampler: $sampler,
                 sigmaSchedule: $sigmaSchedule,
-                modelFamily: samplingModelFamily
+                modelFamily: samplingModelFamily,
+                // The one automatic reset, on the user's OWN pick only. An
+                // `.onChange(of: sampler)` here fired for `applyPreset` too and
+                // judged the preset's sampler against the family still
+                // resident while its model loaded (~70 s) — a Z-Image preset
+                // with ddim + eta 0.6 applied over krea2 lost its eta. Also
+                // suppressed while an apply / model switch is in flight.
+                onUserChange: { newSampler in
+                    let outcome = SamplingGate.userSamplerChange(
+                        to: newSampler, modelFamily: samplingModelFamily,
+                        eta: eta, bongmath: bongmath, applyInFlight: isApplyingPreset)
+                    eta = outcome.eta
+                    bongmath = outcome.bongmath
+                }
             )
             .disabled(backend != .local)
-            .onChange(of: sampler) { _, newSampler in
-                // User-initiated (the picker is the only writer besides
-                // applyPreset, which sets a whole recipe): the one automatic
-                // reset — a sampler that refuses eta/bongmath drops them.
-                if SamplingGate.eta(modelFamily: samplingModelFamily, sampler: newSampler).isRefused { eta = 0 }
-                if SamplingGate.bongmath(modelFamily: samplingModelFamily, sampler: newSampler).isRefused { bongmath = false }
-            }
 
             // #419: shift + projector scale + the RES4LYF SDE / bongmath /
             // noise knobs (the Clownshark recipe) — the SAME family-aware

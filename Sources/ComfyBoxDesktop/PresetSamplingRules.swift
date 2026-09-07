@@ -51,6 +51,22 @@ enum SamplingGate {
         SamplingRecipeCatalog.vaeStatus(forModelFamily: modelFamily)
     }
 
+    /// The Generate panel's one automatic reset, as a pure function: the
+    /// user just picked `sampler` (the picker's own edit — never a
+    /// programmatic write, see `SamplingRecipePicker.userEditBinding`). If
+    /// the new sampler refuses eta/bongmath on the RESIDENT family, drop
+    /// them. While an apply / model switch is in flight the resident family
+    /// is the OLD one, so nothing is judged (`applyInFlight`).
+    static func userSamplerChange(
+        to sampler: String, modelFamily: String?, eta: Double, bongmath: Bool, applyInFlight: Bool
+    ) -> (eta: Double, bongmath: Bool) {
+        guard !applyInFlight else { return (eta, bongmath) }
+        return (
+            self.eta(modelFamily: modelFamily, sampler: sampler).isRefused ? 0 : eta,
+            self.bongmath(modelFamily: modelFamily, sampler: sampler).isRefused ? false : bongmath
+        )
+    }
+
     /// Stage-2 `eta` is gated on the sampler the stage ACTUALLY runs — its
     /// own when named, else the render's (`WarmServer.stage2Gate`'s
     /// effective-sampler rule). The refusal wording is the engine's.

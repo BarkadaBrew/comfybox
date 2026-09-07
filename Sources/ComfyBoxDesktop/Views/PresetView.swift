@@ -673,12 +673,14 @@ private struct ServerPresetEditor: View {
             sampler: $sampler,
             sigmaSchedule: $sigmaSchedule,
             modelFamily: samplingModelFamily,
-            showsExplanation: true
+            showsExplanation: true,
+            // The one automatic reset, on the user's OWN pick only (the
+            // picker's proxy binding, not `.onChange`, so a programmatic
+            // write can never trigger it).
+            onUserChange: { newSampler in
+                sampling.samplerDidChange(to: newSampler, modelFamily: samplingModelFamily)
+            }
         )
-        .onChange(of: sampler) { _, newSampler in
-            // User-initiated (the picker is the only writer): the one reset.
-            sampling.samplerDidChange(to: newSampler, modelFamily: samplingModelFamily)
-        }
         SamplingAdvancedControls(
             shift: $sampling.shift,
             projectorScale: $sampling.projectorScale,
@@ -767,12 +769,12 @@ private struct ServerPresetEditor: View {
                     sampler: $sampling.stage2Sampler,
                     sigmaSchedule: $sampling.stage2SigmaSchedule,
                     modelFamily: samplingModelFamily,
-                    showsExplanation: false
+                    showsExplanation: false,
+                    onUserChange: { newSampler in
+                        sampling.stage2SamplerDidChange(
+                            to: newSampler, stage1Sampler: sampler, modelFamily: samplingModelFamily)
+                    }
                 )
-                .onChange(of: sampling.stage2Sampler) { _, newSampler in
-                    sampling.stage2SamplerDidChange(
-                        to: newSampler, stage1Sampler: sampler, modelFamily: samplingModelFamily)
-                }
                 Text("Model Default here means the main render's sampler / scheduler; an empty eta inherits the main render's eta.")
                     .font(.caption2).foregroundStyle(.tertiary)
                 NumericSliderField(label: "Eta (SDE)", value: $sampling.stage2Eta, range: 0...1, step: 0.05, fractionDigits: 2)
