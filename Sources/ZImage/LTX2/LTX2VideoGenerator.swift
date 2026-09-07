@@ -190,10 +190,25 @@ public struct LTX2VideoResult: Sendable {
     /// already-recorded per-shot clips via a different writer and gets its
     /// own aggregate sidecar there — not this struct.
     public let generationRecord: VideoGenerationRecord?
+    /// comfybox#405 (review round 2): the dims of the frames actually ENCODED,
+    /// measured at write time from the decoded frames put through the same
+    /// delivery downscale the writer applies — never predicted from the
+    /// request. Everything upstream IS a prediction: the two-stage convention
+    /// assumes the refine doubles, but the shipping `refine_scale` is 1.5 and
+    /// `LTX2RefineGate` can skip the refine outright, so a predicted size can
+    /// name a resolution no file has. 0 when no file was written.
+    public let outputWidth: Int
+    public let outputHeight: Int
+    /// Whether the two-stage refine actually ran (requested AND not
+    /// gate-skipped), and the scale it resolved to.
+    public let refineApplied: Bool
+    public let refineScale: Float
 
     public init(
         outputPath: String, frameCount: Int, durationSeconds: Float, elapsedSeconds: Double,
-        refineSkippedReason: String? = nil, generationRecord: VideoGenerationRecord? = nil
+        refineSkippedReason: String? = nil, generationRecord: VideoGenerationRecord? = nil,
+        outputWidth: Int = 0, outputHeight: Int = 0,
+        refineApplied: Bool = false, refineScale: Float = 1.0
     ) {
         self.outputPath = outputPath
         self.frameCount = frameCount
@@ -201,6 +216,10 @@ public struct LTX2VideoResult: Sendable {
         self.elapsedSeconds = elapsedSeconds
         self.refineSkippedReason = refineSkippedReason
         self.generationRecord = generationRecord
+        self.outputWidth = outputWidth
+        self.outputHeight = outputHeight
+        self.refineApplied = refineApplied
+        self.refineScale = refineScale
     }
 }
 
@@ -1785,6 +1804,17 @@ public final class LTX2VideoGenerator {
         // comfybox#322: last boundary before anything is written to disk, so a
         // cancelled render never leaves a file at `outputPath` (the `defer`
         // above is the backstop for a cancel that lands mid-write).
+        // comfybox#405 (review round 2): the writer scales appended buffers to
+        // these dims, so this pair IS the file's resolution. Computed with the
+        // SAME function `writeMP4` uses so the two cannot disagree, and taken
+        // from the ACTUAL decoded frame size (`outW`/`outH` above) rather than
+        // from anything predicted upstream. Pure arithmetic, and deliberately
+        // ABOVE the cancellation boundary below: that check must stay adjacent
+        // to the write (`LTX2CancellationBoundaryTests` pins the adjacency —
+        // an interrupted render must not write an MP4).
+        let encodedDims = LTX2PostProcess.deliveryDims(
+            width: outW, height: outH,
+            shortEdge: pipeline.resolvedConfig.deliveryShortEdge)
         try Task.checkCancellation()
         telemetry?.begin(.postProcess)
         startedWrite = true
@@ -1819,7 +1849,11 @@ public final class LTX2VideoGenerator {
             // invocation and would drop an earlier chunk's reason if a
             // preemption rebuilt the pipeline in between.
             refineSkippedReason: refineSkippedReason,
-            generationRecord: generationRecord
+            generationRecord: generationRecord,
+            // comfybox#405: MEASURED, not predicted.
+            outputWidth: encodedDims.width, outputHeight: encodedDims.height,
+            refineApplied: pipeline.resolvedConfig.twoStage && refineSkippedReason == nil,
+            refineScale: pipeline.resolvedConfig.refineScale
         ))
         #else
         throw LTX2VideoError.unsupportedPlatform
