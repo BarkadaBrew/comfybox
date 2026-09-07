@@ -14315,9 +14315,9 @@ struct GenerateResponse: Encodable, Sendable {
   let presetRecipeApplied: [String]?
   /// PR #420 review (B1/B2): `preset_recipe_skipped` — declared preset recipe
   /// fields the expansion did NOT adopt, each with its reason: the request's
-  /// explicit stage-2 off switch, or a preset eta left off because the
-  /// effective sampler is not RES4LYF (the daemon's #1797 rule). Absent when
-  /// nothing was skipped.
+  /// explicit stage-2 off switch, or a preset eta / bongmath left off because
+  /// the effective sampler is not RES4LYF (the daemon's #1797 rule). Absent
+  /// when nothing was skipped.
   let presetRecipeSkipped: [String]?
 
   /// #22 (PR #363 review, C1b): the render's estimated peak activation

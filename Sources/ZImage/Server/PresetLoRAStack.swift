@@ -288,11 +288,11 @@ public enum PresetLoRAStack: Sendable, Equatable {
 
     // --- Declared sampler recipe (#419) — DECLARED, per field, only where
     // the request said nothing. No family gate for the NAMES: sampler /
-    // schedule are family-agnostic and the capability matrix, the bongmath
-    // sampler gate, the `stage2` family gate and the T3 stage2.bongmath stub
-    // all run at dispatch on the EXPANDED payload, so a preset naming a
-    // combination its family refuses gets the same 400 an explicit request
-    // does. `eta` has its own rule below (B2). `noise_type` / `noise_alpha` /
+    // schedule are family-agnostic and the capability matrix, the `stage2`
+    // family gate and the T3 stage2.bongmath stub all run at dispatch on the
+    // EXPANDED payload, so a preset naming a combination its family refuses
+    // gets the same 400 an explicit request does. `eta` and `bongmath` have
+    // their own rule below (B2). `noise_type` / `noise_alpha` /
     // `implicit_steps` / `c2` / `projector_scale` are read by the Krea 2 loop
     // only; the other families do not gate them for a request today and do
     // not for a preset either. Before #419 every one of these was silently
@@ -325,7 +325,16 @@ public enum PresetLoRAStack: Sendable, Equatable {
         expansion.eta = eta
       }
     }
-    if requestRecipe.bongmath == nil, let bongmath = declared.bongmath { expansion.bongmath = bongmath }
+    // …and its twin: a PRESET-sourced `bongmath: true` is RES4LYF's fixed
+    // point over its own tableau rows and is undefined for any other sampler
+    // — same rule, same record, request-sourced bongmath untouched.
+    if requestRecipe.bongmath == nil, let bongmath = declared.bongmath {
+      if family == "krea2", bongmath, !effectiveSampler.isRES4LYFFamily {
+        expansion.skipped.append("bongmath (non-RES4LYF sampler '\(effectiveSampler.rawValue)')")
+      } else {
+        expansion.bongmath = bongmath
+      }
+    }
     // `stage2` is adopted as ONE object: a request that sent its own stage
     // keeps it whole (no field-wise merge across the two sources — that would
     // build a stage nobody declared). An all-nil `{}` is not a declaration.
@@ -527,11 +536,11 @@ public struct PresetExpansion: Sendable, Equatable {
   /// only where the request omitted its own — the `shift` rule, applied to
   /// every other dial a preset can declare. Unlike `shift` there is no
   /// family gate at expansion for the NAMES: sampler / schedule are
-  /// family-agnostic and the family capability matrix, the bongmath sampler
-  /// gate and the `stage2` family gate all run at DISPATCH on the expanded
-  /// payload, so a preset declaring a combination its family refuses gets the
-  /// same 400 an explicit request does. `eta` is the one field with an
-  /// expansion-time rule (``skipped``, PR #420 review B2). `noise_type` /
+  /// family-agnostic and the family capability matrix and the `stage2`
+  /// family gate run at DISPATCH on the expanded payload, so a preset
+  /// declaring a combination its family refuses gets the same 400 an
+  /// explicit request does. `eta` and `bongmath` have an expansion-time
+  /// rule (``skipped``, PR #420 review B2). `noise_type` /
   /// `noise_alpha` / `implicit_steps` / `c2` / `projector_scale` are Krea 2
   /// dials that the other families' loops do not read — for a request OR a
   /// preset, today, unchanged here.
@@ -560,11 +569,12 @@ public struct PresetExpansion: Sendable, Equatable {
   /// response as `preset_recipe_skipped`. Two sources today: the request
   /// switched stage 2 off explicitly (`detail_pass: false` / `stage2: null`)
   /// while the preset declares one, and the daemon's #1797 rule mirrored
-  /// engine-side — a PRESET-sourced non-zero `eta` (stage 1 or 2) whose
-  /// EFFECTIVE sampler (request's, else preset's; stage 2 falls back to
-  /// stage 1) is not RES4LYF on the Krea 2 family is left off rather than
-  /// turned into a 400, because the preset is the only layer that asked for
-  /// it. A REQUEST-sourced eta is untouched and still hits the existing gate.
+  /// engine-side — a PRESET-sourced non-zero `eta` (stage 1 or 2) or
+  /// `bongmath: true` whose EFFECTIVE sampler (request's, else preset's;
+  /// stage 2 falls back to stage 1) is not RES4LYF on the Krea 2 family is
+  /// left off rather than turned into a 400, because the preset is the only
+  /// layer that asked for it. A REQUEST-sourced eta / bongmath is untouched
+  /// and still hits the existing gate.
   public var skipped: [String] = []
   /// C2: the engine could not expand this preset. It behaves as the label it
   /// always was, and this reaches the response as `preset_unresolved` (the

@@ -434,21 +434,22 @@ out (the daemon's shape) is unchanged. `stage2` is adopted as one object
 requires `steps` and `denoise`, a preset stage missing either is a **400
 naming the preset**, not a guess; so is a preset sampler/schedule name the
 engine does not resolve. There is no family gate at expansion for the
-names — the family capability matrix, the bongmath-by-sampler gate and the
-`stage2` family gate all run at dispatch on the **expanded** values, so a
+names — the family capability matrix and the `stage2` family gate run at
+dispatch on the **expanded** values, so a
 preset naming a combination its family refuses gets the same 400 the explicit
 request does. `shift` (next section) is unchanged: on Krea 2 it is `mu` and
 stays request-only.
 
-**A preset-sourced `eta` follows the daemon's rule (#1797), engine-side.** On
-the Krea 2 family a non-zero `eta` declared by the preset is adopted only when
-the *effective* stage-1 sampler — the request's if it sent one, else the
-preset's, else euler — is a RES4LYF sampler; otherwise it is left off and
-recorded, not turned into a 400, because the preset is the only layer that
-asked for it. The same holds for the preset's `stage2.eta` against the
-effective stage-2 sampler (the stage's own, else the render's). A **request**
-`eta` is untouched and still hits the existing sampler gate. Z-Image `eta` is
-a different, shipped parameter and is adopted as declared.
+**A preset-sourced `eta` or `bongmath` follows the daemon's rule (#1797),
+engine-side.** On the Krea 2 family a non-zero `eta` or a `bongmath: true`
+declared by the preset is adopted only when the *effective* stage-1 sampler —
+the request's if it sent one, else the preset's, else euler — is a RES4LYF
+sampler; otherwise it is left off and recorded, not turned into a 400,
+because the preset is the only layer that asked for it. The same holds for
+the preset's `stage2.eta` against the effective stage-2 sampler (the stage's
+own, else the render's). A **request** `eta` / `bongmath` is untouched and
+still hits the existing sampler gate. Z-Image `eta` is a different, shipped
+parameter and is adopted as declared.
 
 **Switching stage 2 off explicitly.** Omitting `stage2` lets a preset's
 declared stage in; to refuse it, send `"detail_pass": false` (the MCP tool
@@ -465,7 +466,8 @@ The response and `GET /v1/generate/status/{id}` carry two additive arrays:
 (`["scheduler", "sigma_schedule", "eta", …]`; a field the request sent is
 never listed) — and `preset_recipe_skipped` — declared fields the expansion
 did NOT adopt, each with its reason (`"eta (non-RES4LYF sampler 'euler')"`,
-`"stage2 (detail_pass=false)"`, `"stage2 (stage2=null)"`), so a dropped field
+`"bongmath (non-RES4LYF sampler 'euler')"`, `"stage2 (detail_pass=false)"`,
+`"stage2 (stage2=null)"`), so a dropped field
 is visible, never silent. A crash-recovery replay carries the accepted recipe
 as explicit request fields (the `vae_source` rule; a JSON `null` in the
 original body counts as absent for that merge) and keeps the off switch

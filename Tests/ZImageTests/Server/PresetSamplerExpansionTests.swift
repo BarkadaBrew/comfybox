@@ -124,10 +124,13 @@ final class PresetSamplerExpansionTests: XCTestCase {
         e.c2 != nil, e.projectorScale != nil,
       ].filter { $0 }.count
       if field == "sampler" {
-        // B2: the request's `euler` makes the preset's eta 0.5 undefined —
-        // left off and recorded, so eight of the other nine come through.
-        XCTAssertEqual(adopted, 8, "\(field): eta is skipped under the request's euler")
-        XCTAssertEqual(e.skipped, ["eta (non-RES4LYF sampler 'euler')"])
+        // B2: the request's `euler` makes the preset's eta 0.5 and bongmath
+        // undefined — left off and recorded, so seven of the other nine
+        // come through.
+        XCTAssertEqual(adopted, 7, "\(field): eta + bongmath are skipped under the request's euler")
+        XCTAssertEqual(e.skipped, [
+          "eta (non-RES4LYF sampler 'euler')", "bongmath (non-RES4LYF sampler 'euler')",
+        ])
       } else {
         XCTAssertEqual(adopted, 9, "\(field): exactly the other nine fields still come from the preset")
         XCTAssertEqual(e.skipped, [], field)
@@ -444,7 +447,7 @@ final class PresetSamplerExpansionTests: XCTestCase {
     // eta is the request's, whatever the preset says).
     let withPreset = try expand(
       #"{"prompt":"x","preset":"krea-clown","scheduler":"euler","eta":0.5}"#,
-      fullRecipePreset(stage2: nil))
+      fullRecipePreset(bongmath: nil, stage2: nil))
     XCTAssertEqual(withPreset.eta, 0.5)
     XCTAssertNil(withPreset.presetRecipeSkipped)
     XCTAssertNotNil(krea2Gate(withPreset))
@@ -452,7 +455,7 @@ final class PresetSamplerExpansionTests: XCTestCase {
 
   /// A zero eta is adopted whatever the sampler — it asks for nothing.
   func testZeroPresetEtaIsAdoptedUnderEuler() throws {
-    let preset = fullRecipePreset(sampler: "euler", eta: 0, stage2: nil)
+    let preset = fullRecipePreset(sampler: "euler", eta: 0, bongmath: nil, stage2: nil)
     let out = try expand(#"{"prompt":"x","preset":"krea-clown"}"#, preset)
     XCTAssertEqual(out.eta, 0)
     XCTAssertNil(out.presetRecipeSkipped)
@@ -481,7 +484,7 @@ final class PresetSamplerExpansionTests: XCTestCase {
     XCTAssertTrue(a.presetRecipeApplied?.contains("stage2") ?? false)
 
     // Stage names no sampler → falls back to the render's res_2s → eta kept.
-    let inherit = fullRecipePreset(stage2: PresetStage(steps: 6, denoise: 0.4, eta: 0.3))
+    let inherit = fullRecipePreset(bongmath: nil, stage2: PresetStage(steps: 6, denoise: 0.4, eta: 0.3))
     let b = try expand(#"{"prompt":"x","preset":"krea-clown"}"#, inherit)
     XCTAssertEqual(b.stage2?.eta, 0.3)
     XCTAssertNil(b.presetRecipeSkipped)
@@ -621,15 +624,53 @@ final class PresetSamplerExpansionTests: XCTestCase {
     XCTAssertEqual(object["steps"] as? Int, 12, "the pre-existing keys take the same rule")
   }
 
-  /// `bongmath: true` from a preset on a non-RES4LYF sampler: same gate.
-  func testPresetBongmathOnEulerIsRefused() throws {
+  /// B2, bongmath twin: a preset `euler + bongmath: true` alone renders
+  /// single-layer with bongmath absent and the skip on the record — not a 400.
+  func testPresetBongmathOnEulerAloneIsSkippedAndRecorded() throws {
     let preset = fullRecipePreset(sampler: "euler", eta: nil, bongmath: true, stage2: nil)
     let out = try expand(#"{"prompt":"x","preset":"krea-clown"}"#, preset)
-    XCTAssertThrowsError(try out.validateKrea2TierGates(try out.validateRecipeNames())) { error in
-      guard case .unsupportedRecipeField(let field, _, _, _)? = error as? WarmServerError
-      else { return XCTFail("expected the bongmath gate, got \(error)") }
-      XCTAssertEqual(field, "bongmath")
-    }
+    XCTAssertEqual(out.scheduler, "euler")
+    XCTAssertNil(out.bongmath)
+    XCTAssertNil(out.stage2)
+    XCTAssertEqual(out.presetRecipeSkipped, ["bongmath (non-RES4LYF sampler 'euler')"])
+    XCTAssertFalse(out.presetRecipeApplied?.contains("bongmath") ?? false)
+    XCTAssertNil(krea2Gate(out))
+    XCTAssertEqual(try out.krea2RecipeFields().bongmath, false)
+  }
+
+  /// Preset `res_2s + bongmath: true`, request overrides the sampler to
+  /// `euler`: skipped against the effective sampler; `res_2s` keeps it.
+  func testRequestSamplerOverrideToEulerSkipsThePresetBongmath() throws {
+    let preset = fullRecipePreset(sampler: "res_2s", eta: nil, bongmath: true, stage2: nil)
+    let out = try expand(#"{"prompt":"x","preset":"krea-clown","sampler":"euler"}"#, preset)
+    XCTAssertNil(out.bongmath)
+    XCTAssertEqual(out.presetRecipeSkipped, ["bongmath (non-RES4LYF sampler 'euler')"])
+    XCTAssertNil(krea2Gate(out))
+    let kept = try expand(#"{"prompt":"x","preset":"krea-clown","sampler":"res_2s"}"#, preset)
+    XCTAssertEqual(kept.bongmath, true)
+    XCTAssertNil(kept.presetRecipeSkipped)
+  }
+
+  /// A REQUEST-sourced `bongmath: true` on euler is untouched: still the 400.
+  func testRequestSourcedBongmathOnEulerIsStillRefused() throws {
+    let explicit = try decode(#"{"prompt":"x","scheduler":"euler","bongmath":true}"#)
+    guard case .unsupportedRecipeField(let field, _, _, _)? = krea2Gate(explicit)
+    else { return XCTFail("a request bongmath on euler must hit the bongmath gate") }
+    XCTAssertEqual(field, "bongmath")
+    let withPreset = try expand(
+      #"{"prompt":"x","preset":"krea-clown","scheduler":"euler","bongmath":true}"#,
+      fullRecipePreset(eta: nil, stage2: nil))
+    XCTAssertEqual(withPreset.bongmath, true)
+    XCTAssertNil(withPreset.presetRecipeSkipped)
+    XCTAssertNotNil(krea2Gate(withPreset))
+  }
+
+  /// `bongmath: false` from a preset asks for nothing and is adopted as-is.
+  func testFalsePresetBongmathIsAdoptedUnderEuler() throws {
+    let preset = fullRecipePreset(sampler: "euler", eta: nil, bongmath: false, stage2: nil)
+    let out = try expand(#"{"prompt":"x","preset":"krea-clown"}"#, preset)
+    XCTAssertEqual(out.bongmath, false)
+    XCTAssertNil(out.presetRecipeSkipped)
   }
 
   /// The family capability matrix reads the expanded names too: a preset's
@@ -793,11 +834,13 @@ final class PresetSamplerExpansionTests: XCTestCase {
     XCTAssertNil(object["projector_scale"])
     // The preset-sourced remainder IS written…
     XCTAssertEqual(object["noise_type"] as? String, "fractal")
-    XCTAssertEqual(object["bongmath"] as? Bool, true)
-    // …except the eta, which B2 left off under the request's `euler` — so the
-    // replay body carries no eta either, and the skip is on the record.
+    // …except eta and bongmath, which B2 left off under the request's `euler`
+    // — so the replay body carries neither, and the skips are on the record.
     XCTAssertNil(object["eta"])
-    XCTAssertEqual(payload.presetRecipeSkipped, ["eta (non-RES4LYF sampler 'euler')"])
+    XCTAssertNil(object["bongmath"])
+    XCTAssertEqual(payload.presetRecipeSkipped, [
+      "eta (non-RES4LYF sampler 'euler')", "bongmath (non-RES4LYF sampler 'euler')",
+    ])
   }
 
   // MARK: - `preset_recipe_applied` on the response
