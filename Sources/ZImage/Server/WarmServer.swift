@@ -4249,7 +4249,7 @@ public final class WarmServer {
       // The wake (§3.1.4a point 1) — fire-and-forget, NEVER a mailbox command.
       // resume's only job through the actor is to (re)start the parked loop;
       // decoupling the ACK from that effect is what avoids the v1 wedge.
-      Task { await coordinator.setPaused(false) }
+      Task { await coordinator.wakeAfterAuthoritativeResume() }
     }
     auditLog.append(kind: "queue.pause", message: paused ? "Queue paused" : "Queue resumed")
     // F-1 (adversarial review): BOTH arms return 200. The authoritative
@@ -10764,6 +10764,18 @@ private actor WarmServerCoordinator {
     publishHealth()
   }
 
+  /// Complete the fire-and-forget half of the synchronous resume route.
+  ///
+  /// The route has already cleared the authoritative pause store before it
+  /// acknowledges the request. This actor hop exists only to wake a parked
+  /// processing loop. It must not write `false` again: a long render can delay
+  /// the hop until after a newer pause, and that newer authoritative value wins.
+  func wakeAfterAuthoritativeResume() {
+    guard !liveHealth.isPausedAuthoritative() else { return }
+    startProcessingIfNeeded()
+    publishHealth()
+  }
+
   /// Move a pending job within the queue. direction: up | down | top | bottom.
   /// Returns true if the job was found and moved.
   func movePending(id: String, direction: String) -> Bool {
@@ -16032,7 +16044,12 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// (never a mailbox command — the F1 wedge guard).
   func controlResume() {
     liveHealth.setPaused(false)
-    Task { await coordinator.setPaused(false) }
+    Task { await coordinator.wakeAfterAuthoritativeResume() }
+  }
+
+  /// Deliver the deferred half of a resume deterministically in unit tests.
+  func deliverControlResumeWake() async {
+    await coordinator.wakeAfterAuthoritativeResume()
   }
 
   /// Whether the AUTHORITATIVE (lock-store) pause flag is set — the value the
