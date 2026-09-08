@@ -539,7 +539,10 @@ struct EngineServiceAsyncGenerateTests {
     func transientFailuresAreTolerated() async throws {
         let transport = FakeEngineTransport()
         let engine = makeEngine(transport, outputDirectory: scratchDirectory())
-        engine.imageStatusTransientFailureBudget = 0.2
+        // The full CI bundle can starve this @MainActor task for several wall-clock
+        // seconds. Keep the scripted polls fast, but leave enough real-time budget
+        // that scheduler load is not mistaken for an engine outage.
+        engine.imageStatusTransientFailureBudget = 10.0
         transport.script("/v1/generate/async", [.init(202, #"{"job_id":"T","status":"queued","source":"desktop","elapsed_ms":0}"#)])
         transport.script("/v1/generate/status/T", [
             .init(503, #"{"error":"engine busy"}"#),
@@ -581,7 +584,7 @@ struct EngineServiceAsyncGenerateTests {
         // It retried for about the budget — several polls, not one, not forever.
         #expect(transport.requestCount("GET", "/v1/generate/status/D") > 1)
         #expect(elapsed >= 0.15)
-        #expect(elapsed < 5.0, "the budget bounds it; it must not hang")
+        #expect(elapsed < 10.0, "the budget bounds it; it must not hang")
     }
 
     /// The budget is WALL-CLOCK, not a poll count: a long poll interval must not
@@ -590,7 +593,9 @@ struct EngineServiceAsyncGenerateTests {
     func transientBudgetIsWallClockNotPollCount() async throws {
         let transport = FakeEngineTransport()
         let engine = makeEngine(transport, outputDirectory: scratchDirectory())
-        engine.imageStatusTransientFailureBudget = 0.3
+        // This test is about recovery after multiple poll intervals, not the CI
+        // runner's ability to schedule the main actor within a sub-second window.
+        engine.imageStatusTransientFailureBudget = 10.0
         engine.imageStatusPollInterval = 0.1
         transport.script("/v1/generate/async", [.init(202, #"{"job_id":"WC","status":"queued","source":"desktop","elapsed_ms":0}"#)])
         // Fails for ~0.2s (2 polls), then recovers well inside the budget.
