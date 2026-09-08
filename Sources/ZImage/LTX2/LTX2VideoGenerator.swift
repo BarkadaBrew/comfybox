@@ -105,6 +105,10 @@ public struct LTX2VideoRequest: Sendable {
     /// rather than a schema change; nothing populates it yet (#408 owns the
     /// wire-up). Not used by the render itself.
     public var dimensionReason: String?
+    /// The public server may deliberately disable an unsafe/unproductive
+    /// refine while retaining the caller's original intent for provenance.
+    public var twoStageRequested: Bool?
+    public var refineSkippedReasonHint: String?
 
     /// `loras`, with the deprecated single `loraPath`/`loraStrength` (if set)
     /// prepended — the single field always applied first, matching the old
@@ -144,13 +148,17 @@ public struct LTX2VideoRequest: Sendable {
         beatSchedule: [BeatSegment]? = nil,
         source: String? = nil,
         contentMode: String? = nil,
-        dimensionReason: String? = nil
+        dimensionReason: String? = nil,
+        twoStageRequested: Bool? = nil,
+        refineSkippedReasonHint: String? = nil
     ) {
         self.audio = audio
         self.beatSchedule = beatSchedule
         self.source = source
         self.contentMode = contentMode
         self.dimensionReason = dimensionReason
+        self.twoStageRequested = twoStageRequested
+        self.refineSkippedReasonHint = refineSkippedReasonHint
         self.prompt = prompt
         self.negativePrompt = negativePrompt
         self.initImagePath = initImagePath
@@ -1143,7 +1151,7 @@ public final class LTX2VideoGenerator {
         // chunk loop below) and snapshotted onto every checkpoint — so a skip
         // recorded before a preemption survives a cold resume even if the
         // pipeline/generator that recorded it was deallocated in between.
-        var refineSkippedReason: String? = ctx.refineSkippedReason
+        var refineSkippedReason: String? = ctx.refineSkippedReason ?? request.refineSkippedReasonHint
         /// Close out this render segment and hand the checkpoint up with its
         /// own snapshot of the generator-level continuation.
         ///
@@ -1280,7 +1288,8 @@ public final class LTX2VideoGenerator {
         // negative pass every step even at cfg=1).
         let negText: String? = {
             if let n = request.negativePrompt, !n.isEmpty { return n }
-            return pipeline.resolvedConfig.samplerIsCfgPP
+            return (pipeline.resolvedConfig.samplerIsCfgPP
+                || pipeline.resolvedConfig.nagConfig?.isEnabled == true)
                 ? "subtitle, caption, text, text on screen, watermark, logo, timestamp, distorted sound, saturated sound, loud noises, static"
                 : nil
         }()
@@ -1796,10 +1805,20 @@ public final class LTX2VideoGenerator {
             frameCount: allFrames.count,
             resolvedWidth: deliveredW,
             resolvedHeight: deliveredH,
-            twoStageRequested: pipeline.resolvedConfig.twoStage,
+            twoStageRequested: request.twoStageRequested ?? pipeline.resolvedConfig.twoStage,
             refineSkippedReason: refineSkippedReason,
             audioWritten: audioTrack != nil,
-            configGuidance: pipeline.config.guidance)
+            configGuidance: pipeline.config.guidance,
+            actualSteps: pipeline.resolvedConfig.stage1SigmasOrNil.map { $0.count - 1 }
+                ?? request.steps,
+            sampler: pipeline.resolvedConfig.sampler,
+            stage1Sigmas: pipeline.resolvedConfig.stage1SigmasOrNil,
+            refineSigmas: pipeline.resolvedConfig.twoStage && refineSkippedReason == nil
+                ? pipeline.resolvedConfig.refineSigmasEffective : nil,
+            nagConfig: pipeline.resolvedConfig.nagConfig,
+            nagApplied: pipeline.resolvedConfig.nagConfig?.isEnabled == true && negBatch != nil,
+            audioRefine: audioTrack != nil && pipeline.resolvedConfig.twoStage
+                && refineSkippedReason == nil && pipeline.resolvedConfig.audioRefine)
 
         // comfybox#322: last boundary before anything is written to disk, so a
         // cancelled render never leaves a file at `outputPath` (the `defer`

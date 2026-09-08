@@ -1310,6 +1310,7 @@ public final class LTX2Pipeline {
         latents, latF: latF, latH: latH, latW: latW,
         textEmbeddings: textOutput.videoEmbeddings,
         negativeEmbeddings: negativeEmbeddings,
+        nagEmbeddings: nagEmbeddings, nag: nagConfig,
         cfgScale: cfgScale, seed: seed,
         refineAnchorImage: refineAnchorImage,
         avState: avState,
@@ -1565,6 +1566,7 @@ public final class LTX2Pipeline {
         sigmas: sigmas,
         cfgScale: cfgScale,
         state: state,
+        nagEmbeddings: nagEmbeddings, nag: nagConfig,
         startStep: baseStartStep,
         seed: seed,
         preemption: preemption,
@@ -1596,6 +1598,7 @@ public final class LTX2Pipeline {
         latents, latF: latF, latH: latH, latW: latW,
         textEmbeddings: textOutput.videoEmbeddings,
         negativeEmbeddings: negativeEmbeddings,
+        nagEmbeddings: nagEmbeddings, nag: nagConfig,
         cfgScale: cfgScale, seed: seed,
         refineAnchorImage: nil,
         preemption: preemption, telemetry: telemetry,
@@ -1869,10 +1872,10 @@ public final class LTX2Pipeline {
       var avVelocityPos: MLXArray? = nil
       var avVelocityNeg: MLXArray? = nil
       if let av = avState {
-        // Joint A/V pass (task #21): both velocities in one forward. NAG is
-        // not available on this path yet (spec open item) — the joint model's
-        // a2v cross-modal coupling replaces it as the video conditioning
-        // difference. Audio updates HERE (positive pass only, plain Euler,
+        // Joint A/V pass (task #21): both velocities in one forward. NAG
+        // patches the video text cross-attention inside this positive pass;
+        // audio text attention and a2v/v2a keep their original structure.
+        // Audio updates HERE (positive pass only, plain Euler,
         // deterministic): CFG/STG passes below remain video-only and steer
         // only the video x0.
         let (vv, va) = transformer.callAV(
@@ -1883,6 +1886,8 @@ public final class LTX2Pipeline {
           audioSigma: sigma,
           context: textEmbeddings.asType(dtype),
           audioContext: av.audioContext.asType(dtype),
+          nagContext: nagEmbeddings?.asType(dtype),
+          nag: nag,
           sigma: sigmaArray,
           pe: av.pe,
           // Beat schedule rides ONLY the positive pass (cond-only threading,
@@ -2318,6 +2323,8 @@ public final class LTX2Pipeline {
     latF: Int, latH: Int, latW: Int,
     textEmbeddings: MLXArray,
     negativeEmbeddings: MLXArray?,
+    nagEmbeddings: MLXArray?,
+    nag: LTX2NAGConfig,
     cfgScale: Float,
     seed: UInt64?,
     refineAnchorImage: MLXArray?,
@@ -2550,6 +2557,7 @@ public final class LTX2Pipeline {
       latents: refineInit, positions: refinePos, precomputedPE: refinePE,
       textEmbeddings: textEmbeddings, negativeEmbeddings: negativeEmbeddings,
       sigmas: refineSigmas, cfgScale: cfgScale, state: refState,
+      nagEmbeddings: nagEmbeddings, nag: nag,
       forceDeterministic: ProcessInfo.processInfo.environment["LTX2_REFINE_DETERMINISTIC"] != "0",
       avState: refineAVState,
       // #1479 codex review: see the T2V inline refine call site's comment —

@@ -200,10 +200,47 @@ final class Phase3ConfigFollowupsTests: XCTestCase {
   func testResolvedLTX2FramesRequestWinsOverConfig() {
     XCTAssertEqual(
       WarmServer.resolvedLTX2Frames(requestFrames: 49, videoConfigDefaults: VideoDefaultValues(frames: 121)),
+      97,
+      "production video requests must not silently run the low-quality 49-frame diagnostic recipe")
+  }
+
+  func testResolvedLTX2FramesDiagnosticRequestMayUseShortClip() {
+    XCTAssertEqual(
+      WarmServer.resolvedLTX2Frames(
+        requestFrames: 49, videoConfigDefaults: VideoDefaultValues(frames: 121), diagnostic: true),
       49)
+  }
+
+  func testResolvedLTX2FramesRoundsProductionRequestUpToValidOnePlusEightK() {
+    XCTAssertEqual(
+      WarmServer.resolvedLTX2Frames(requestFrames: 100, videoConfigDefaults: VideoDefaultValues()),
+      105)
   }
 
   func testResolvedLTX2FramesFallsBackTo97WhenBothAreAbsent() {
     XCTAssertEqual(WarmServer.resolvedLTX2Frames(requestFrames: nil, videoConfigDefaults: VideoDefaultValues()), 97)
+  }
+
+
+  // MARK: - Production guidance contract (comfybox#424)
+
+  func testProductionNAGRejectsCFGAboveOne() {
+    XCTAssertNotNil(WarmServer.productionVideoQualityError(
+      guidance: 2.0, cfgSchedule: [], nagEnabled: true, diagnostic: false))
+  }
+
+  func testDiagnosticNAGAllowsCFGExperiment() {
+    XCTAssertNil(WarmServer.productionVideoQualityError(
+      guidance: 2.0, cfgSchedule: [], nagEnabled: true, diagnostic: true))
+  }
+
+  func testProductionNAGRejectsCFGScheduleAboveOne() {
+    XCTAssertNotNil(WarmServer.productionVideoQualityError(
+      guidance: 1.0, cfgSchedule: [1.0, 1.25, 1.0], nagEnabled: true, diagnostic: false))
+  }
+
+  func testProductionWithoutNAGMayUseCFGAboveOne() {
+    XCTAssertNil(WarmServer.productionVideoQualityError(
+      guidance: 2.0, cfgSchedule: [], nagEnabled: false, diagnostic: false))
   }
 }

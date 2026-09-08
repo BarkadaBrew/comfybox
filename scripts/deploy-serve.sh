@@ -50,6 +50,7 @@ smoke() {
 if (( SMOKE_ONLY )); then smoke; exit 0; fi
 
 say "1) Todd was told before this ran (pause is visible; codesign can prompt)."
+"$ROOT/scripts/check-production-video-recipe.sh" "$PLIST" || fail "production video recipe preflight failed"
 PAUSED=0
 STAMPED=0
 on_exit() {
@@ -88,6 +89,21 @@ else
   codesign --force --sign - --identifier "$LABEL" "$BIN_DIR/ComfyBox-$sha" 2>&1 | tail -1 || true
   print -P "%F{red}[deploy $sha] WARN: stable identity missing — ad-hoc signed; Removable-Volumes/Local-Network grants will re-prompt%f" >&2
 fi
+
+# A paused queue stops new work but does not cancel the render already on the
+# GPU. Never bootout while MLX kernels are in flight: that has produced mutex
+# crashes and partial outputs. On timeout, fail before changing `current`.
+DRAIN_TIMEOUT=${DEPLOY_DRAIN_TIMEOUT:-900}
+waited=0
+while (( waited < DRAIN_TIMEOUT )); do
+  rendering=$(health 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("is_rendering", False))' 2>/dev/null || print down)
+  [[ "$rendering" == False || "$rendering" == down ]] && break
+  (( waited == 0 )) && say "   active render detected; draining before restart (timeout ${DRAIN_TIMEOUT}s)"
+  sleep 5
+  (( waited += 5 ))
+done
+(( waited < DRAIN_TIMEOUT )) || fail "render still active after ${DRAIN_TIMEOUT}s; current binary was not switched"
+
 prev=$(readlink "$BIN_DIR/current" 2>/dev/null || echo none)
 ln -sfn "ComfyBox-$sha" "$BIN_DIR/current"
 say "   current -> ComfyBox-$sha (previous: $prev)"

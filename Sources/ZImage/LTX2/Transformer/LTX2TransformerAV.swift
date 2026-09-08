@@ -143,8 +143,8 @@ extension LTX2Transformer {
   /// `callDualStream`, then both output projections.
   ///
   /// v1 scope: audio timestep is a SCALAR sigma (t2v audio; per-token audio
-  /// timesteps arrive with i2v mask integration); no NAG/STG on this path
-  /// yet. `videoSigmaMax` drives the av_ca video scale-shift and the v2a
+  /// timesteps arrive with i2v mask integration). `videoSigmaMax` drives the
+  /// av_ca video scale-shift and the v2a
   /// gate — pass the max video sigma (== sigma for uniform timesteps).
   public func callAV(
     latent: MLXArray,
@@ -155,6 +155,8 @@ extension LTX2Transformer {
     context: MLXArray,
     audioContext: MLXArray,
     contextMask: MLXArray? = nil,
+    nagContext: MLXArray? = nil,
+    nag: LTX2NAGConfig = .disabled,
     sigma: MLXArray? = nil,
     pe: (videoPE: (cos: MLXArray, sin: MLXArray),
          audioPE: (cos: MLXArray, sin: MLXArray),
@@ -181,6 +183,13 @@ extension LTX2Transformer {
     var ctx = context
     if let captionProj = captionProjection { ctx = captionProj(ctx) }
     ctx = ctx.reshaped(batchSize, -1, vx.dim(-1))
+    var negativeCtx = nagContext
+    if let nagContext, let captionProj = captionProjection {
+      negativeCtx = captionProj(nagContext)
+    }
+    if let projected = negativeCtx {
+      negativeCtx = projected.reshaped(batchSize, -1, vx.dim(-1))
+    }
 
     var attnMask = contextMask
     if let mask = attnMask {
@@ -221,6 +230,8 @@ extension LTX2Transformer {
         audioCrossGateTimestep: av.audioCrossGateTimestep,
         promptTimestep: promptTS,
         audioPromptTimestep: av.audioPromptTimestep,
+        negativeContext: negativeCtx,
+        nag: nag,
         beatBias: beatBias,
         audioBeatBias: audioBeatBias)
     }

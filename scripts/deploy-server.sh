@@ -9,6 +9,7 @@ BIN=".build/release/ComfyBox"
 LABEL="com.barkadabrew.comfybox"
 
 cd "$(dirname "$0")/.."
+scripts/check-production-video-recipe.sh
 swift build -c release --product ComfyBox
 
 xattr -cr "$BIN"

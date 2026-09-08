@@ -148,6 +148,30 @@ final class VideoTracePayloadTests: XCTestCase {
     XCTAssertNil(unmeasured["output_height"])
   }
 
+  func testMeasuredPayloadCarriesTheExecutedRecipe() {
+    let record = VideoGenerationRecord(
+      prompt: "p", steps: 10, requestedSteps: 8, model: "ltx2",
+      width: 704, height: 448, frames: 97, fps: 24,
+      resolvedWidth: 704, resolvedHeight: 448,
+      twoPass: false, refine: false, audio: true,
+      sampler: "euler_ancestral_cfg_pp", stage1Sigmas: [1, 0.5, 0],
+      nagScale: 11, nagAlpha: 0.25, nagTau: 2.5,
+      nagApplied: true, audioRefine: false, kind: "t2v")
+    let result = LTX2VideoResult(
+      outputPath: "/tmp/x.mp4", frameCount: 97, durationSeconds: 4,
+      elapsedSeconds: 1, generationRecord: record,
+      outputWidth: 704, outputHeight: 448)
+
+    let payload = WarmServer.videoMeasuredOutputPayload(result: result)
+    XCTAssertEqual(payload["steps"], "10")
+    XCTAssertEqual(payload["requested_steps"], "8")
+    XCTAssertEqual(payload["sampler"], "euler_ancestral_cfg_pp")
+    XCTAssertEqual(payload["stage1_sigmas"], "1.0,0.5,0.0")
+    XCTAssertEqual(payload["nag_applied"], "true")
+    XCTAssertEqual(payload["nag_scale"], "11.0")
+    XCTAssertEqual(payload["audio_refine"], "false")
+  }
+
   // MARK: - The sync route writes submitted + terminal on BOTH paths
 
   func testSyncRouteWritesSubmittedAndTerminalOnSuccess() {

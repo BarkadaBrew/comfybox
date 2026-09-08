@@ -28,7 +28,7 @@ curl -s -m 10 -X POST http://localhost:3787/v1/kira/content-scheduler/pause >/de
 PROMPT="standing sex, he thrusts into her petite body in a steady fluid rhythm, her hips rocking with each thrust, breasts moving, penetration clearly visible, she reacts, natural continuous coherent motion, sharp photorealistic skin, fine detail"
 NEG="subtitle, caption, text, text on screen, watermark, logo, timestamp"
 JOB=$(curl -s -m 30 -X POST http://127.0.0.1:7870/v1/video/generate/async -H "Content-Type: application/json" \
-  -d "{\"prompt\":\"$PROMPT\",\"negative_prompt\":\"$NEG\",\"image_path\":\"$REPO/qa/video/assets/seed-girl.png\",\"width\":384,\"height\":640,\"frames\":49,\"seed\":43,\"backend\":\"local\",\"content_mode\":\"avocado\",\"strength\":1.0,\"enhance\":false,\"character\":\"\"}" \
+  -d "{\"prompt\":\"$PROMPT\",\"negative_prompt\":\"$NEG\",\"image_path\":\"$REPO/qa/video/assets/seed-girl.png\",\"width\":384,\"height\":640,\"frames\":49,\"diagnostic\":true,\"seed\":43,\"backend\":\"local\",\"content_mode\":\"avocado\",\"strength\":1.0,\"enhance\":false,\"character\":\"\"}" \
   | python3 -c "import sys,json;print(json.load(sys.stdin).get('job_id',''))")
 [ -z "$JOB" ] && fail "submit failed"
 

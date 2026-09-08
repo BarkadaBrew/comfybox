@@ -26,6 +26,19 @@ final class LTX2NAGBlockTests: XCTestCase {
     return block
   }
 
+  private func makeAVBlock() -> LTX2TransformerBlock {
+    MLXRandom.seed(23)
+    let block = LTX2TransformerBlock(
+      dim: 64, contextDim: 64, heads: 4, dimHead: 16,
+      hasPromptAdaLN: true, hasAudio: true,
+      audioDim: 32, audioHeads: 2, audioDimHead: 16)
+    for (_, p) in block.parameters().flattened() {
+      p[0..., .ellipsis] = MLXRandom.normal(p.shape) * 0.05
+    }
+    MLX.eval(block.parameters())
+    return block
+  }
+
   /// Without a negative context the block must behave exactly as before —
   /// NAG is opt-in and existing renders stay byte-identical.
   func testNoNegativeContextLeavesBlockUnchanged() {
@@ -102,5 +115,67 @@ final class LTX2NAGBlockTests: XCTestCase {
 
     XCTAssertLessThan(MLX.abs(baseline - guided).max().item(Float.self), 1e-4,
                       "pos == neg must be a no-op through the block")
+  }
+
+
+  /// Joint audio/video inference used a separate block entry point and was
+  /// silently bypassing the video-side NAG patch. The negative pass belongs
+  /// only on video text cross-attention; audio text/cross-modal structure is
+  /// otherwise unchanged.
+  func testEnabledNAGChangesJointAVVideoOutput() {
+    let block = makeAVBlock()
+    MLXRandom.seed(29)
+    let video = MLXRandom.normal([1, 8, 64])
+    let audio = MLXRandom.normal([1, 5, 32])
+    let context = MLXRandom.normal([1, 5, 64])
+    let negative = MLXRandom.normal([1, 5, 64])
+    let audioContext = MLXRandom.normal([1, 5, 32])
+    let timestep = MLXRandom.normal([1, 1, 9 * 64])
+    let audioTimestep = MLXRandom.normal([1, 1, 9 * 32])
+    let promptTimestep = MLXRandom.normal([1, 1, 2 * 64])
+    let audioPromptTimestep = MLXRandom.normal([1, 1, 2 * 32])
+
+    let baseline = block.callDualStream(
+      video: video, audio: audio, context: context, audioContext: audioContext,
+      timestep: timestep, audioTimestep: audioTimestep,
+      promptTimestep: promptTimestep, audioPromptTimestep: audioPromptTimestep)
+    let guided = block.callDualStream(
+      video: video, audio: audio, context: context, audioContext: audioContext,
+      timestep: timestep, audioTimestep: audioTimestep,
+      promptTimestep: promptTimestep, audioPromptTimestep: audioPromptTimestep,
+      negativeContext: negative, nag: .reference)
+    MLX.eval(baseline.video, guided.video)
+
+    XCTAssertGreaterThan(
+      MLX.abs(baseline.video - guided.video).max().item(Float.self), 1e-4,
+      "joint A/V inference must apply NAG to the video text cross-attention")
+  }
+
+  func testDisabledNAGLeavesJointAVOutputUnchanged() {
+    let block = makeAVBlock()
+    MLXRandom.seed(31)
+    let video = MLXRandom.normal([1, 8, 64])
+    let audio = MLXRandom.normal([1, 5, 32])
+    let context = MLXRandom.normal([1, 5, 64])
+    let negative = MLXRandom.normal([1, 5, 64])
+    let audioContext = MLXRandom.normal([1, 5, 32])
+    let timestep = MLXRandom.normal([1, 1, 9 * 64])
+    let audioTimestep = MLXRandom.normal([1, 1, 9 * 32])
+    let promptTimestep = MLXRandom.normal([1, 1, 2 * 64])
+    let audioPromptTimestep = MLXRandom.normal([1, 1, 2 * 32])
+
+    let baseline = block.callDualStream(
+      video: video, audio: audio, context: context, audioContext: audioContext,
+      timestep: timestep, audioTimestep: audioTimestep,
+      promptTimestep: promptTimestep, audioPromptTimestep: audioPromptTimestep)
+    let disabled = block.callDualStream(
+      video: video, audio: audio, context: context, audioContext: audioContext,
+      timestep: timestep, audioTimestep: audioTimestep,
+      promptTimestep: promptTimestep, audioPromptTimestep: audioPromptTimestep,
+      negativeContext: negative, nag: .disabled)
+    MLX.eval(baseline.video, disabled.video, baseline.audio, disabled.audio)
+
+    XCTAssertLessThan(MLX.abs(baseline.video - disabled.video).max().item(Float.self), 1e-5)
+    XCTAssertLessThan(MLX.abs(baseline.audio - disabled.audio).max().item(Float.self), 1e-5)
   }
 }

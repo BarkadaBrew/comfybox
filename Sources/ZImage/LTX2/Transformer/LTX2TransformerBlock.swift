@@ -216,6 +216,10 @@ public final class LTX2TransformerBlock: Module {
     audioCrossGateTimestep: MLXArray? = nil,
     promptTimestep: MLXArray? = nil,
     audioPromptTimestep: MLXArray? = nil,
+    // NAG is a video text-conditioning patch. The audio text attention and
+    // both cross-modal attentions intentionally keep their existing math.
+    negativeContext: MLXArray? = nil,
+    nag: LTX2NAGConfig = .disabled,
     // Temporal beat scheduling (comfybox#310): additive Gaussian-penalty
     // bias on the TEXT cross-attentions only — a2v/v2a (cross-modal) are
     // untouched. Nil (the default) leaves this byte-identical to before.
@@ -232,13 +236,29 @@ public final class LTX2TransformerBlock: Module {
     v = v + attn1(vNorm, pe: pe) * vMSA[2]
 
     let vCross = getAdaValues(table: scaleShiftTable, batchSize: b, timestep: timestep, range: 6..<9)
+    let nagActive = nag.isEnabled && negativeContext != nil
     var vCtx = context
+    var vNegCtx = negativeContext
     if let pTS = promptTimestep, let pTable = promptScaleShiftTable {
       let pp = getAdaValues(table: pTable, batchSize: b, timestep: pTS, range: 0..<2)
       vCtx = context * (1 + pp[1]) + pp[0]
+      if let negativeContext {
+        vNegCtx = negativeContext * (1 + pp[1]) + pp[0]
+      }
     }
-    v = v + attn2(weightFreeRMSNorm(v) * (1 + vCross[1]) + vCross[0],
-                  context: vCtx, mask: LTX2BeatScheduleBuilder.combine(contextMask, beatBias)) * vCross[2]
+    let vAttnInput = weightFreeRMSNorm(v) * (1 + vCross[1]) + vCross[0]
+    var vCrossOut = attn2(
+      vAttnInput, context: vCtx,
+      mask: LTX2BeatScheduleBuilder.combine(contextMask, beatBias))
+    if nagActive, let vNegCtx {
+      // Beat bias is positive-conditioning-only. The negative concept stays
+      // temporally unbiased, matching the video-only block path.
+      let negativeOut = attn2(vAttnInput, context: vNegCtx, mask: contextMask)
+      vCrossOut = ltx2ApplyNAG(
+        positive: vCrossOut, negative: negativeOut,
+        scale: nag.scale, alpha: nag.alpha, tau: nag.tau)
+    }
+    v = v + vCrossOut * vCross[2]
 
     // ---- Audio stream: self-attn, text cross-attn ----
     var a = audio
