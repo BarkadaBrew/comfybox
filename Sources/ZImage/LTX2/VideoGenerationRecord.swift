@@ -42,6 +42,9 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
   /// single seed) — every per-shot/per-render record carries one.
   public let seed: UInt64?
   public let steps: Int?
+  /// Caller-visible step request, retained separately when a resolved sigma
+  /// schedule determines a different number of executed denoise steps.
+  public let requestedSteps: Int?
   /// CFG guidance — LTX's primary motion lever (>1 amplifies the action
   /// direction). Same field/key `ImageMetadata.generation`'s `guidance`
   /// carries on the PNG side.
@@ -80,6 +83,16 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
   public let refineSkippedReason: String?
   /// Synchronized audio track present in this render.
   public let audio: Bool
+  /// Resolved execution recipe. Optional so sidecars written before these
+  /// fields existed remain decodable.
+  public let sampler: String?
+  public let stage1Sigmas: [Float]?
+  public let refineSigmas: [Float]?
+  public let nagScale: Float?
+  public let nagAlpha: Float?
+  public let nagTau: Float?
+  public let nagApplied: Bool?
+  public let audioRefine: Bool?
   /// `"t2v" | "i2v" | "extend" | "storyboard"` — how this clip was produced.
   /// `"extend"` is an i2v render whose request asked for more than one chunk
   /// (`extendToSeconds > 0`); a plain i2v single chunk stays `"i2v"`.
@@ -110,10 +123,14 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
 
   public init(
     prompt: String, negativePrompt: String? = nil, seed: UInt64? = nil, steps: Int? = nil,
+    requestedSteps: Int? = nil,
     guidance: Float? = nil,
     model: String, width: Int, height: Int, frames: Int, fps: Int,
     resolvedWidth: Int, resolvedHeight: Int, dimensionReason: String? = nil,
     twoPass: Bool, refine: Bool, refineSkippedReason: String? = nil, audio: Bool,
+    sampler: String? = nil, stage1Sigmas: [Float]? = nil, refineSigmas: [Float]? = nil,
+    nagScale: Float? = nil, nagAlpha: Float? = nil, nagTau: Float? = nil,
+    nagApplied: Bool? = nil, audioRefine: Bool? = nil,
     kind: String, source: String? = nil, contentMode: String? = nil, truncated: Bool = false,
     loras: [LoRAEntry] = []
   ) {
@@ -121,6 +138,7 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     self.negativePrompt = negativePrompt
     self.seed = seed
     self.steps = steps
+    self.requestedSteps = requestedSteps
     self.guidance = guidance
     self.model = model
     self.width = width
@@ -134,6 +152,14 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     self.refine = refine
     self.refineSkippedReason = refineSkippedReason
     self.audio = audio
+    self.sampler = sampler
+    self.stage1Sigmas = stage1Sigmas
+    self.refineSigmas = refineSigmas
+    self.nagScale = nagScale
+    self.nagAlpha = nagAlpha
+    self.nagTau = nagTau
+    self.nagApplied = nagApplied
+    self.audioRefine = audioRefine
     self.kind = kind
     self.source = source
     self.contentMode = contentMode
@@ -189,13 +215,21 @@ extension VideoGenerationRecord {
     twoStageRequested: Bool,
     refineSkippedReason: String?,
     audioWritten: Bool,
-    configGuidance: Float
+    configGuidance: Float,
+    actualSteps: Int? = nil,
+    sampler: String? = nil,
+    stage1Sigmas: [Float]? = nil,
+    refineSigmas: [Float]? = nil,
+    nagConfig: LTX2NAGConfig? = nil,
+    nagApplied: Bool? = nil,
+    audioRefine: Bool? = nil
   ) -> VideoGenerationRecord {
     VideoGenerationRecord(
       prompt: request.prompt,
       negativePrompt: request.negativePrompt,
       seed: request.seed,
-      steps: request.steps,
+      steps: actualSteps ?? request.steps,
+      requestedSteps: request.steps,
       guidance: request.guidance ?? configGuidance,
       model: basename(transformerFile),
       width: request.width,
@@ -209,6 +243,14 @@ extension VideoGenerationRecord {
       refine: twoStageRequested && refineSkippedReason == nil,
       refineSkippedReason: refineSkippedReason,
       audio: audioWritten,
+      sampler: sampler,
+      stage1Sigmas: stage1Sigmas,
+      refineSigmas: refineSigmas,
+      nagScale: nagConfig?.scale,
+      nagAlpha: nagConfig?.alpha,
+      nagTau: nagConfig?.tau,
+      nagApplied: nagApplied,
+      audioRefine: audioRefine,
       kind: kind(initImagePath: request.initImagePath, extendToSeconds: request.extendToSeconds),
       source: request.source,
       contentMode: request.contentMode,

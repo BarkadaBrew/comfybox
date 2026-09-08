@@ -108,6 +108,38 @@ final class VideoGenerationRecordTests: XCTestCase {
     XCTAssertEqual(record.guidance, 4.5, "an explicit request override must win over the config default")
   }
 
+  func testBuildRecordsTheRecipeThatActuallyExecutedSeparatelyFromTheRequest() throws {
+    let request = LTX2VideoRequest(
+      prompt: "p", width: 704, height: 448, framesPerChunk: 97, steps: 8,
+      outputPath: "/tmp/o.mp4")
+    let nag = LTX2NAGConfig(scale: 11, alpha: 0.25, tau: 2.5)
+    let record = VideoGenerationRecord.build(
+      request: request, transformerFile: "t.safetensors", frameCount: 97,
+      resolvedWidth: 704, resolvedHeight: 448, twoStageRequested: false,
+      refineSkippedReason: nil, audioWritten: true, configGuidance: 1.0,
+      actualSteps: 10, sampler: "euler_ancestral_cfg_pp",
+      stage1Sigmas: [1, 0.5, 0], refineSigmas: nil,
+      nagConfig: nag, nagApplied: true, audioRefine: false)
+
+    XCTAssertEqual(record.requestedSteps, 8)
+    XCTAssertEqual(record.steps, 10)
+    XCTAssertEqual(record.sampler, "euler_ancestral_cfg_pp")
+    XCTAssertEqual(record.stage1Sigmas, [1, 0.5, 0])
+    XCTAssertNil(record.refineSigmas)
+    XCTAssertEqual(record.nagScale, 11)
+    XCTAssertEqual(record.nagAlpha, 0.25)
+    XCTAssertEqual(record.nagTau, 2.5)
+    XCTAssertEqual(record.nagApplied, true)
+    XCTAssertEqual(record.audioRefine, false)
+
+    let json = try JSONSerialization.jsonObject(with: record.encodeJSON()) as? [String: Any]
+    XCTAssertEqual(json?["requested_steps"] as? Int, 8)
+    XCTAssertEqual(json?["steps"] as? Int, 10)
+    XCTAssertEqual(json?["sampler"] as? String, "euler_ancestral_cfg_pp")
+    XCTAssertEqual(json?["nag_applied"] as? Bool, true)
+    XCTAssertEqual(json?["audio_refine"] as? Bool, false)
+  }
+
   // `WarmServer.buildLocalVideoRequest` is where "request override, else
   // preset guidance" actually happens — `build()` above only sees whatever
   // `request.guidance` already holds by the time it gets there. See
@@ -200,6 +232,21 @@ final class VideoGenerationRecordTests: XCTestCase {
     XCTAssertEqual(decoded, record)
     XCTAssertNil(decoded.seed)
     XCTAssertNil(decoded.steps)
+  }
+
+  func testSidecarWrittenBeforeExecutionRecipeFieldsStillDecodes() throws {
+    let legacy = #"""
+      {"prompt":"old clip","steps":8,"model":"ltx2","width":704,"height":448,
+       "frames":97,"fps":24,"resolved_width":704,"resolved_height":448,
+       "two_pass":false,"refine":false,"audio":false,"kind":"t2v",
+       "truncated":false,"loras":[]}
+      """#
+    let decoded = try VideoGenerationRecord.decodeJSON(Data(legacy.utf8))
+    XCTAssertEqual(decoded.steps, 8)
+    XCTAssertNil(decoded.requestedSteps)
+    XCTAssertNil(decoded.sampler)
+    XCTAssertNil(decoded.nagApplied)
+    XCTAssertNil(decoded.audioRefine)
   }
 
   func testWireKeysAreSnakeCase() throws {

@@ -48,6 +48,13 @@ final class LocalVideoRequestDecodeTests: XCTestCase {
     XCTAssertNil(req.twoPass, "no two_pass key, no tuning key — additive field must not be required")
   }
 
+  func testDiagnosticFlagDecodesWithoutBecomingRequired() throws {
+    XCTAssertEqual(
+      try decodeLocalVideoRequest(#"{"prompt":"x","diagnostic":true}"#).diagnostic,
+      true)
+    XCTAssertNil(try decodeLocalVideoRequest(#"{"prompt":"x"}"#).diagnostic)
+  }
+
   /// `two_pass` is additive: it must not disturb the pre-existing
   /// `tuning.two_stage` decode path exercised above.
   func testTwoPassAlongsideExistingTuningBlockBothDecode() throws {
@@ -160,6 +167,24 @@ final class LocalVideoRequestDecodeTests: XCTestCase {
   func testBuildLocalVideoRequestNestedTuningStillWinsOnConflict() throws {
     let request = try buildRequest(#"{"prompt":"x","two_pass":true,"tuning":{"two_stage":false}}"#)
     XCTAssertEqual(request.tuning?.twoStage, false)
+  }
+
+  func testBuildLocalVideoRequestCanForceSingleStageAndPreserveRequestedProvenance() throws {
+    let req = try decodeLocalVideoRequest(#"{"prompt":"x","two_pass":true}"#)
+    let request = WarmServer.buildLocalVideoRequest(
+      req: req, videoPreset: nil,
+      effectivePrompt: req.prompt, effectiveInitImage: nil,
+      renderWidth: 320, renderHeight: 320,
+      foldedFramesPerChunk: 97, foldedExtendSeconds: 0,
+      resolvedLoRAs: [], effectiveBeatSchedule: nil,
+      resolvedOutput: "/tmp/o.mp4",
+      forceSingleStage: true,
+      twoStageRequested: true,
+      refineSkippedReasonHint: "stage1_floor")
+
+    XCTAssertEqual(request.tuning?.twoStage, false)
+    XCTAssertEqual(request.twoStageRequested, true)
+    XCTAssertEqual(request.refineSkippedReasonHint, "stage1_floor")
   }
 
   // MARK: - comfybox#401 review round 3, ruling 1: guidance preset fallback

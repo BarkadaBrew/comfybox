@@ -26,6 +26,10 @@ final class EffectiveVideoConfigTests: XCTestCase {
     XCTAssertNil(q.twoPass)
   }
 
+  func testDiagnosticDecodesOnTheQuery() throws {
+    XCTAssertEqual(try decodeQuery(#"{"diagnostic":true}"#).diagnostic, true)
+  }
+
   // MARK: - effectiveVideoTuning(for: EffectiveVideoConfigQuery) — same merge as the request path
 
   func testEffectiveTuningFollowsTopLevelTwoPassOnTheQuery() throws {
@@ -64,6 +68,9 @@ final class EffectiveVideoConfigTests: XCTestCase {
     let steps = plan(width: 320, height: 320, resolvedTwoStage: true).map { $0["step"] }
     XCTAssertTrue(steps.contains("stage1_floor"), "\(steps)")
     XCTAssertFalse(steps.contains("two_stage_halving"), "\(steps)")
+    XCTAssertTrue(
+      plan(width: 320, height: 320, resolvedTwoStage: true)
+        .contains { $0["note"]?.contains("two-stage skipped") == true })
   }
 
   /// End-to-end through the ACTUAL two functions the route calls, in the

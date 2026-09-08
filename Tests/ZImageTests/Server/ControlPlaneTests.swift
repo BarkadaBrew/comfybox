@@ -113,7 +113,8 @@ final class ControlPlaneTests: XCTestCase {
   /// loop exits when paused with no `runsWhilePaused` work), then RESUME — and the
   /// loop must restart and run the parked job WITHOUT a new enqueue kicking it.
   /// v1's mailbox `resume` would 202 and wedge here forever; the fire-and-forget
-  /// `setPaused(false) -> startProcessingIfNeeded()` path is what avoids it.
+  /// `wakeAfterAuthoritativeResume() -> startProcessingIfNeeded()` path is what
+  /// avoids it.
   func testResumeWakesAParkedLoopWithoutANewEnqueue() async throws {
     let probe = makeQueueProbe()
 
@@ -132,6 +133,24 @@ final class ControlPlaneTests: XCTestCase {
     let finished = try await op   // hangs forever here if resume wedged the loop
     XCTAssertTrue(finished, "the parked job ran after resume, with no new enqueue")
     XCTAssertFalse(probe.lockStorePaused)
+  }
+
+  /// A resume wake is deliberately fire-and-forget so the synchronous control
+  /// route cannot wedge behind a long render. That means it can arrive after a
+  /// newer pause. The deferred wake must observe authority, not overwrite it.
+  func testDelayedResumeWakeCannotOverrideANewerPause() async throws {
+    let probe = makeQueueProbe()
+
+    probe.controlResume()  // clears authority and schedules the wake
+    probe.controlPause()   // newer command wins before the actor catches up
+    XCTAssertTrue(probe.lockStorePaused)
+
+    await probe.deliverControlResumeWake()
+
+    XCTAssertTrue(probe.lockStorePaused, "a stale resume wake must not clear a newer pause")
+    XCTAssertTrue(probe.isPaused, "the read path must still publish the newer pause")
+
+    await probe.setPaused(false)
   }
 
   // MARK: - Scenario 4: sidecar persistence replay

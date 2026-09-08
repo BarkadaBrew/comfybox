@@ -93,7 +93,7 @@ struct CurvesEditor: View {
     }
 
     private func nearestIndex(to location: CGPoint, size: CGFloat) -> Int? {
-        var best: (Int, CGFloat)?
+        var best: (Int, Double)?
         for (i, p) in points.wrappedValue.enumerated() {
             let d = hypot(p.x * size - location.x, (1 - p.y) * size - location.y)
             if d < 12, best == nil || d < best!.1 { best = (i, d) }

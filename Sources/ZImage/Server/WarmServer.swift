@@ -1508,7 +1508,8 @@ public final class WarmServer {
       // no-context readout.
       do {
         let q = (try? decode(EffectiveVideoConfigQuery.self, from: request.body)) ?? EffectiveVideoConfigQuery(
-          width: nil, height: nil, frames: nil, duration: nil, fps: nil, tuning: nil, preset: nil, twoPass: nil)
+          width: nil, height: nil, frames: nil, duration: nil, fps: nil, tuning: nil,
+          preset: nil, twoPass: nil, diagnostic: nil)
         let videoPreset: ImagePreset? = q.preset.flatMap { presetStore.get($0) }
         let effectiveTuning = Self.effectiveVideoTuning(for: q)
         let resolvedTyped = LTX2ConfigResolver.resolveTyped(
@@ -1520,7 +1521,8 @@ public final class WarmServer {
           width: q.width, height: q.height, frames: q.frames, duration: q.duration, fps: q.fps,
           presetWidth: videoPreset?.width, presetHeight: videoPreset?.height,
           videoConfigDefaults: ServerConfigStore.shared.videoDefaults(),
-          resolvedTwoStage: resolvedTyped.twoStage)
+          resolvedTwoStage: resolvedTyped.twoStage,
+          diagnostic: q.diagnostic == true)
 
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -2184,6 +2186,9 @@ public final class WarmServer {
     /// env/preset/builtin answer, silently ignoring the very field it was
     /// probing.
     let twoPass: Bool?
+    /// Explicit escape hatch for short clips and CFG experiments. Production
+    /// callers omit this and receive the validated quality contract.
+    let diagnostic: Bool?
   }
 
   struct LocalVideoRequest: Decodable {
@@ -2235,6 +2240,9 @@ public final class WarmServer {
     /// unchanged. When BOTH this and `tuning.two_stage` are set, the more
     /// specific `tuning.two_stage` wins (see `LTX2VideoTuning.merging`).
     let twoPass: Bool?
+    /// Explicit escape hatch for quality experiments (short clips, CFG+NAG).
+    /// It is intentionally opt-in rather than inferred from dimensions/source.
+    let diagnostic: Bool?
     /// Server-minted id from /v1/enhance binding this render to its
     /// optimization lineage (task #19, finding #6).
     let optimizationAttemptId: String?
@@ -2668,8 +2676,27 @@ public final class WarmServer {
   /// F3: the frames half of the same real `prepareLocalVideo` chain —
   /// `videoDefaults.frames` (migrated from the desktop's `videoFrames`) slots
   /// between the request and the 97f engine default.
-  static func resolvedLTX2Frames(requestFrames: Int?, videoConfigDefaults: VideoDefaultValues) -> Int {
-    requestFrames ?? videoConfigDefaults.frames ?? 97
+  static func resolvedLTX2Frames(
+    requestFrames: Int?, videoConfigDefaults: VideoDefaultValues,
+    diagnostic: Bool = false
+  ) -> Int {
+    let requested = requestFrames ?? videoConfigDefaults.frames ?? 97
+    guard !diagnostic else { return requested }
+    // The public production contract is at least 97 frames and 1 + 8k. Round
+    // upward so normalizing an invalid request never shortens its duration.
+    let floored = max(97, requested)
+    let remainder = (floored - 1) % 8
+    return remainder == 0 ? floored : floored + (8 - remainder)
+  }
+
+  /// Reject the known saturation recipe: CFG above 1 while NAG is already
+  /// providing attention guidance. Diagnostics may opt into experiments.
+  static func productionVideoQualityError(
+    guidance: Float, cfgSchedule: [Float], nagEnabled: Bool, diagnostic: Bool
+  ) -> String? {
+    guard !diagnostic, nagEnabled else { return nil }
+    guard guidance > 1.0 || cfgSchedule.contains(where: { $0 > 1.0 }) else { return nil }
+    return "CFG above 1 with NAG enabled is diagnostic-only; omit guidance/use CFG 1, or set diagnostic=true for an intentional experiment"
   }
 
   /// comfybox#307 (review r1, item 2): the derived render plan for
@@ -2682,7 +2709,8 @@ public final class WarmServer {
     width: Int?, height: Int?, frames: Int?, duration: Float?, fps: Int?,
     presetWidth: Int?, presetHeight: Int?,
     videoConfigDefaults: VideoDefaultValues,
-    resolvedTwoStage: Bool
+    resolvedTwoStage: Bool,
+    diagnostic: Bool = false
   ) -> [[String: String]] {
     var plan: [[String: String]] = []
     // comfybox#405: the same budget chain the real path uses (no named
@@ -2706,11 +2734,12 @@ public final class WarmServer {
                      "note": "request dims are FINAL; stage 1 paints \(s1.width)x\(s1.height), refine doubles back"])
       } else {
         plan.append(["step": "stage1_floor",
-                     "note": "final \(w)x\(h) too small to halve (floor 512x320) — single-scale render"])
+                     "note": "final \(w)x\(h) too small to halve (floor 512x320) — two-stage skipped; final dimensions preserved"])
       }
     }
     let effectiveFps = fps ?? 24
-    var framesPerChunk = frames ?? videoConfigDefaults.frames ?? 97
+    var framesPerChunk = Self.resolvedLTX2Frames(
+      requestFrames: frames, videoConfigDefaults: videoConfigDefaults, diagnostic: diagnostic)
     var extendSeconds = Self.extendSecondsFromDuration(duration, framesPerChunk: framesPerChunk, fps: effectiveFps)
     if extendSeconds > 0 {
       let targetFrames = Int((extendSeconds * Float(effectiveFps)).rounded())
@@ -2758,9 +2787,18 @@ public final class WarmServer {
     foldedFramesPerChunk: Int, foldedExtendSeconds: Float,
     resolvedLoRAs: [LTX2LoRAReference], effectiveBeatSchedule: [BeatSegment]?,
     resolvedOutput: String,
-    dimensionReason: String? = nil
+    dimensionReason: String? = nil,
+    forceSingleStage: Bool = false,
+    twoStageRequested: Bool? = nil,
+    refineSkippedReasonHint: String? = nil
   ) -> LTX2VideoRequest {
-    LTX2VideoRequest(
+    var resolvedTuning = Self.effectiveVideoTuning(for: req)
+    if forceSingleStage {
+      var forced = resolvedTuning ?? LTX2VideoTuning()
+      forced.twoStage = false
+      resolvedTuning = forced
+    }
+    return LTX2VideoRequest(
       prompt: effectivePrompt,
       negativePrompt: req.negativePrompt ?? videoPreset?.negativePrompt,
       initImagePath: effectiveInitImage,
@@ -2804,7 +2842,7 @@ public final class WarmServer {
       loraStrength: req.loraStrength ?? 1.0,
       loras: resolvedLoRAs,
       outputPath: resolvedOutput,
-      tuning: Self.effectiveVideoTuning(for: req),
+      tuning: resolvedTuning,
       presetTuning: videoPreset?.videoTuning,
       audio: req.audio ?? false,
       beatSchedule: effectiveBeatSchedule,
@@ -2821,7 +2859,9 @@ public final class WarmServer {
       // layer up, in `prepareLocalVideo`. It now travels with the request:
       // `"source_aspect"` when the i2v source image decided the shape,
       // `"explicit"` when the caller did, `"default"` for the fall-through.
-      dimensionReason: dimensionReason
+      dimensionReason: dimensionReason,
+      twoStageRequested: twoStageRequested,
+      refineSkippedReasonHint: refineSkippedReasonHint
     )
   }
 
@@ -2837,7 +2877,7 @@ public final class WarmServer {
     // before anything downstream reads it — every existing consumer
     // (dims math, `LTX2ConfigResolver.resolveTyped`, the trace snapshot) then
     // sees one authoritative tuning block, unchanged otherwise.
-    let effectiveTuning = Self.effectiveVideoTuning(for: req)
+    var effectiveTuning = Self.effectiveVideoTuning(for: req)
 
     // Video presets — same PresetStore as images (mediaKind "video"). A
     // preset is a named bundle: LoRAs (bare filenames resolve through the
@@ -2966,7 +3006,9 @@ public final class WarmServer {
     // trained window (289f = 12s) into ONE chunk here, t2v included.
     // FDD §3.3, D3: `videoDefaults.frames` (migrated from the desktop's
     // `videoFrames`) slots between the request and the 97f engine default.
-    var foldedFramesPerChunk = Self.resolvedLTX2Frames(requestFrames: req.frames, videoConfigDefaults: videoConfigDefaults)
+    var foldedFramesPerChunk = Self.resolvedLTX2Frames(
+      requestFrames: req.frames, videoConfigDefaults: videoConfigDefaults,
+      diagnostic: req.diagnostic == true)
     var foldedExtendSeconds = req.extendToSeconds
       ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: foldedFramesPerChunk, fps: req.fps ?? 24)
     if foldedExtendSeconds > 0 {
@@ -2983,8 +3025,16 @@ public final class WarmServer {
 
     // comfybox#405: resolve the LTX-2 config ONCE — the ceiling, the two-stage
     // flag, the refine scale and the refine gate's budget all come from it.
-    let resolvedVideoConfig = LTX2ConfigResolver.resolveTyped(
+    var resolvedVideoConfig = LTX2ConfigResolver.resolveTyped(
       request: effectiveTuning, preset: videoPreset?.videoTuning)
+    let effectiveGuidance = req.guidance ?? videoPreset?.guidance.map(Float.init) ?? 1.0
+    if let qualityError = Self.productionVideoQualityError(
+      guidance: effectiveGuidance,
+      cfgSchedule: resolvedVideoConfig.cfgSchedule,
+      nagEnabled: resolvedVideoConfig.nagConfig?.isEnabled == true,
+      diagnostic: req.diagnostic == true) {
+      throw WarmServerError.invalidRequest(message: qualityError)
+    }
     let resolvedVideoCeiling = resolvedVideoConfig.maxLongEdge
     let sourceSize = effectiveInitImage.flatMap { Self.imagePixelSize(atPath: $0) }
     let resolvedDims = VideoDimensionResolver.resolve(
@@ -3023,7 +3073,9 @@ public final class WarmServer {
     // and matches all validated two-stage renders (stage 1 at 448x256 etc.).
     // Typed resolution honors request/preset tuning overrides (finding #18):
     // a request can enable two-stage without the plist knowing.
-    let resolvedTwoStage = resolvedVideoConfig.twoStage
+    let twoStageRequested = resolvedVideoConfig.twoStage
+    var resolvedTwoStage = twoStageRequested
+    var refineSkippedReasonHint: String? = nil
     if resolvedTwoStage {
       let s1 = Self.stageOneDims(finalWidth: renderWidth, finalHeight: renderHeight)
       // comfybox#405 (review round 2) / comfybox#409: these messages used to
@@ -3046,13 +3098,18 @@ public final class WarmServer {
         renderWidth = s1.width
         renderHeight = s1.height
       } else {
+        refineSkippedReasonHint = "stage1_floor (final \(renderWidth)x\(renderHeight) cannot halve above the 512x320 stage-1 floor)"
+        var forced = effectiveTuning ?? LTX2VideoTuning()
+        forced.twoStage = false
+        effectiveTuning = forced
+        resolvedVideoConfig = LTX2ConfigResolver.resolveTyped(
+          request: effectiveTuning, preset: videoPreset?.videoTuning)
+        resolvedTwoStage = false
         logger.warning("""
           LTX-2 two-stage: request \(renderWidth)x\(renderHeight) would paint stage 1 at \
           \(Self.snapDim64(renderWidth / 2))x\(Self.snapDim64(renderHeight / 2)) — below the \
           stage-1 floor, which renders SOFT (the refine sharpens, it cannot invent detail). \
-          Treating the request as stage-1 dims instead; output will be \
-          \(refineOut(renderWidth, renderHeight)) at refine scale \
-          \(resolvedVideoConfig.refineScale). Send ~2x larger dims for the intended size.
+          Skipping two-stage for this render and preserving the requested final dimensions.
           """)
       }
     }
@@ -3236,7 +3293,10 @@ public final class WarmServer {
       foldedFramesPerChunk: foldedFramesPerChunk, foldedExtendSeconds: foldedExtendSeconds,
       resolvedLoRAs: resolvedLoRAs, effectiveBeatSchedule: effectiveBeatSchedule,
       resolvedOutput: resolvedOutput,
-      dimensionReason: renderDimensions.reason.rawValue)
+      dimensionReason: renderDimensions.reason.rawValue,
+      forceSingleStage: twoStageRequested && !resolvedTwoStage,
+      twoStageRequested: twoStageRequested,
+      refineSkippedReasonHint: refineSkippedReasonHint)
     // Validate before enqueuing so bad frames/dims fail fast.
     try generator.validate(videoRequest)
 
@@ -3291,6 +3351,7 @@ public final class WarmServer {
     tracePayload["width"] = String(prep.request.width)
     tracePayload["height"] = String(prep.request.height)
     tracePayload["frames"] = String(prep.request.framesPerChunk)
+    tracePayload["requested_steps"] = String(prep.request.steps)
     tracePayload["fps"] = String(prep.request.fps)
     // comfybox#405: the PREDICTED output dims and WHY. `width`/`height` above
     // are the dims handed to the generator (the STAGE-1 half when two-stage is
@@ -3319,6 +3380,12 @@ public final class WarmServer {
     }
     if let initImage = prep.request.initImagePath {
       tracePayload["image_path"] = initImage
+    }
+    if let requested = prep.request.twoStageRequested {
+      tracePayload["two_stage_requested"] = requested ? "true" : "false"
+    }
+    if let reason = prep.request.refineSkippedReasonHint {
+      tracePayload["refine_skipped"] = reason
     }
     return tracePayload
   }
@@ -3386,6 +3453,26 @@ public final class WarmServer {
     if result.outputWidth > 0, result.outputHeight > 0 {
       payload["output_width"] = String(result.outputWidth)
       payload["output_height"] = String(result.outputHeight)
+    }
+    if let record = result.generationRecord {
+      if let steps = record.steps { payload["steps"] = String(steps) }
+      if let requested = record.requestedSteps {
+        payload["requested_steps"] = String(requested)
+      }
+      if let sampler = record.sampler { payload["sampler"] = sampler }
+      if let sigmas = record.stage1Sigmas {
+        payload["stage1_sigmas"] = sigmas.map { String($0) }.joined(separator: ",")
+      }
+      if let sigmas = record.refineSigmas {
+        payload["refine_sigmas"] = sigmas.map { String($0) }.joined(separator: ",")
+      }
+      if let applied = record.nagApplied { payload["nag_applied"] = applied ? "true" : "false" }
+      if let scale = record.nagScale { payload["nag_scale"] = String(scale) }
+      if let alpha = record.nagAlpha { payload["nag_alpha"] = String(alpha) }
+      if let tau = record.nagTau { payload["nag_tau"] = String(tau) }
+      if let refined = record.audioRefine {
+        payload["audio_refine"] = refined ? "true" : "false"
+      }
     }
     return payload
   }
@@ -4162,7 +4249,7 @@ public final class WarmServer {
       // The wake (§3.1.4a point 1) — fire-and-forget, NEVER a mailbox command.
       // resume's only job through the actor is to (re)start the parked loop;
       // decoupling the ACK from that effect is what avoids the v1 wedge.
-      Task { await coordinator.setPaused(false) }
+      Task { await coordinator.wakeAfterAuthoritativeResume() }
     }
     auditLog.append(kind: "queue.pause", message: paused ? "Queue paused" : "Queue resumed")
     // F-1 (adversarial review): BOTH arms return 200. The authoritative
@@ -10677,6 +10764,18 @@ private actor WarmServerCoordinator {
     publishHealth()
   }
 
+  /// Complete the fire-and-forget half of the synchronous resume route.
+  ///
+  /// The route has already cleared the authoritative pause store before it
+  /// acknowledges the request. This actor hop exists only to wake a parked
+  /// processing loop. It must not write `false` again: a long render can delay
+  /// the hop until after a newer pause, and that newer authoritative value wins.
+  func wakeAfterAuthoritativeResume() {
+    guard !liveHealth.isPausedAuthoritative() else { return }
+    startProcessingIfNeeded()
+    publishHealth()
+  }
+
   /// Move a pending job within the queue. direction: up | down | top | bottom.
   /// Returns true if the job was found and moved.
   func movePending(id: String, direction: String) -> Bool {
@@ -15945,7 +16044,12 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// (never a mailbox command — the F1 wedge guard).
   func controlResume() {
     liveHealth.setPaused(false)
-    Task { await coordinator.setPaused(false) }
+    Task { await coordinator.wakeAfterAuthoritativeResume() }
+  }
+
+  /// Deliver the deferred half of a resume deterministically in unit tests.
+  func deliverControlResumeWake() async {
+    await coordinator.wakeAfterAuthoritativeResume()
   }
 
   /// Whether the AUTHORITATIVE (lock-store) pause flag is set — the value the
