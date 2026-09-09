@@ -4,16 +4,18 @@ import XCTest
 final class ContentModeTests: XCTestCase {
     func testRawValuesMatchServerModeStrings() {
         XCTAssertEqual(ContentMode.neutral.rawValue, "neutral")
+        XCTAssertEqual(ContentMode.apple.rawValue, "apple")
         XCTAssertEqual(ContentMode.banana.rawValue, "banana")
         XCTAssertEqual(ContentMode.avocado.rawValue, "avocado")
     }
 
     func testAllCasesInDisplayOrder() {
-        XCTAssertEqual(ContentMode.allCases, [.neutral, .banana, .avocado])
+        XCTAssertEqual(ContentMode.allCases, [.neutral, .apple, .banana, .avocado])
     }
 
     func testLabelsCarryEmoji() {
         XCTAssertTrue(ContentMode.neutral.label.contains("Neutral"))
+        XCTAssertTrue(ContentMode.apple.label.contains("🍎"))
         XCTAssertTrue(ContentMode.banana.label.contains("🍌"))
         XCTAssertTrue(ContentMode.avocado.label.contains("🥑"))
     }
