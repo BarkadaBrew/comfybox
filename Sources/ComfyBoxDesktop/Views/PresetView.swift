@@ -400,6 +400,7 @@ private struct ServerPresetRow: View {
         if let w = preset.width, let h = preset.height { parts.append("\(w)×\(h)") }
         if let steps = preset.steps { parts.append("\(steps) steps") }
         if let guidance = preset.guidance { parts.append(String(format: "g %.1f", guidance)) }
+        if let mode = preset.contentMode { parts.append(mode.capitalized) }
         if !preset.loras.isEmpty { parts.append("\(preset.loras.count) LoRA\(preset.loras.count == 1 ? "" : "s")") }
         if let sampler = preset.sampler ?? preset.scheduler {
             let schedule = preset.sigmaSchedule.map { " / \($0)" } ?? ""
@@ -460,6 +461,7 @@ private struct ServerPresetEditor: View {
     @State private var descriptionText: String
     @State private var prompt: String
     @State private var negativePrompt: String
+    @State private var contentMode: ContentMode
     @State private var model: String
     @State private var widthText: String
     @State private var heightText: String
@@ -488,6 +490,7 @@ private struct ServerPresetEditor: View {
         _descriptionText = State(initialValue: original.description)
         _prompt = State(initialValue: original.prompt ?? "")
         _negativePrompt = State(initialValue: original.negativePrompt ?? "")
+        _contentMode = State(initialValue: ContentMode(rawValue: original.contentMode ?? "") ?? .neutral)
         _model = State(initialValue: original.customModelPath ?? original.model ?? "")
         _widthText = State(initialValue: original.width.map(String.init) ?? "")
         _heightText = State(initialValue: original.height.map(String.init) ?? "")
@@ -515,6 +518,10 @@ private struct ServerPresetEditor: View {
         return family
     }
 
+    private var isLTX2ImagePreset: Bool {
+        LTX2ImageRecipe.isEngineName(original.engine)
+    }
+
     /// #419: the whole recipe as the editor currently holds it, with the
     /// neutral sentinels already collapsed to nil. `buildPreset()` writes
     /// exactly this; `samplingValidationError` validates exactly this.
@@ -528,7 +535,12 @@ private struct ServerPresetEditor: View {
     /// closed gate refuses: the control is greyed, Clear sits beside it, and
     /// Save waits for the user to decide.
     private var samplingValidationError: String? {
-        PresetSamplingValidator.validationError(samplingDraft)
+        if isLTX2ImagePreset {
+            return LTX2ImageRecipe.validationError(
+                sampler: sampler.isEmpty ? nil : sampler,
+                sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule)
+        }
+        return PresetSamplingValidator.validationError(samplingDraft)
     }
 
     private var stage2EtaStatus: SamplingGate.Status {
@@ -548,7 +560,16 @@ private struct ServerPresetEditor: View {
                     TextField("Negative prompt", text: $negativePrompt, axis: .vertical).lineLimit(1...3)
                 }
                 Section("Model & Parameters") {
-                    TextField("Model (name or path)", text: $model)
+                    if isLTX2ImagePreset {
+                        LabeledContent("Model", value: "Configured LTX-2.3 weights")
+                        Picker("Content tier", selection: $contentMode) {
+                            ForEach(ContentMode.allCases) { mode in
+                                Text(mode.label).tag(mode)
+                            }
+                        }
+                    } else {
+                        TextField("Model (name or path)", text: $model)
+                    }
                     HStack {
                         TextField("Width", text: $widthText).frame(width: 90)
                         Text("×").foregroundStyle(.secondary)
@@ -636,6 +657,7 @@ private struct ServerPresetEditor: View {
             // clear alone cannot cover an answer that arrives for a spec the
             // user has already typed past.
             detectedModelFamily = nil
+            guard !isLTX2ImagePreset else { return }
             guard let engine else { return }
             let spec = model.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !spec.isEmpty else { return }
@@ -669,32 +691,36 @@ private struct ServerPresetEditor: View {
     /// user's own sampler change.
     @ViewBuilder
     private var samplingSection: some View {
-        SamplingRecipePicker(
-            sampler: $sampler,
-            sigmaSchedule: $sigmaSchedule,
-            modelFamily: samplingModelFamily,
-            showsExplanation: true,
-            // The one automatic reset, on the user's OWN pick only (the
-            // picker's proxy binding, not `.onChange`, so a programmatic
-            // write can never trigger it).
-            onUserChange: { newSampler in
-                sampling.samplerDidChange(to: newSampler, modelFamily: samplingModelFamily)
-            }
-        )
-        SamplingAdvancedControls(
-            shift: $sampling.shift,
-            projectorScale: $sampling.projectorScale,
-            eta: $sampling.eta,
-            bongmath: $sampling.bongmath,
-            noiseType: $sampling.noiseType,
-            noiseAlpha: $sampling.noiseAlpha,
-            implicitSteps: $sampling.implicitSteps,
-            c2: $sampling.c2,
-            sampler: sampler,
-            sigmaSchedule: sigmaSchedule,
-            modelFamily: samplingModelFamily
-        )
-        vaeRow
+        if isLTX2ImagePreset {
+            LTX2ImageRecipePicker(sampler: $sampler, sigmaSchedule: $sigmaSchedule)
+        } else {
+            SamplingRecipePicker(
+                sampler: $sampler,
+                sigmaSchedule: $sigmaSchedule,
+                modelFamily: samplingModelFamily,
+                showsExplanation: true,
+                // The one automatic reset, on the user's OWN pick only (the
+                // picker's proxy binding, not `.onChange`, so a programmatic
+                // write can never trigger it).
+                onUserChange: { newSampler in
+                    sampling.samplerDidChange(to: newSampler, modelFamily: samplingModelFamily)
+                }
+            )
+            SamplingAdvancedControls(
+                shift: $sampling.shift,
+                projectorScale: $sampling.projectorScale,
+                eta: $sampling.eta,
+                bongmath: $sampling.bongmath,
+                noiseType: $sampling.noiseType,
+                noiseAlpha: $sampling.noiseAlpha,
+                implicitSteps: $sampling.implicitSteps,
+                c2: $sampling.c2,
+                sampler: sampler,
+                sigmaSchedule: sigmaSchedule,
+                modelFamily: samplingModelFamily
+            )
+            vaeRow
+        }
         // The pair error is the picker's own to show (above); this label
         // covers every OTHER rule so a refusal is never reported twice.
         if let error = samplingValidationError, pairIsSupported {
@@ -728,7 +754,12 @@ private struct ServerPresetEditor: View {
     }
 
     private var pairIsSupported: Bool {
-        SamplingRecipeCatalog.supports(
+        if isLTX2ImagePreset {
+            return LTX2ImageRecipe.validationError(
+                sampler: sampler.isEmpty ? nil : sampler,
+                sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule) == nil
+        }
+        return SamplingRecipeCatalog.supports(
             sampler: sampler.isEmpty ? nil : sampler,
             sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
             forModelFamily: samplingModelFamily)
@@ -743,6 +774,10 @@ private struct ServerPresetEditor: View {
     /// unimplemented — but a stored value is shown with Clear, not dropped.
     @ViewBuilder
     private var stage2Section: some View {
+        if isLTX2ImagePreset {
+            Text("Native LTX image presets use one denoising stage.")
+                .font(.caption2).foregroundStyle(.tertiary)
+        } else {
         let status = SamplingGate.stage2(modelFamily: samplingModelFamily)
         Toggle("Run a detail pass after the main render", isOn: $sampling.stage2Enabled)
             // Turning OFF is always possible (it is the Clear for a refused
@@ -804,6 +839,7 @@ private struct ServerPresetEditor: View {
                 }
             }
             .disabled(status.isRefused)
+        }
         }
     }
 
@@ -1038,6 +1074,7 @@ private struct ServerPresetEditor: View {
         p.description = descriptionText.trimmingCharacters(in: .whitespacesAndNewlines)
         p.prompt = prompt.isEmpty ? nil : prompt
         p.negativePrompt = negativePrompt.isEmpty ? nil : negativePrompt
+        if isLTX2ImagePreset { p.contentMode = contentMode.rawValue }
         let loras = editableLoras
             .filter { !$0.filename.isEmpty }
             .map { ServerPresetLora(filename: $0.filename, scale: $0.scale, role: $0.role) }

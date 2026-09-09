@@ -105,6 +105,8 @@ struct GenerationView: View {
     /// Empty = let the active model choose its native recipe.
     @SceneStorage("gen.sampler") private var sampler: String = ""
     @SceneStorage("gen.sigmaSchedule") private var sigmaSchedule: String = ""
+    @SceneStorage("gen.ltxImageSampler") private var ltxImageSampler: String = LTX2ImageRecipe.defaultSampler
+    @SceneStorage("gen.ltxImageSigmaSchedule") private var ltxImageSigmaSchedule: String = LTX2ImageRecipe.defaultSigmaSchedule
     @SceneStorage("gen.seedText") private var seedText: String = ""
     @State private var displayedImage: NSImage?
 
@@ -128,6 +130,9 @@ struct GenerationView: View {
     }
 
     private var isLTX2Image: Bool { backend == .local && selectedImageEngine == .ltx2 }
+
+    private var selectedSampler: String { isLTX2Image ? ltxImageSampler : sampler }
+    private var selectedSigmaSchedule: String { isLTX2Image ? ltxImageSigmaSchedule : sigmaSchedule }
 
     private var imageEngineSelection: Binding<ImageGenerationEngine> {
         Binding(
@@ -193,6 +198,9 @@ struct GenerationView: View {
                 height: effectiveHeight,
                 steps: Int(steps),
                 guidance: Float(guidance)
+            ) { return error }
+            if let error = LTX2ImageRecipe.validationError(
+                sampler: ltxImageSampler, sigmaSchedule: ltxImageSigmaSchedule
             ) { return error }
 
             let activeModel = "ltx"
@@ -340,64 +348,64 @@ struct GenerationView: View {
                 guidance: Float(guidance),
                 width: effectiveWidth,
                 height: effectiveHeight,
-                sampler: isLTX2Image ? "" : sampler,
-                sigmaSchedule: isLTX2Image ? "" : sigmaSchedule,
+                sampler: selectedSampler,
+                sigmaSchedule: selectedSigmaSchedule,
                 eta: isLTX2Image ? 0 : eta,
                 bongmath: isLTX2Image ? false : bongmath,
                 shift: isLTX2Image ? nil : shift.wrappedValue,
                 onSave: { name, editedNegative in
                     // Save to the canonical server preset store, not the old
-                    // device-local list. Desktop materializes LTX presets
-                    // itself because the HTTP LTX route rejects preset names.
+                    // device-local list. The server can expand the same LTX
+                    // recipe fields later when this preset is selected by name.
                     // Todd 2026-09-04: kroma is a regular LoRA — `loras[]` is
                     // the single source; no separate structured field to
                     // compose here (the server's `kroma` is a deprecated,
                     // derived, read-only echo it recomputes on save).
-                    let preset = ServerPreset(
-                        name: name,
-                        mediaKind: "image",
-                        provider: "local",
-                        engine: isLTX2Image ? ImageGenerationEngine.ltx2.rawValue : nil,
-                        prompt: prompt.isEmpty ? nil : prompt,
-                        negativePrompt: editedNegative.isEmpty ? nil : editedNegative,
-                        steps: Int(steps),
-                        guidance: guidance,
-                        // Neutral values stay absent — never freeze a default.
-                        projectorScale: isLTX2Image || projectorScale == 1.0 ? nil : projectorScale,
-                        noiseType: isLTX2Image || noiseType == "gaussian" ? nil : noiseType,
-                        noiseAlpha: isLTX2Image || noiseAlpha == 0 ? nil : noiseAlpha,
-                        implicitSteps: isLTX2Image || implicitSteps.rounded() == 0 ? nil : Int(implicitSteps.rounded()),
-                        c2: isLTX2Image || c2 == 0.5 ? nil : c2,
-                        width: effectiveWidth,
-                        height: effectiveHeight,
-                        loras: selectedLoras.map {
-                            ServerPresetLora(
-                                filename: $0.filename,
-                                scale: Double($0.scale),
-                                role: $0.role
-                            )
-                        },
-                        // Mirror the sampler into the legacy field for older
-                        // preset consumers while the structured fields remain
-                        // the authoritative Krea 2 recipe.
-                        scheduler: isLTX2Image || sampler.isEmpty ? nil : sampler,
-                        sampler: isLTX2Image || sampler.isEmpty ? nil : sampler,
-                        sigmaSchedule: isLTX2Image || sigmaSchedule.isEmpty ? nil : sigmaSchedule,
-                        // #419: the panel's RES4LYF knobs used to be dropped
-                        // here — a Clownshark session saved as an ODE preset.
-                        // Neutral values stay absent (never freeze a default).
-                        shift: isLTX2Image ? nil : shift.wrappedValue,
-                        eta: isLTX2Image || eta == 0 ? nil : eta,
-                        bongmath: isLTX2Image ? nil : (bongmath ? true : nil)
-                    )
-                    var withModel = preset
+                    let savedLoras = selectedLoras.map {
+                        ServerPresetLora(
+                            filename: $0.filename,
+                            scale: Double($0.scale),
+                            role: $0.role
+                        )
+                    }
+                    let savedEngine = isLTX2Image ? ImageGenerationEngine.ltx2.rawValue : nil
+                    let savedSampler = selectedSampler.isEmpty ? nil : selectedSampler
+                    let savedSchedule = selectedSigmaSchedule.isEmpty ? nil : selectedSigmaSchedule
+                    var preset = ServerPreset(name: name)
+                    preset.mediaKind = "image"
+                    preset.provider = "local"
+                    preset.engine = savedEngine
+                    preset.contentMode = contentMode.rawValue
+                    preset.prompt = prompt.isEmpty ? nil : prompt
+                    preset.negativePrompt = editedNegative.isEmpty ? nil : editedNegative
+                    preset.steps = Int(steps)
+                    preset.guidance = guidance
+                    preset.projectorScale = isLTX2Image || projectorScale == 1.0 ? nil : projectorScale
+                    preset.noiseType = isLTX2Image || noiseType == "gaussian" ? nil : noiseType
+                    preset.noiseAlpha = isLTX2Image || noiseAlpha == 0 ? nil : noiseAlpha
+                    preset.implicitSteps = isLTX2Image || implicitSteps.rounded() == 0
+                        ? nil
+                        : Int(implicitSteps.rounded())
+                    preset.c2 = isLTX2Image || c2 == 0.5 ? nil : c2
+                    preset.width = effectiveWidth
+                    preset.height = effectiveHeight
+                    preset.loras = savedLoras
+                    // Mirror the sampler into the legacy field for older
+                    // preset consumers while structured fields stay authoritative.
+                    preset.scheduler = savedSampler
+                    preset.sampler = savedSampler
+                    preset.sigmaSchedule = savedSchedule
+                    // Neutral RES4LYF values stay absent so defaults remain live.
+                    preset.shift = isLTX2Image ? nil : shift.wrappedValue
+                    preset.eta = isLTX2Image || eta == 0 ? nil : eta
+                    preset.bongmath = isLTX2Image ? nil : (bongmath ? true : nil)
                     if !isLTX2Image, let model = engine.currentModel {
-                        if model.hasPrefix("/") { withModel.customModelPath = model }
-                        else { withModel.model = model }
+                        if model.hasPrefix("/") { preset.customModelPath = model }
+                        else { preset.model = model }
                     }
                     // Capture the seed so the preset reproduces exactly (0/empty = random).
-                    if let s = UInt64(seedText), s > 0 { withModel.seed = Int(truncatingIfNeeded: s) }
-                    let toSave = withModel
+                    if let s = UInt64(seedText), s > 0 { preset.seed = Int(truncatingIfNeeded: s) }
+                    let toSave = preset
                     Task {
                         try? await engine.savePreset(toSave)
                         await loadServerPresets()
@@ -733,7 +741,9 @@ struct GenerationView: View {
                 .onChange(of: contentMode) { _, mode in
                     if let presetId = contentModeDefaultPresets[mode],
                        let preset = serverPresets.first(where: { $0.id == presetId }) {
-                        Task { await applyPreset(preset.toGenerationPreset()) }
+                        // A tier switch changes the recipe, not the subject.
+                        // Preserve the prompt and seed the user is comparing.
+                        Task { await applyPreset(preset.toGenerationPreset(), preserveContent: true) }
                         activePresetName = preset.name
                     }
                 }
@@ -960,17 +970,11 @@ struct GenerationView: View {
             )
 
             if isLTX2Image {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("LTX image recipe")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    Text("Shifted flow schedule · Euler · image STG 0.8 · guidance rescale 0.7")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                    Text("These image-specific settings are fixed by the native LTX pipeline.")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
+                LTX2ImageRecipePicker(
+                    sampler: $ltxImageSampler,
+                    sigmaSchedule: $ltxImageSigmaSchedule
+                )
+                .disabled(backend != .local)
             } else {
                 // Sampler = solver; Scheduler = sigma/noise schedule. Options are
                 // sourced from the engine's family capability matrix.
@@ -1100,7 +1104,7 @@ struct GenerationView: View {
                     "\($0.filename.replacingOccurrences(of: ".safetensors", with: "")) @\(String(format: "%g", $0.scale))"
                   }.joined(separator: ", "))
             summaryRow("Params", isLTX2Image
-                ? "\(Int(steps)) steps · g\(String(format: "%g", guidance)) · Euler / shifted flow · image STG · \(effectiveWidth)×\(effectiveHeight) · seed \(seedText.isEmpty ? "random" : seedText) · \(contentMode.rawValue)"
+                ? "\(Int(steps)) steps · g\(String(format: "%g", guidance)) · \(ltxImageSampler) / \(ltxImageSigmaSchedule) · image STG · \(effectiveWidth)×\(effectiveHeight) · seed \(seedText.isEmpty ? "random" : seedText) · \(contentMode.rawValue)"
                 : "\(Int(steps)) steps · g\(String(format: "%g", guidance)) · sampler \(sampler.isEmpty ? "default" : sampler) · scheduler \(sigmaSchedule.isEmpty ? "default" : sigmaSchedule)\(shift.wrappedValue.map { " · shift \(String(format: "%g", $0))" } ?? "")\(eta > 0 ? " · eta \(String(format: "%g", eta))" : "")\(bongmath ? " · bongmath" : "") · \(effectiveWidth)×\(effectiveHeight) · seed \(seedText.isEmpty ? "random" : seedText) · \(contentMode.rawValue)")
             if let warning = generationValidationError, backend == .local {
                 Text(warning).foregroundStyle(.orange)
@@ -1386,8 +1390,8 @@ struct GenerationView: View {
             implicitSteps: Int(implicitSteps.rounded()),
             c2: Float(c2),
             shift: shift.wrappedValue.map { Float($0) },
-            sampler: sampler.isEmpty ? nil : sampler,
-            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
+            sampler: selectedSampler.isEmpty ? nil : selectedSampler,
+            sigmaSchedule: selectedSigmaSchedule.isEmpty ? nil : selectedSigmaSchedule,
             seed: seed,
             modelId: isLTX2Image ? nil : engine.currentModel,
             loras: selectedLoras,
@@ -1441,8 +1445,8 @@ struct GenerationView: View {
             implicitSteps: Int(implicitSteps.rounded()),
             c2: Float(c2),
             shift: shift.wrappedValue.map { Float($0) },
-            sampler: sampler.isEmpty ? nil : sampler,
-            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
+            sampler: selectedSampler.isEmpty ? nil : selectedSampler,
+            sigmaSchedule: selectedSigmaSchedule.isEmpty ? nil : selectedSigmaSchedule,
             seed: seed,
             modelId: isLTX2Image ? nil : engine.currentModel,
             loras: selectedLoras,
@@ -2023,8 +2027,16 @@ struct GenerationView: View {
         noiseAlpha = Double(preset.noiseAlpha ?? 0)
         implicitSteps = Double(preset.implicitSteps ?? 0)
         c2 = Double(preset.c2 ?? 0.5)
-        sampler = preset.sampler ?? ""
-        sigmaSchedule = preset.sigmaSchedule ?? ""
+        if presetEngine == .ltx2 {
+            ltxImageSampler = preset.sampler ?? LTX2ImageRecipe.defaultSampler
+            ltxImageSigmaSchedule = preset.sigmaSchedule ?? LTX2ImageRecipe.defaultSigmaSchedule
+        } else {
+            sampler = preset.sampler ?? ""
+            sigmaSchedule = preset.sigmaSchedule ?? ""
+        }
+        if let rawMode = preset.contentMode, let mode = ContentMode(rawValue: rawMode) {
+            contentMode = mode
+        }
         // #419: eta / bongmath / shift used to be dropped here, so applying
         // a Clownshark preset (res_2s + eta 0.5, shift 1.15) rendered the
         // default ODE at the default shift. Absent = model default.

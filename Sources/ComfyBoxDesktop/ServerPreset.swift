@@ -100,6 +100,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
     public var promptPrefix: String?
     public var promptSuffix: String?
     public var injectedKeywords: [String]?
+    public var contentMode: String?
 
     // Parameters
     public var steps: Int?
@@ -179,6 +180,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         promptPrefix: String? = nil,
         promptSuffix: String? = nil,
         injectedKeywords: [String]? = nil,
+        contentMode: String? = nil,
         steps: Int? = nil,
         guidance: Double? = nil,
         projectorScale: Double? = nil,
@@ -221,6 +223,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         self.promptPrefix = promptPrefix
         self.promptSuffix = promptSuffix
         self.injectedKeywords = injectedKeywords
+        self.contentMode = contentMode
         self.steps = steps
         self.guidance = guidance
         self.projectorScale = projectorScale
@@ -253,7 +256,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         case id, name, description
         case mediaKind, provider, engine, mode
         case model, customModelPath, baseModel
-        case prompt, negativePrompt, promptPrefix, promptSuffix, injectedKeywords
+        case prompt, negativePrompt, promptPrefix, promptSuffix, injectedKeywords, contentMode
         case steps, guidance, projectorScale, noiseType, noiseAlpha, implicitSteps, c2, seed, width, height
         case loras, scheduler, upscale
         case vae, checkpointFamily, kroma, sampler, sigmaSchedule, shift, eta, bongmath, stage2
@@ -285,6 +288,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         try c.encodeIfPresent(promptPrefix, forKey: .promptPrefix)
         try c.encodeIfPresent(promptSuffix, forKey: .promptSuffix)
         try c.encodeIfPresent(injectedKeywords, forKey: .injectedKeywords)
+        try c.encodeIfPresent(contentMode, forKey: .contentMode)
         try c.encodeIfPresent(steps, forKey: .steps)
         try c.encodeIfPresent(guidance, forKey: .guidance)
         try c.encodeIfPresent(projectorScale, forKey: .projectorScale)
@@ -336,6 +340,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         promptPrefix = try c.decodeIfPresent(String.self, forKey: .promptPrefix)
         promptSuffix = try c.decodeIfPresent(String.self, forKey: .promptSuffix)
         injectedKeywords = try c.decodeIfPresent([String].self, forKey: .injectedKeywords)
+        contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
         steps = try c.decodeIfPresent(Int.self, forKey: .steps)
         guidance = try c.decodeIfPresent(Double.self, forKey: .guidance)
         projectorScale = try c.decodeIfPresent(Double.self, forKey: .projectorScale)
@@ -387,6 +392,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
             id: id,
             name: name,
             engine: engine,
+            contentMode: contentMode,
             promptTemplate: prompt ?? "",
             negativePrompt: negativePrompt,
             modelId: customModelPath ?? model,
@@ -443,6 +449,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
             promptPrefix: promptPrefix,
             promptSuffix: promptSuffix,
             injectedKeywords: injectedKeywords,
+            contentMode: contentMode,
             steps: steps,
             guidance: guidance,
             projectorScale: projectorScale,

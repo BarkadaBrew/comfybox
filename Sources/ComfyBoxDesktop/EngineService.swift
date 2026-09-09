@@ -620,15 +620,15 @@ public final class EngineService {
 
         if request.engine == .ltx2 {
             payloadDict["engine"] = request.engine.rawValue
-            if !request.loras.isEmpty {
-                payloadDict["loras"] = request.loras.map { lora -> [String: Any] in
-                    var entry: [String: Any] = [
-                        "path": lora.filename,
-                        "scale": lora.scale,
-                    ]
-                    if let role = lora.role, !role.isEmpty { entry["role"] = role }
-                    return entry
-                }
+            // LTX's adapter stack is per-render. An empty array is meaningful:
+            // it clears any daemon-level --ltx2-lora default for this request.
+            payloadDict["loras"] = request.loras.map { lora -> [String: Any] in
+                var entry: [String: Any] = [
+                    "path": lora.filename,
+                    "scale": lora.scale,
+                ]
+                if let role = lora.role, !role.isEmpty { entry["role"] = role }
+                return entry
             }
         }
 
@@ -636,17 +636,15 @@ public final class EngineService {
             payloadDict["seed"] = request.seed
         }
 
-        if request.engine == .active {
-            if let sampler = request.sampler?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !sampler.isEmpty {
-                // `sampler` is the user-facing alias accepted by GeneratePayload;
-                // it maps to the engine's historical `scheduler` field.
-                payloadDict["sampler"] = sampler
-            }
-            if let schedule = request.sigmaSchedule?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !schedule.isEmpty {
-                payloadDict["sigma_schedule"] = schedule
-            }
+        if let sampler = request.sampler?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !sampler.isEmpty {
+            // `sampler` is the user-facing alias accepted by GeneratePayload;
+            // both image engines validate it against their own recipe table.
+            payloadDict["sampler"] = sampler
+        }
+        if let schedule = request.sigmaSchedule?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !schedule.isEmpty {
+            payloadDict["sigma_schedule"] = schedule
         }
 
         if !request.negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

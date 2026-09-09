@@ -2437,7 +2437,8 @@ public final class WarmServer {
         "stage1_sigmas": imageSigmas,
         "two_stage": false,
         "cond_fps": 1.0,
-        "sampler": "euler",
+        "sampler": LTX2ImageRecipe.normalized(payload.scheduler)
+          ?? LTX2ImageRecipe.defaultSampler,
         "stg_scale": 0.8,
         "stg_blocks": "28",
         "face_anchor_strength": 0.0,
@@ -2451,7 +2452,7 @@ public final class WarmServer {
     if let contentMode = payload.contentMode, !contentMode.isEmpty {
       body["content_mode"] = contentMode
     }
-    if let loras = payload.loras, !loras.isEmpty {
+    if let loras = payload.loras {
       body["loras"] = loras.map { entry -> [String: Any] in
         var value: [String: Any] = ["path": entry.path]
         if let scale = entry.scale { value["scale"] = scale }
@@ -2466,7 +2467,10 @@ public final class WarmServer {
         message: "Native LTX-2 image generation is not configured (--ltx2-weights/--ltx2-gemma)")
     }
 
-    logger.info("LTX-2 image: queued \(prepared.request.width)x\(prepared.request.height), \(steps) steps, seed \(seed)")
+    let sampler = prepared.request.tuning?.sampler
+      ?? LTX2ImageRecipe.normalized(payload.scheduler)
+      ?? LTX2ImageRecipe.defaultSampler
+    logger.info("LTX-2 image: queued \(prepared.request.width)x\(prepared.request.height), \(steps) steps, \(sampler), seed \(seed)")
     let result = try await coordinator.enqueueLocalVideo(wantsAudio: false) { report in
       try prepared.generator.generatePreemptible(prepared.request) {
         chunk, totalChunks, step, totalSteps in
@@ -2480,10 +2484,27 @@ public final class WarmServer {
       kind: "image.ltx2",
       message: "LTX-2 native image -> \(result.outputPath)",
       metadata: ["seed": String(seed), "width": String(width), "height": String(height)])
+    let appliedLoras = prepared.request.effectiveLoRAs.map { reference in
+      let filename = (reference.path as NSString).lastPathComponent
+      let role = payload.loras?.first {
+        ($0.path as NSString).lastPathComponent == filename
+      }?.role
+      return LoRAState(LoRAConfiguration(
+        source: .local(URL(fileURLWithPath: reference.path)), scale: reference.scale,
+        role: role))
+    }
+    let stackOrigin: String? = prepared.request.effectiveLoRAs.isEmpty ? nil
+      : (payload.presetStackApplied == true ? "preset" : (payload.loras != nil ? "request" : "warm_default"))
     return GenerateResponse(
       success: true,
       outputPath: result.outputPath,
-      durationMs: Int(result.elapsedSeconds * 1000))
+      durationMs: Int(result.elapsedSeconds * 1000),
+      appliedLoras: appliedLoras,
+      presetUnresolved: payload.presetUnresolved,
+      presetUnresolvedReason: payload.presetUnresolvedReason,
+      presetStackMismatch: payload.presetStackMismatch,
+      presetRecipeApplied: payload.presetRecipeApplied,
+      loraStackOrigin: stackOrigin)
   }
 
   /// Submit a video render to the paid Replicate cloud proxy and return its 202
@@ -3063,7 +3084,7 @@ public final class WarmServer {
         LoRAEntry(path: $0.filename, scale: Float($0.scale), role: $0.role)
       }
     }
-    if loraEntries.isEmpty, req.loraPath == nil,
+    if loraEntries.isEmpty, req.loraPath == nil, req.loras == nil,
        let defaultLoRA = configuration.ltx2DefaultLoRA, !defaultLoRA.isEmpty {
       // "path" or "path@scale"
       let parts = defaultLoRA.split(separator: "@", maxSplits: 1).map(String.init)
@@ -6133,12 +6154,18 @@ public final class WarmServer {
     var payload = try decode(GeneratePayload.self, from: body)
     try payload.validateEngine()
     if payload.usesLTX2ImageEngine {
-      // LTX images use their own model admission path. Validate and return
-      // before image-preset expansion, image-family LoRA checks, or the image
-      // model's memory preflight can reinterpret the request.
+      // LTX images use their own model admission path and their own preset
+      // expansion because the configured LTX weights are the base (a valid
+      // preset therefore has no image `model` field).
       try payload.validateOutputPath(configuration: configuration)
-      _ = try payload.validateRecipeNames()
+      payload = expandLTX2ImagePreset(
+        payload, store: store, stageNearline: stageNearline,
+        loraExists: loraExists, log: log)
       try payload.validateLTX2ImageFields()
+      try LoRAEntry.refuseRemovableVolumeEntries(payload.loras ?? [])
+      try validateLoRAFamilyCompatibility(
+        entries: payload.loras ?? [], targetFamily: "ltx", lookup: loraLookup,
+        log: { line in log("LoRACompatibility: \(line)") })
       return payload
     }
     // Bytes-uploaded img2img init image (init_image_base64) — write it to a
@@ -6398,6 +6425,12 @@ public final class WarmServer {
     for (key, value) in [
       ("model", payload.model as Any?), ("steps", payload.steps as Any?),
       ("guidance", payload.guidance as Any?), ("vae", payload.vae as Any?),
+      // Native LTX presets may also contribute the one-frame shape, seed,
+      // negative prompt and fruit tier. Freeze all of them into a persisted
+      // body so replay never re-resolves an edited preset.
+      ("width", payload.width as Any?), ("height", payload.height as Any?),
+      ("seed", payload.seed as Any?), ("negative_prompt", payload.negativePrompt as Any?),
+      ("content_mode", payload.contentMode as Any?),
       // #154: a preset-owned schedule shift must survive a crash-recovery
       // replay, exactly like the preset-owned model/steps/guidance/vae — a
       // replayed body that dropped it would silently render on the model's
@@ -13218,9 +13251,9 @@ struct Stage2Payload: Sendable, Decodable, Equatable {
 
 struct GeneratePayload: Sendable {
   let prompt: String
-  let negativePrompt: String?
-  let width: Int?
-  let height: Int?
+  var negativePrompt: String?
+  var width: Int?
+  var height: Int?
   /// `var` since #286: filled from the named `preset`'s DECLARED `steps` when
   /// the request omitted them (never from `ResolvedPreset`, whose default is 4).
   var steps: Int?
@@ -13330,8 +13363,8 @@ struct GeneratePayload: Sendable {
   /// is a request `model` that contradicts the preset's (409).
   let preset: String?
 
-  /// Fruit mode (neutral | banana | avocado) — stamped into render metadata.
-  let contentMode: String?
+  /// Fruit mode (neutral | apple | banana | avocado) — stamped into render metadata.
+  var contentMode: String?
 
   /// Per-job model override (spec/CivitAI id/pool key). When set, the job's
   /// own model is loaded/activated at dequeue time instead of trusting
@@ -13783,13 +13816,9 @@ extension GeneratePayload: Decodable {
       throw WarmServerError.invalidRequest(
         message: "Native LTX-2 image output_path must end in .png")
     }
-    if let scheduler, scheduler.lowercased() != "euler" {
-      throw WarmServerError.invalidRequest(
-        message: "Native LTX-2 image generation currently requires scheduler 'euler'; got '\(scheduler)'")
-    }
-    if let sigmaSchedule, sigmaSchedule.lowercased() != "flow" {
-      throw WarmServerError.invalidRequest(
-        message: "Native LTX-2 image generation uses the shifted flow schedule; got '\(sigmaSchedule)'")
+    if let error = LTX2ImageRecipe.validationError(
+      sampler: scheduler, sigmaSchedule: sigmaSchedule) {
+      throw WarmServerError.invalidRequest(message: error)
     }
     if model != nil {
       throw WarmServerError.invalidRequest(
@@ -13809,7 +13838,6 @@ extension GeneratePayload: Decodable {
       ("mask_invert", maskInvert != nil), ("cfg", cfg != nil),
       ("first_n_steps_without_cfg", firstNStepsWithoutCFG != nil),
       ("phone_look", phoneLook != nil), ("style", style != nil),
-      ("preset", preset != nil),
       ("control_image", controlImage != nil || controlImageData != nil),
       ("controlnet_strength", controlnetStrength != nil), ("preempt", preempt == true),
       ("vae", vae != nil), ("stage2", stage2 != nil || stage2Null),

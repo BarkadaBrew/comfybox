@@ -137,6 +137,17 @@ public enum PresetEffectiveRecipePresenter {
   /// network path (decode the server's response, reuse this) and the local
   /// live-preview path (`compute(declared:)`) share one decision function.
   public static func compute(resolved: ResolvedPreset, declared: ImagePreset) -> EffectiveRecipe {
+    if LTX2ImageRecipe.isEngineName(declared.engine) {
+      return EffectiveRecipe(
+        model: nil, checkpointFamily: "ltx", mediaKind: resolved.mediaKind,
+        loraStack: resolved.loras.map {
+          EffectiveLoRA(filename: $0.filename, scale: $0.scale, role: $0.role)
+        },
+        steps: resolved.steps, guidance: resolved.guidance,
+        sampler: declared.sampler ?? declared.scheduler ?? LTX2ImageRecipe.defaultSampler,
+        sigmaSchedule: declared.sigmaSchedule ?? LTX2ImageRecipe.defaultSigmaSchedule,
+        shift: nil, eta: nil, bongmath: nil, stage2: nil, unresolved: nil)
+    }
     // `decide` treats an empty presetId as "no preset named" (`.unchanged`),
     // which would skip the expansion decision entirely — a brand-new,
     // not-yet-saved preset has no id yet, but the panel still needs to show

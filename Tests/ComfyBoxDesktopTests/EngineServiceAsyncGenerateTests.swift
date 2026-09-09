@@ -223,8 +223,8 @@ struct EngineServiceAsyncGenerateTests {
             eta: 0.5,
             bongmath: true,
             shift: 1.15,
-            sampler: "res_2s",
-            sigmaSchedule: "krea2",
+            sampler: "euler_ancestral_cfg_pp",
+            sigmaSchedule: "flow",
             loras: [LoRASelection(
                 id: "motion", filename: "motion.safetensors", scale: 0.8)],
             initImagePath: "/tmp/reference.png",
@@ -245,8 +245,14 @@ struct EngineServiceAsyncGenerateTests {
         #expect(body["eta"] == nil)
         #expect(body["bongmath"] == nil)
         #expect(body["shift"] == nil)
-        #expect(body["sampler"] == nil)
-        #expect(body["sigma_schedule"] == nil)
+        #expect(body["sampler"] as? String == "euler_ancestral_cfg_pp")
+        #expect(body["sigma_schedule"] as? String == "flow")
+
+        let noAdapters = EngineService.generatePayload(
+            GenerationRequest(engine: .ltx2, prompt: "clean base render"),
+            outputPath: "/tmp/ltx-base.png", contentMode: .neutral)
+        let emptyStack = try #require(noAdapters["loras"] as? [[String: Any]])
+        #expect(emptyStack.isEmpty)
     }
 
     /// #419: `shift` rides the Generate path only when an applied preset (or

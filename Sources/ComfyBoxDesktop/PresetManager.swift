@@ -13,6 +13,9 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
     /// Image engine restored into the Generate tab. nil/"default" preserves
     /// legacy presets; "ltx2" selects native LTX-2.3 image generation.
     public var engine: String?
+    /// Fruit tier restored with the preset. `apple` and `neutral` are both
+    /// SFW but remain separate provenance choices in the UI.
+    public var contentMode: String?
     public var promptTemplate: String
     public var negativePrompt: String?
     public var modelId: String?
@@ -50,6 +53,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         id: String = UUID().uuidString,
         name: String,
         engine: String? = nil,
+        contentMode: String? = nil,
         promptTemplate: String = "",
         negativePrompt: String? = nil,
         modelId: String? = nil,
@@ -76,6 +80,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         self.id = id
         self.name = name
         self.engine = engine
+        self.contentMode = contentMode
         self.promptTemplate = promptTemplate
         self.negativePrompt = negativePrompt
         self.modelId = modelId

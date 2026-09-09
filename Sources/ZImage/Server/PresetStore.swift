@@ -241,6 +241,9 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
   public var promptPrefix: String?
   public var promptSuffix: String?
   public var injectedKeywords: [String]?
+  /// Fruit/content tier restored by preset application. `apple` is the SFW
+  /// alias of `neutral`, but remains distinct on the wire for provenance.
+  public var contentMode: String?
 
   // Numeric generation params.
   public var steps: Int?
@@ -340,6 +343,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     promptPrefix: String? = nil,
     promptSuffix: String? = nil,
     injectedKeywords: [String]? = nil,
+    contentMode: String? = nil,
     steps: Int? = nil,
     guidance: Double? = nil,
     projectorScale: Double? = nil,
@@ -383,6 +387,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     self.promptPrefix = promptPrefix
     self.promptSuffix = promptSuffix
     self.injectedKeywords = injectedKeywords
+    self.contentMode = contentMode
     self.steps = steps
     self.guidance = guidance
     self.projectorScale = projectorScale
@@ -415,7 +420,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
   private enum CodingKeys: String, CodingKey {
     case id, name, description
     case mediaKind, provider, engine, mode, model, customModelPath, baseModel
-    case prompt, negativePrompt, promptPrefix, promptSuffix, injectedKeywords
+    case prompt, negativePrompt, promptPrefix, promptSuffix, injectedKeywords, contentMode
     case steps, guidance, projectorScale, noiseType, noiseAlpha, implicitSteps, c2, seed, width, height
     case loras, scheduler, upscale
     // Missing until 2026-08-07: with it absent, BOTH the custom decoder and
@@ -456,6 +461,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     promptPrefix = try c.decodeIfPresent(String.self, forKey: .promptPrefix)
     promptSuffix = try c.decodeIfPresent(String.self, forKey: .promptSuffix)
     injectedKeywords = try c.decodeIfPresent([String].self, forKey: .injectedKeywords)
+    contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
     steps = try c.decodeIfPresent(Int.self, forKey: .steps)
     guidance = try c.decodeIfPresent(Double.self, forKey: .guidance)
     projectorScale = try c.decodeIfPresent(Double.self, forKey: .projectorScale)
@@ -628,6 +634,7 @@ public struct ResolvedPreset: Codable, Equatable, Sendable {
   public var promptPrefix: String?
   public var promptSuffix: String?
   public var injectedKeywords: [String]
+  public var contentMode: String?
 
   public var steps: Int
   public var guidance: Double?
@@ -685,6 +692,7 @@ public struct ResolvedPreset: Codable, Equatable, Sendable {
     promptPrefix = preset.promptPrefix
     promptSuffix = preset.promptSuffix
     injectedKeywords = preset.injectedKeywords ?? []
+    contentMode = preset.contentMode
     steps = preset.steps ?? defaults.steps
     guidance = preset.guidance ?? defaults.guidance
     projectorScale = preset.projectorScale ?? defaults.projectorScale
@@ -1102,7 +1110,8 @@ public final class PresetStore: @unchecked Sendable {
   /// ruling requires it to warn, never refuse.
   static func resolvedLoRAFamily(for preset: ImagePreset) -> String? {
     resolvedLoRAFamily(
-      checkpointFamily: preset.checkpointFamily, model: preset.model, mediaKind: preset.mediaKind)
+      checkpointFamily: preset.checkpointFamily, model: preset.model,
+      mediaKind: preset.mediaKind, engine: preset.engine)
   }
 
   /// #402 fix round 1 (Critical 1): the pure core of `resolvedLoRAFamily(for:)`,
@@ -1110,8 +1119,11 @@ public final class PresetStore: @unchecked Sendable {
   /// `POST /v1/lora/swap` (whose payload has no `ImagePreset` to hand in) can
   /// resolve its OWN declared target family through the identical table
   /// (`WarmServer.loraSwapTargetFamily`).
-  static func resolvedLoRAFamily(checkpointFamily: String?, model: String?, mediaKind: String? = nil) -> String? {
-    if mediaKind?.lowercased() == "video" { return "ltx" }
+  static func resolvedLoRAFamily(
+    checkpointFamily: String?, model: String?, mediaKind: String? = nil,
+    engine: String? = nil
+  ) -> String? {
+    if mediaKind?.lowercased() == "video" || LTX2ImageRecipe.isEngineName(engine) { return "ltx" }
     if resolvesToKrea2Family(checkpointFamily: checkpointFamily, model: model) { return "krea2" }
     if let family = checkpointFamily, zimageCheckpointFamilies.contains(family) { return "z-image" }
     if let model, !model.isEmpty,
@@ -1251,6 +1263,9 @@ public final class PresetStore: @unchecked Sendable {
   /// does not have, and the numeric knobs are range-checked here rather than
   /// at render time.
   static func validateRecipeFields(_ preset: ImagePreset) throws {
+    if LTX2ImageRecipe.isEngineName(preset.engine) {
+      return try validateLTX2ImagePreset(preset)
+    }
     func named(_ error: Error) -> PresetStoreError {
       .validation("preset \"\(preset.id)\": " + ((error as? LocalizedError)?.errorDescription ?? "\(error)"))
     }
@@ -1308,6 +1323,70 @@ public final class PresetStore: @unchecked Sendable {
       if let eta = stage2.eta, !(eta.isFinite && eta >= 0) {
         throw PresetStoreError.validation("preset \"\(preset.id)\": stage2.eta must be a finite number >= 0 (got \(eta))")
       }
+    }
+  }
+
+  /// LTX presets describe the configured one-frame pipeline, not a warm image
+  /// model. Validate the controls that path can actually consume and reject
+  /// every image-family dial that would otherwise be saved and ignored.
+  static func validateLTX2ImagePreset(_ preset: ImagePreset) throws {
+    func fail(_ message: String) -> PresetStoreError {
+      .validation("preset \"\(preset.id)\": " + message)
+    }
+
+    if preset.mediaKind?.lowercased() == "video" {
+      throw fail("engine '\(preset.engine ?? "ltx2")' on /v1/generate requires mediaKind 'image'")
+    }
+    if let provider = preset.provider?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !provider.isEmpty, provider.lowercased() != "local" {
+      throw fail("native LTX-2 image presets require provider 'local'")
+    }
+    if preset.model != nil || preset.customModelPath != nil || preset.baseModel != nil {
+      throw fail("native LTX-2 image presets must not name a model; they use the configured LTX weights")
+    }
+
+    let sampler = LTX2ImageRecipe.normalized(preset.sampler)
+      ?? LTX2ImageRecipe.normalized(preset.scheduler)
+    if let modern = LTX2ImageRecipe.normalized(preset.sampler),
+       let legacy = LTX2ImageRecipe.normalized(preset.scheduler), modern != legacy {
+      throw fail("sampler '\(modern)' and legacy scheduler '\(legacy)' disagree")
+    }
+    if let error = LTX2ImageRecipe.validationError(
+      sampler: sampler, sigmaSchedule: preset.sigmaSchedule) {
+      throw fail(error)
+    }
+
+    if let steps = preset.steps, !(1...100).contains(steps) {
+      throw fail("steps must be between 1 and 100 (got \(steps))")
+    }
+    if let guidance = preset.guidance, !(guidance.isFinite && guidance >= 1) {
+      throw fail("guidance must be finite and at least 1 (got \(guidance))")
+    }
+    if let width = preset.width, width <= 0 || !width.isMultiple(of: 32) {
+      throw fail("width must be a positive multiple of 32 (got \(width))")
+    }
+    if let height = preset.height, height <= 0 || !height.isMultiple(of: 32) {
+      throw fail("height must be a positive multiple of 32 (got \(height))")
+    }
+    if let mode = LTX2ImageRecipe.normalized(preset.contentMode),
+       !["neutral", "apple", "banana", "avocado"].contains(mode) {
+      throw fail("contentMode must be neutral, apple, banana, or avocado (got '\(mode)')")
+    }
+
+    let unsupported: [(String, Bool)] = [
+      ("mode", preset.mode != nil), ("promptPrefix", preset.promptPrefix != nil),
+      ("promptSuffix", preset.promptSuffix != nil), ("injectedKeywords", preset.injectedKeywords != nil),
+      ("projectorScale", preset.projectorScale != nil), ("noiseType", preset.noiseType != nil),
+      ("noiseAlpha", preset.noiseAlpha != nil), ("implicitSteps", preset.implicitSteps != nil),
+      ("c2", preset.c2 != nil), ("upscale", preset.upscale != nil), ("vae", preset.vae != nil),
+      ("checkpointFamily", preset.checkpointFamily != nil), ("phoneLook", preset.phoneLook != nil),
+      ("style", preset.style != nil), ("kroma", preset.kroma != nil),
+      ("bypass", preset.bypass != nil), ("shift", preset.shift != nil), ("eta", preset.eta != nil),
+      ("bongmath", preset.bongmath != nil), ("stage2", preset.stage2 != nil),
+      ("videoTuning", preset.videoTuning != nil),
+    ]
+    if let field = unsupported.first(where: { $0.1 })?.0 {
+      throw fail("native LTX-2 image generation does not support '\(field)'; remove it")
     }
   }
 
