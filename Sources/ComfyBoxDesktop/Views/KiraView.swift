@@ -30,7 +30,7 @@ struct KiraView: View {
     @State private var overrideLorasSeeded = false
     @State private var pendingKroma: Double?
     @State private var pendingAccel: Double?
-    @State private var imagePresetChoices: [String] = []
+    @State private var imagePresetChoices: [ServerPreset] = []
     @State private var videoPresets: [ServerPreset] = []
     /// Which cards are expanded. Empty by default → every card starts collapsed
     /// on launch (Todd 2026-07-17). Expansion is per-session, not persisted.
@@ -710,8 +710,7 @@ struct KiraView: View {
                 // (kira-video-*), everything else is an image preset.
                 imagePresetChoices = presets
                     .filter { !$0.id.contains("video") && ($0.mediaKind ?? "image") == "image" }
-                    .map(\.id)
-                    .sorted()
+                    .sorted { $0.id < $1.id }
                 videoPresets = presets
                     .filter { $0.id.contains("video") || $0.mediaKind == "video" }
                     .sorted { $0.id < $1.id }
@@ -830,7 +829,7 @@ struct KiraView: View {
                         get: { scheduler.imagePreset ?? "" },
                         set: { v in Task { await client.updateSchedulerPolicy(["imagePreset": v.isEmpty ? NSNull() : v]) } })) {
                         Text("Implicit render set").tag("")
-                        ForEach(imagePresetChoices, id: \.self) { Text($0).tag($0) }
+                        ForEach(imagePresetChoices) { preset in Text(preset.name).tag(preset.id) }
                     }
                     .labelsHidden().frame(maxWidth: 240)
                     .disabled(client.actionInFlight)
@@ -904,6 +903,7 @@ struct KiraView: View {
             .disabled(client.actionInFlight)
 
             if let tier = scheduler.tiers[mode] {
+                tierPresetPicker(mode)
                 Toggle("window", isOn: Binding(
                     get: { tier.activeHoursStart != nil },
                     set: { on in
@@ -955,6 +955,39 @@ struct KiraView: View {
                 Spacer(minLength: 0)
             }
         }
+    }
+
+    /// Picker for one tier's image preset. "Default" restores implicit routing;
+    /// unavailable saved IDs are surfaced so catalog outages never erase policy.
+    private func tierPresetPicker(_ mode: String) -> some View {
+        let savedId = client.scheduler?.tiers[mode]?.imagePresetId ?? ""
+        let availableIds = Set(imagePresetChoices.map(\.id))
+        let savedUnavailable = !savedId.isEmpty && !availableIds.contains(savedId)
+        return Picker("", selection: tierPresetBinding(mode)) {
+            Text("Default").tag("")
+            ForEach(imagePresetChoices) { preset in
+                Text(preset.name).tag(preset.id)
+            }
+            if savedUnavailable {
+                Text("Unavailable: \(savedId)").tag(savedId)
+            }
+        }
+        .labelsHidden()
+        .frame(width: 140)
+        .disabled(client.actionInFlight)
+        .help("Image preset used for this tier's scheduled stills and i2v seed frames.")
+    }
+
+    private func tierPresetBinding(_ mode: String) -> Binding<String> {
+        Binding(
+            get: { client.scheduler?.tiers[mode]?.imagePresetId ?? "" },
+            set: { v in
+                putTiers { tiers in
+                    guard var tier = tiers[mode] else { return }
+                    tier.imagePresetId = v.isEmpty ? nil : v
+                    tiers[mode] = tier
+                }
+            })
     }
 
     /// Hour-grain binding for one end of a tier's window (writes the pair).
