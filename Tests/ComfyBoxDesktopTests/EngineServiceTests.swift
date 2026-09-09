@@ -256,6 +256,7 @@ struct GenerationRequestTests {
     @Test("default values")
     func defaults() {
         let req = GenerationRequest()
+        #expect(req.engine == .active)
         #expect(req.prompt == "")
         #expect(req.width == 1024)
         #expect(req.height == 1024)
@@ -269,6 +270,7 @@ struct GenerationRequestTests {
     @Test("custom values preserved")
     func customValues() {
         let req = GenerationRequest(
+            engine: .ltx2,
             prompt: "test prompt",
             width: 768,
             height: 512,
@@ -279,6 +281,7 @@ struct GenerationRequestTests {
             loras: [LoRASelection(id: "l1", filename: "l1.safetensors", scale: 0.8)]
         )
         #expect(req.prompt == "test prompt")
+        #expect(req.engine == .ltx2)
         #expect(req.width == 768)
         #expect(req.height == 512)
         #expect(req.steps == 25)

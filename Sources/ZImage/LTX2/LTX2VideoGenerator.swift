@@ -1865,7 +1865,11 @@ public final class LTX2VideoGenerator {
                     guidance: appliedGuidance,
                     width: outW,
                     height: outH,
-                    model: "LTX-2.3"))
+                    model: "LTX-2.3",
+                    generatedBy: request.source,
+                    contentMode: request.contentMode,
+                    engine: "ltx2",
+                    kind: "t2i"))
         } else {
             try Task.checkCancellation()
             try LTX2PostProcess.writeMP4(

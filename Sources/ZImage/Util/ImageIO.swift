@@ -222,7 +222,8 @@ public enum QwenImageIO {
       prompt: String, negativePrompt: String? = nil, seed: UInt64? = nil,
       steps: Int? = nil, guidance: Float? = nil, width: Int? = nil,
       height: Int? = nil, model: String? = nil, generatedBy: String? = nil,
-      contentMode: String? = nil, loras: [LoRAConfiguration] = [],
+      contentMode: String? = nil, engine: String? = nil, kind: String? = nil,
+      loras: [LoRAConfiguration] = [],
       applied: RenderRecipe? = nil,
       /// Tri-state provenance (round 2, C4). Pass this — not `applied` — from
       /// a Krea 2 render, so a REFUSED record writes `"applied": null` rather
@@ -285,6 +286,8 @@ public enum QwenImageIO {
       // Which app/persona generated it — placed persona renders in the gallery.
       if let generatedBy, !generatedBy.isEmpty { params["source"] = generatedBy }
       if let contentMode, !contentMode.isEmpty { params["content_mode"] = contentMode }
+      if let engine, !engine.isEmpty { params["engine"] = engine }
+      if let kind, !kind.isEmpty { params["kind"] = kind }
       if let style, !style.isEmpty { params["style"] = style }
       if !loras.isEmpty {
         params["loras"] = loras.map { c -> [String: Any] in

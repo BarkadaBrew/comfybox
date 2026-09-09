@@ -46,6 +46,34 @@ Binary and Metal library appear in `.build/xcode/Build/Products/Release/`.
 
 ## Text-to-Image
 
+### Desktop: Active Model or LTX-2.3
+
+The CoffeeShop Desktop **Generate** tab exposes an **Image engine** selector
+when Backend is Local:
+
+- **Active Model** uses the warm Krea/Z-Image-family model and its full
+  sampler, img2img, Studio Pack, and DyPE controls.
+- **LTX-2.3** runs the configured LTX transformer and VAE as a native
+  one-frame image pipeline. The UI starts from 1280×704, 8 steps, guidance 1,
+  shows the fixed shifted-flow/Euler/image-STG recipe, and accepts LTX LoRAs
+  as per-render adapters.
+
+LTX image mode is text-to-image only. The Desktop hides img2img and
+image-model-only recipe controls instead of sending fields the server cannot
+honour. Saved Desktop presets and Gallery **Send to Generate** preserve the
+selected engine; generated PNGs embed `engine: "ltx2"` and `kind: "t2i"` for
+that round trip.
+
+The server must be configured with `--ltx2-weights` and `--ltx2-gemma`.
+
+The equivalent CLI command is:
+
+```bash
+ComfyBox ltx-image -p "A mountain landscape at sunset" \
+  --width 1280 --height 704 --steps 8 --guidance 1 \
+  -o landscape-ltx.png
+```
+
 ### Basic Generation
 
 ```bash

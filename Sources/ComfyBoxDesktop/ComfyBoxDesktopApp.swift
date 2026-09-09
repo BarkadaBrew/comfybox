@@ -881,6 +881,10 @@ struct ComfyBoxDesktopApp: App {
             "width": request.width,
             "height": request.height,
         ]
+        if request.engine == .ltx2 {
+            metadata["engine"] = request.engine.rawValue
+            metadata["kind"] = "t2i"
+        }
         if request.seed > 0 {
             metadata["seed"] = request.seed
         }
@@ -890,7 +894,7 @@ struct ComfyBoxDesktopApp: App {
         if let schedule = request.sigmaSchedule, !schedule.isEmpty {
             metadata["sigma_schedule"] = schedule
         }
-        if let model = request.modelId ?? engine.currentModel {
+        if request.engine == .active, let model = request.modelId ?? engine.currentModel {
             metadata["model"] = model
         }
         if !request.loras.isEmpty {

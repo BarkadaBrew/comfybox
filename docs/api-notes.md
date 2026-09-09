@@ -25,6 +25,13 @@ StylePacks, stage 2, and non-Euler recipe fields are rejected rather than
 silently ignored. An optional `negative_prompt` only affects renders whose
 explicit `guidance` is above 1; the distilled guidance-1 default ignores it.
 
+CoffeeShop Desktop exposes this route in Generate → Local → Image engine →
+LTX-2.3. Its selected LTX LoRAs are sent in the request's `loras[]` field,
+never through the Krea/Z-Image `/v1/lora/swap` endpoint. LTX PNG metadata adds
+`engine: "ltx2"` and `kind: "t2i"`, allowing Gallery **Send to Generate** to
+restore the same engine and avoid treating the transformer filename as an
+image-model pool id.
+
 ## Video generation (LTX-2 / Replicate)
 
 `POST /v1/video/generate`: Video generation. **Local LTX-2** (T2V + I2V) when

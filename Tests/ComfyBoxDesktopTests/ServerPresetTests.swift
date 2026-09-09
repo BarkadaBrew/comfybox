@@ -64,7 +64,7 @@ struct ServerPresetTests {
         // in `loras[]` maps like any other, with no separate `kroma` field
         // on `GenerationPreset` (removed, review r2 M: dead state).
         let p = ServerPreset(
-            id: "x", name: "X", model: "z-image-turbo",
+            id: "x", name: "X", engine: "ltx2", model: "z-image-turbo",
             prompt: "a test", steps: 12, guidance: 4.0,
             width: 1280, height: 1280,
             loras: [
@@ -75,6 +75,7 @@ struct ServerPresetTests {
         )
         let g = p.toGenerationPreset()
         #expect(g.promptTemplate == "a test")
+        #expect(g.engine == "ltx2")
         #expect(g.modelId == "z-image-turbo")
         #expect(g.steps == 12)
         #expect(g.width == 1280)

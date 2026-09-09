@@ -10,6 +10,9 @@ import Foundation
 public struct GenerationPreset: Identifiable, Codable, Sendable {
     public var id: String
     public var name: String
+    /// Image engine restored into the Generate tab. nil/"default" preserves
+    /// legacy presets; "ltx2" selects native LTX-2.3 image generation.
+    public var engine: String?
     public var promptTemplate: String
     public var negativePrompt: String?
     public var modelId: String?
@@ -46,6 +49,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
     public init(
         id: String = UUID().uuidString,
         name: String,
+        engine: String? = nil,
         promptTemplate: String = "",
         negativePrompt: String? = nil,
         modelId: String? = nil,
@@ -71,6 +75,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         self.seed = seed
         self.id = id
         self.name = name
+        self.engine = engine
         self.promptTemplate = promptTemplate
         self.negativePrompt = negativePrompt
         self.modelId = modelId
@@ -127,6 +132,7 @@ public final class PresetManager {
     /// Create a new preset from the current generation parameters.
     public func create(
         name: String,
+        engine: String? = nil,
         promptTemplate: String,
         modelId: String?,
         loras: [LoRASelection],
@@ -146,6 +152,7 @@ public final class PresetManager {
     ) -> GenerationPreset {
         let preset = GenerationPreset(
             name: name,
+            engine: engine,
             promptTemplate: promptTemplate,
             modelId: modelId,
             loras: loras.map {

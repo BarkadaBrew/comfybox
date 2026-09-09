@@ -386,6 +386,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         GenerationPreset(
             id: id,
             name: name,
+            engine: engine,
             promptTemplate: prompt ?? "",
             negativePrompt: negativePrompt,
             modelId: customModelPath ?? model,
