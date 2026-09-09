@@ -16,6 +16,10 @@ import CoreGraphics
 import CoreImage
 #endif
 
+#if canImport(ImageIO)
+import ImageIO
+#endif
+
 import Foundation
 import MLX
 
@@ -170,6 +174,27 @@ public enum LTX2PostProcess {
       shouldInterpolate: false,
       intent: .defaultIntent
     )
+  }
+  #endif
+
+  #if canImport(CoreGraphics) && canImport(ImageIO)
+  /// Write a decoded single LTX frame as a native PNG image.
+  public static func writePNG(
+    image: CGImage,
+    outputPath: String,
+    metadata: QwenImageIO.ImageMetadata? = nil
+  ) throws {
+    let url = URL(fileURLWithPath: outputPath)
+    guard let destination = CGImageDestinationCreateWithURL(
+      url as CFURL, "public.png" as CFString, 1, nil
+    ) else {
+      throw LTX2PostProcessError.writingFailed("Could not create PNG destination at \(outputPath)")
+    }
+    let properties = metadata.map { QwenImageIO.cgProperties(for: $0) as CFDictionary }
+    CGImageDestinationAddImage(destination, image, properties)
+    guard CGImageDestinationFinalize(destination) else {
+      throw LTX2PostProcessError.writingFailed("Could not finalize PNG at \(outputPath)")
+    }
   }
   #endif
 

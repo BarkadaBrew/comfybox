@@ -14,6 +14,12 @@ final class MCPGenerateSchemaTests: XCTestCase {
     return try XCTUnwrap(props[name] as? [String: Any], "generate_image has no '\(name)' property")
   }
 
+  func testGenerateImageAdvertisesNativeLTXEngine() throws {
+    let engine = try property("engine")
+    XCTAssertEqual(engine["type"] as? String, "string")
+    XCTAssertEqual(engine["enum"] as? [String], ["default", "ltx2"])
+  }
+
   func testSchedulerEnumEqualsSchedulerKindAllCases() throws {
     let scheduler = try property("scheduler")
     let enumValues = try XCTUnwrap(scheduler["enum"] as? [String], "scheduler must carry an enum array")

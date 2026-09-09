@@ -269,4 +269,13 @@ public struct LTX2PipelineConfig: Sendable {
 
     return sigmas
   }
+
+  /// Native LTX image schedule used by the LTX-2.3 image workflow.
+  ///
+  /// A still image is a one-frame LTX latent, but it does not use the
+  /// front-loaded distilled *video* schedule. The reference image workflow
+  /// runs the LTXV token-dependent shift with `stretch=false`.
+  public static func imageSigmaSchedule(steps: Int, numTokens: Int) -> [Float] {
+    devSigmaSchedule(steps: steps, numTokens: numTokens, stretch: false)
+  }
 }

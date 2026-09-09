@@ -259,6 +259,9 @@ struct ZImageCLI {
       case "video":
         try runVideo(args: Array(args.dropFirst()))
         return
+      case "ltx-image":
+        try runLTXImage(args: Array(args.dropFirst()))
+        return
       case "ltx2-demo":
         try runLTX2Demo(args: Array(args.dropFirst()))
         return
@@ -1318,6 +1321,15 @@ struct ZImageCLI {
         -r, --resolution     Resolution: 480p, 720p, 1080p (default: 720p)
         --aspect-ratio       16:9 or 9:16 (default: 16:9)
         Use 'ComfyBox video --help' for full options
+
+      ltx-image              Native LTX-2.3 text-to-image (same LTX weights)
+        -p, --prompt         Text prompt (required)
+        -o, --output         Output .png path (default: ltx-image.png)
+        --width              Width, multiple of 32 (default: 1280)
+        --height             Height, multiple of 32 (default: 704)
+        --steps              Denoising steps (default: 8)
+        --guidance           CFG scale (default: 1.0 distilled)
+        Use 'ComfyBox ltx-image --help' for full options
 
       models                 List known model families with installation status
         --paths, -v          Show filesystem paths for installed models
@@ -3369,6 +3381,156 @@ struct ZImageCLI {
 
     print()
     print(String(repeating: "=", count: 60))
+  }
+
+  // MARK: - LTX Image Subcommand (LTX-2.3 Native)
+
+  private static func runLTXImage(args: [String]) throws {
+    let defaultWeightsDir = (NSHomeDirectory() as NSString)
+      .appendingPathComponent("Models/ltx2-distilled")
+    let defaultGemmaPath = (NSHomeDirectory() as NSString).appendingPathComponent(
+      ".cache/huggingface/hub/models--unsloth--gemma-3-12b-it/snapshots/9478e665381f42974aa06177b019352fb6291876")
+
+    var prompt: String?
+    var negativePrompt: String?
+    var outputPath = "ltx-image.png"
+    var width = 1280
+    var height = 704
+    var steps = 8
+    var guidance: Float = 1
+    var stgScale: Float = 0.8
+    var seed: UInt64?
+    var weightsDir = defaultWeightsDir
+    var gemmaPath = defaultGemmaPath
+    var loraPath: String?
+    var loraStrength: Float = 1
+    var noProgress = false
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--prompt", "-p":
+        prompt = nextValue(for: arg, iterator: &iterator)
+      case "--negative-prompt", "-n":
+        negativePrompt = nextValue(for: arg, iterator: &iterator)
+      case "--output", "-o":
+        outputPath = nextValue(for: arg, iterator: &iterator)
+      case "--width":
+        width = intValue(for: arg, iterator: &iterator, minimum: 32, fallback: width)
+      case "--height":
+        height = intValue(for: arg, iterator: &iterator, minimum: 32, fallback: height)
+      case "--steps":
+        steps = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: steps)
+      case "--guidance":
+        guidance = floatValue(for: arg, iterator: &iterator, fallback: guidance)
+      case "--stg-scale":
+        stgScale = floatValue(for: arg, iterator: &iterator, fallback: stgScale)
+      case "--seed":
+        seed = uint64Value(for: arg, iterator: &iterator)
+      case "--weights", "-w":
+        weightsDir = nextValue(for: arg, iterator: &iterator)
+      case "--gemma-path":
+        gemmaPath = nextValue(for: arg, iterator: &iterator)
+      case "--lora":
+        loraPath = nextValue(for: arg, iterator: &iterator)
+      case "--lora-strength":
+        loraStrength = floatValue(for: arg, iterator: &iterator, fallback: loraStrength)
+      case "--no-progress":
+        noProgress = true
+      case "--help", "-h":
+        printLTXImageUsage()
+        return
+      default:
+        logger.warning("Unknown ltx-image argument: \(arg)")
+      }
+    }
+
+    guard let prompt, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      fputs("Error: --prompt is required.\n", stderr)
+      printLTXImageUsage()
+      exit(1)
+    }
+    guard LTX2VideoGenerator.areValidDimensions(width: width, height: height) else {
+      fputs("Error: LTX image width and height must be positive multiples of 32.\n", stderr)
+      exit(1)
+    }
+    guard guidance.isFinite, guidance >= 1 else {
+      fputs("Error: --guidance must be finite and at least 1.\n", stderr)
+      exit(1)
+    }
+    guard stgScale.isFinite, stgScale >= 0 else {
+      fputs("Error: --stg-scale must be finite and non-negative.\n", stderr)
+      exit(1)
+    }
+    if URL(fileURLWithPath: outputPath).pathExtension.lowercased() != "png" {
+      outputPath += ".png"
+    }
+
+    let actualSeed = seed ?? UInt64.random(in: 0...UInt64.max)
+    var tuning = LTX2VideoTuning()
+    tuning.guidanceRescale = 0.7
+    tuning.stage1Sigmas = LTX2PipelineConfig.imageSigmaSchedule(
+      steps: steps, numTokens: (width / 32) * (height / 32))
+    tuning.twoStage = false
+    tuning.condFps = 1
+    tuning.sampler = "euler"
+    tuning.stgScale = stgScale
+    tuning.stgBlocks = "28"
+    tuning.faceAnchorStrength = 0
+    tuning.colorAnchor = 0
+    tuning.nagScale = 0
+
+    let generator = LTX2VideoGenerator(
+      config: .init(weightsDir: weightsDir, gemmaPath: gemmaPath), logger: logger)
+    let request = LTX2VideoRequest(
+      prompt: prompt,
+      negativePrompt: negativePrompt,
+      width: width,
+      height: height,
+      framesPerChunk: 1,
+      steps: steps,
+      seed: actualSeed,
+      guidance: guidance,
+      fps: 1,
+      loraPath: loraPath,
+      loraStrength: loraStrength,
+      outputPath: outputPath,
+      tuning: tuning)
+
+    print("Native LTX-2.3 image: \(width)x\(height), \(steps) steps, seed \(actualSeed)")
+    let result = try generator.generate(request) { _, _, step, total in
+      if !noProgress { print("  [step \(step)/\(total)]") }
+    }
+    print("Wrote \(result.outputPath) in \(String(format: "%.1f", result.elapsedSeconds))s")
+  }
+
+  private static func printLTXImageUsage() {
+    print("""
+
+    ComfyBox ltx-image — Native one-frame LTX-2.3 image generation.
+
+    Usage:
+      ComfyBox ltx-image -p "prompt" [options]
+
+    Options:
+      -p, --prompt <text>       Text prompt (required)
+      -n, --negative-prompt     Negative prompt (used when guidance > 1)
+      -o, --output <path>       Output PNG (default: ltx-image.png)
+      --width <pixels>          Multiple of 32 (default: 1280)
+      --height <pixels>         Multiple of 32 (default: 704)
+      --steps <int>             Shifted-flow steps (default: 8)
+      --guidance <float>        CFG scale (default: 1.0)
+      --stg-scale <float>       Image STG scale; 0 disables (default: 0.8)
+      --seed <uint64>           Reproducible seed
+      -w, --weights <dir>       Existing LTX-2.3 weights directory
+      --gemma-path <dir>        Existing Gemma 3 text encoder directory
+      --lora <path>             Optional LTX LoRA
+      --lora-strength <float>   LoRA merge scale (default: 1.0)
+      --no-progress             Hide step progress
+
+    This uses the same LTX visual transformer and VAE as video generation.
+    It does not load or call another image model.
+    """)
   }
 
   // MARK: - Video Subcommand (LTX-2 Native)

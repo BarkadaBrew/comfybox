@@ -756,6 +756,15 @@ public final class WarmServer {
         // re-resolving the preset against a store that may have changed.
         let (payload, rawBody) = try await decodedGenerateRequest(from: request.body)
         let source = payload.source ?? "api"
+        if payload.usesLTX2ImageEngine {
+          guard configuration.ltx2WeightsPath != nil, configuration.ltx2GemmaPath != nil else {
+            return .error(.error(
+              status: 503,
+              message: "Native LTX-2 image generation is not configured (--ltx2-weights/--ltx2-gemma)"))
+          }
+          let result = try await generateLocalLTX2Image(payload)
+          return .json(status: 200, payload: result)
+        }
         // #1479: absent/false `preempt` (or no video rendering, or a nested
         // attempt) is `.notApplicable` — same call as before this feature.
         switch await attemptPreemption(payload, source: source, rawBody: rawBody) {
@@ -792,6 +801,25 @@ public final class WarmServer {
       do {
         let (payload, rawBody) = try await decodedGenerateRequest(from: request.body)
         let source = payload.source ?? "api"
+        if payload.usesLTX2ImageEngine {
+          guard configuration.ltx2WeightsPath != nil, configuration.ltx2GemmaPath != nil else {
+            return .error(.error(
+              status: 503,
+              message: "Native LTX-2 image generation is not configured (--ltx2-weights/--ltx2-gemma)"))
+          }
+          let status = imageJobTracker.submit(
+            payload, source: source, rawBody: request.body
+          ) { [weak self] _ in
+            guard let self else {
+              throw WarmServerError.invalidRequest(message: "ComfyBox server stopped before the LTX-2 image render began")
+            }
+            return try await self.generateLocalLTX2Image(payload)
+          }
+          let encoder = JSONEncoder()
+          encoder.keyEncodingStrategy = .convertToSnakeCase
+          let data = try encoder.encode(status)
+          return .json(.rawJSON(status: 202, data: data))
+        }
         // #1479: `submitPreempting` runs the SAME `attemptPreemption` check
         // inside the job's own detached Task, so a `preempt`-absent/false
         // submit takes the exact same `coordinator.enqueueGenerate` path as
@@ -2372,6 +2400,92 @@ public final class WarmServer {
     let refineScale: Float
   }
 
+  /// Run native LTX text-to-image through the same serialized GPU/admission
+  /// path as LTX video. The generator receives one frame and a dedicated image
+  /// recipe; no second model or ComfyUI process is involved.
+  private func generateLocalLTX2Image(_ payload: GeneratePayload) async throws -> GenerateResponse {
+    try payload.validateLTX2ImageFields()
+
+    let width = payload.width ?? 1280
+    let height = payload.height ?? 704
+    let steps = payload.steps ?? 8
+    let guidance = payload.guidance ?? 1.0
+    let seed = payload.seed ?? UInt64.random(in: 0...UInt64.max)
+    let outputURL = try payload.resolvedOutputURL(
+      configuration: configuration,
+      defaultFilename: "ltx2-image-\(UUID().uuidString).png")
+
+    let tokenCount = (width / 32) * (height / 32)
+    let imageSigmas = LTX2PipelineConfig.imageSigmaSchedule(
+      steps: steps, numTokens: tokenCount)
+
+    var body: [String: Any] = [
+      "prompt": payload.prompt,
+      "width": width,
+      "height": height,
+      "frames": 1,
+      "steps": steps,
+      "seed": seed,
+      "guidance": guidance,
+      "fps": 1,
+      "output_path": outputURL.path,
+      "source": payload.source ?? "api",
+      "enhance": false,
+      "skip_character_injection": true,
+      "tuning": [
+        "guidance_rescale": 0.7,
+        "stage1_sigmas": imageSigmas,
+        "two_stage": false,
+        "cond_fps": 1.0,
+        "sampler": "euler",
+        "stg_scale": 0.8,
+        "stg_blocks": "28",
+        "face_anchor_strength": 0.0,
+        "color_anchor": 0.0,
+        "nag_scale": 0.0,
+      ] as [String: Any],
+    ]
+    if let negative = payload.negativePrompt, !negative.isEmpty {
+      body["negative_prompt"] = negative
+    }
+    if let contentMode = payload.contentMode, !contentMode.isEmpty {
+      body["content_mode"] = contentMode
+    }
+    if let loras = payload.loras, !loras.isEmpty {
+      body["loras"] = loras.map { entry -> [String: Any] in
+        var value: [String: Any] = ["path": entry.path]
+        if let scale = entry.scale { value["scale"] = scale }
+        if let role = entry.role { value["role"] = role }
+        return value
+      }
+    }
+
+    let encoded = try JSONSerialization.data(withJSONObject: body)
+    guard let prepared = try await prepareLocalVideo(body: encoded) else {
+      throw WarmServerError.invalidRequest(
+        message: "Native LTX-2 image generation is not configured (--ltx2-weights/--ltx2-gemma)")
+    }
+
+    logger.info("LTX-2 image: queued \(prepared.request.width)x\(prepared.request.height), \(steps) steps, seed \(seed)")
+    let result = try await coordinator.enqueueLocalVideo(wantsAudio: false) { report in
+      try prepared.generator.generatePreemptible(prepared.request) {
+        chunk, totalChunks, step, totalSteps in
+        report(Self.localVideoProgressPercent(
+          chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps))
+        self.ltx2StepPosition.update(
+          chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps)
+      }
+    }
+    auditLog.append(
+      kind: "image.ltx2",
+      message: "LTX-2 native image -> \(result.outputPath)",
+      metadata: ["seed": String(seed), "width": String(width), "height": String(height)])
+    return GenerateResponse(
+      success: true,
+      outputPath: result.outputPath,
+      durationMs: Int(result.elapsedSeconds * 1000))
+  }
+
   /// Submit a video render to the paid Replicate cloud proxy and return its 202
   /// job status (already submit-and-poll). Shared by the sync and async video
   /// routes for the cloud / unspecified-fallback case.
@@ -2681,6 +2795,9 @@ public final class WarmServer {
     diagnostic: Bool = false
   ) -> Int {
     let requested = requestFrames ?? videoConfigDefaults.frames ?? 97
+    // A single temporal frame is the native LTX image path. Keep the public
+    // video normalization below for every other request.
+    if requested == 1 { return 1 }
     guard !diagnostic else { return requested }
     // The public production contract is at least 97 frames and 1 + 8k. Round
     // upward so normalizing an invalid request never shortens its duration.
@@ -3055,14 +3172,22 @@ public final class WarmServer {
     if req.width == nil, let nd = namedDims {
       logger.info("LTX-2: resolution '\(req.resolution ?? "")' -> \(nd.width)x\(nd.height) budget")
     }
-    if resolvedDims.adjusted {
-      let sourceNote = sourceSize.map { " (source \($0.width)x\($0.height))" } ?? ""
-      logger.info(
-        "LTX-2 dims: \(resolvedDims.budgetWidth)x\(resolvedDims.budgetHeight) -> \(renderWidth)x\(renderHeight)\(sourceNote), reason \(resolvedDims.reason.rawValue), /64 (#405)")
-    }
-    if effectiveInitImage != nil, sourceSize == nil {
-      logger.warning(
-        "LTX-2 I2V: could not read the init image's pixel size — rendering at the requested \(renderWidth)x\(renderHeight) budget shape, which may not match the source aspect (#405)")
+    if req.frames == 1, effectiveInitImage == nil {
+      // Native LTX images use one temporal frame and support the model's /32
+      // spatial grid. The production video resolver intentionally snaps to
+      // /64, so restore the already-validated image request dimensions here.
+      renderWidth = req.width ?? namedDims?.width ?? videoPreset?.width ?? 1280
+      renderHeight = req.height ?? namedDims?.height ?? videoPreset?.height ?? 704
+    } else {
+      if resolvedDims.adjusted {
+        let sourceNote = sourceSize.map { " (source \($0.width)x\($0.height))" } ?? ""
+        logger.info(
+          "LTX-2 dims: \(resolvedDims.budgetWidth)x\(resolvedDims.budgetHeight) -> \(renderWidth)x\(renderHeight)\(sourceNote), reason \(resolvedDims.reason.rawValue), /64 (#405)")
+      }
+      if effectiveInitImage != nil, sourceSize == nil {
+        logger.warning(
+          "LTX-2 I2V: could not read the init image's pixel size — rendering at the requested \(renderWidth)x\(renderHeight) budget shape, which may not match the source aspect (#405)")
+      }
     }
     // Two-stage dims convention (2026-08-02): with LTX2_TWO_STAGE=1 the request
     // dims are the FINAL output size (matching ComfyUI and every caller's
@@ -3172,9 +3297,10 @@ public final class WarmServer {
       renderWidth = fitted.width
       renderHeight = fitted.height
     }
-    if let requestedSteps = req.steps, requestedSteps != 8 {
+    let scheduledStepCount = (resolvedVideoConfig.stage1SigmasOrNil?.count ?? 9) - 1
+    if let requestedSteps = req.steps, requestedSteps != scheduledStepCount {
       logger.warning(
-        "LTX-2: steps=\(requestedSteps) requested, but the distilled pipeline uses a fixed 8-step sigma schedule — the value is currently ignored (#219)")
+        "LTX-2: steps=\(requestedSteps) requested, but the resolved sigma schedule runs \(scheduledStepCount) steps — the value is ignored (#219)")
     }
 
     // Character identity + optional prompt enhancement. For T2V (no init image)
@@ -6005,6 +6131,16 @@ public final class WarmServer {
     loraLookup: (String) -> LoRALibraryEntry? = { _ in nil }
   ) throws -> GeneratePayload {
     var payload = try decode(GeneratePayload.self, from: body)
+    try payload.validateEngine()
+    if payload.usesLTX2ImageEngine {
+      // LTX images use their own model admission path. Validate and return
+      // before image-preset expansion, image-family LoRA checks, or the image
+      // model's memory preflight can reinterpret the request.
+      try payload.validateOutputPath(configuration: configuration)
+      _ = try payload.validateRecipeNames()
+      try payload.validateLTX2ImageFields()
+      return payload
+    }
     // Bytes-uploaded img2img init image (init_image_base64) — write it to a
     // temp file so remote clients don't need a pre-existing server path.
     if let initData = payload.initImageData, payload.imagePath == nil {
@@ -13210,6 +13346,10 @@ struct GeneratePayload: Sendable {
   /// different base — an explicit `model` that contradicts the preset's is a
   /// 409 (``WarmServerError/presetModelConflict(preset:presetModel:requestModel:)``).
   var model: String?
+  /// Rendering engine override. nil/"default" keeps the active image-model
+  /// path; "ltx2" runs native one-frame LTX-2.3 generation with the already
+  /// configured LTX weights.
+  let engine: String?
   /// Per-job LoRA override, applied the same way as `model` at dequeue time.
   ///
   /// `var` since #286: ``WarmServer/expandGeneratePayload(_:store:stageNearline:log:)``
@@ -13396,7 +13536,7 @@ struct GeneratePayload: Sendable {
     imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil,
     maskPath: String? = nil, maskRegion: String? = nil, maskInvert: Bool? = nil,
     source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil,
-    model: String? = nil, loras: [LoRAEntry]? = nil,
+    model: String? = nil, engine: String? = nil, loras: [LoRAEntry]? = nil,
     controlImageData: Data? = nil, controlnetStrength: Float? = nil, controlImage: String? = nil,
     preempt: Bool? = nil, vae: String? = nil,
     stage2: Stage2Payload? = nil, detailPass: Bool? = nil, detailDenoise: Double? = nil,
@@ -13423,6 +13563,7 @@ struct GeneratePayload: Sendable {
     self.contentMode = contentMode
     self.initImageData = initImageData
     self.model = model
+    self.engine = engine
     self.loras = loras
     self.presetUnresolved = nil
     self.presetUnresolvedReason = nil
@@ -13484,7 +13625,7 @@ extension GeneratePayload: Decodable {
     case controlImageData
     case controlnetStrength
     case controlImage
-    case model, loras
+    case model, engine, loras
     case preempt
     case vae
     // WP-E17. `stage2` has no underscore, so `.convertFromSnakeCase` leaves it
@@ -13553,6 +13694,7 @@ extension GeneratePayload: Decodable {
     preset = try c.decodeIfPresent(String.self, forKey: .preset)
     contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
     model = try c.decodeIfPresent(String.self, forKey: .model)
+    engine = try c.decodeIfPresent(String.self, forKey: .engine)
     loras = try c.decodeIfPresent([LoRAEntry].self, forKey: .loras)
     // #286: engine-set, never decoded from the wire.
     presetUnresolved = nil
@@ -13592,7 +13734,97 @@ extension GeneratePayload: Decodable {
     presetRecipeSkipped = nil
   }
 
-  /// Validate the `shift` field for the family that will render it.
+  /// Whether this request selects native one-frame LTX generation.
+  var usesLTX2ImageEngine: Bool {
+    guard let engine else { return false }
+    switch engine.lowercased() {
+    case "ltx2", "ltx-2", "ltx2-image": return true
+    default: return false
+    }
+  }
+
+  /// Validate the additive engine selector without changing default requests.
+  func validateEngine() throws {
+    guard let engine, !engine.isEmpty else { return }
+    let normalized = engine.lowercased()
+    guard normalized == "default" || normalized == "ltx2"
+            || normalized == "ltx-2" || normalized == "ltx2-image" else {
+      throw WarmServerError.invalidRequest(
+        message: "Unknown image engine '\(engine)'; expected 'default' or 'ltx2'")
+    }
+  }
+
+  /// LTX image generation deliberately has a narrow first-class recipe. Fail
+  /// on fields it cannot honour instead of silently running a different image
+  /// pipeline or dropping controls.
+  func validateLTX2ImageFields() throws {
+    guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      throw WarmServerError.invalidRequest(message: "prompt must not be empty")
+    }
+    let resolvedWidth = width ?? 1280
+    let resolvedHeight = height ?? 704
+    guard LTX2VideoGenerator.areValidDimensions(
+      width: resolvedWidth, height: resolvedHeight) else {
+      throw WarmServerError.invalidRequest(
+        message: "Native LTX-2 image width/height must be positive multiples of 32; got \(resolvedWidth)x\(resolvedHeight)")
+    }
+    let resolvedSteps = steps ?? 8
+    guard (1...100).contains(resolvedSteps) else {
+      throw WarmServerError.invalidRequest(
+        message: "Native LTX-2 image steps must be between 1 and 100; got \(resolvedSteps)")
+    }
+    let resolvedGuidance = guidance ?? 1
+    guard resolvedGuidance.isFinite, resolvedGuidance >= 1 else {
+      throw WarmServerError.invalidRequest(
+        message: "Native LTX-2 image guidance must be finite and at least 1; got \(resolvedGuidance)")
+    }
+    if let outputPath, !outputPath.isEmpty,
+       URL(fileURLWithPath: outputPath).pathExtension.lowercased() != "png" {
+      throw WarmServerError.invalidRequest(
+        message: "Native LTX-2 image output_path must end in .png")
+    }
+    if let scheduler, scheduler.lowercased() != "euler" {
+      throw WarmServerError.invalidRequest(
+        message: "Native LTX-2 image generation currently requires scheduler 'euler'; got '\(scheduler)'")
+    }
+    if let sigmaSchedule, sigmaSchedule.lowercased() != "flow" {
+      throw WarmServerError.invalidRequest(
+        message: "Native LTX-2 image generation uses the shifted flow schedule; got '\(sigmaSchedule)'")
+    }
+    if model != nil {
+      throw WarmServerError.invalidRequest(
+        message: "Do not combine engine:'ltx2' with model; LTX uses the configured --ltx2-weights")
+    }
+    if imagePath != nil || initImageData != nil || imageStrength != nil || creativity != nil {
+      throw WarmServerError.invalidRequest(
+        message: "Native LTX-2 image mode currently supports text-to-image only; remove img2img fields")
+    }
+    let unsupported: [(String, Bool)] = [
+      ("levels_min", levelsMin != nil), ("levels_max", levelsMax != nil),
+      ("eta", eta != nil), ("bongmath", bongmath == true), ("shift", shift != nil),
+      ("dype", dype != nil), ("inpaint_image_base64", inpaintImageData != nil),
+      ("mask_base64", maskData != nil), ("denoise", denoise != nil),
+      ("mask_grow", maskGrow != nil), ("mask_feather", maskFeather != nil),
+      ("mask_path", maskPath != nil), ("mask_region", maskRegion != nil),
+      ("mask_invert", maskInvert != nil), ("cfg", cfg != nil),
+      ("first_n_steps_without_cfg", firstNStepsWithoutCFG != nil),
+      ("phone_look", phoneLook != nil), ("style", style != nil),
+      ("preset", preset != nil),
+      ("control_image", controlImage != nil || controlImageData != nil),
+      ("controlnet_strength", controlnetStrength != nil), ("preempt", preempt == true),
+      ("vae", vae != nil), ("stage2", stage2 != nil || stage2Null),
+      ("detail_pass", detailPass != nil), ("detail_denoise", detailDenoise != nil),
+      ("projector_scale", projectorScale != nil), ("noise_type", noiseType != nil),
+      ("noise_alpha", noiseAlpha != nil), ("implicit_steps", implicitSteps != nil),
+      ("c2", c2 != nil),
+    ]
+    if let field = unsupported.first(where: { $0.1 })?.0 {
+      throw WarmServerError.invalidRequest(
+        message: "Native LTX-2 image generation does not support '\(field)'; remove it")
+    }
+  }
+
+  /// Validate the D3 `shift` field for the family that will render it.
   ///
   /// Returns a 400 message, or nil when the request is acceptable. `shift` is
   /// always a positive finite number, and it is refused — not ignored — on a

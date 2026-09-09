@@ -284,6 +284,9 @@ public final class MCPToolExecutor: @unchecked Sendable {
 
     var body: [String: Any] = ["prompt": prompt]
 
+    if let engine = params?.string("engine") {
+      body["engine"] = engine
+    }
     if let negativePrompt = params?.string("negative_prompt") {
       body["negative_prompt"] = negativePrompt
     }

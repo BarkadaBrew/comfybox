@@ -50,14 +50,17 @@ The port check is IPv4-only by design: `WarmServer` and the bridge's own `--host
 
 #### `generate_image`
 
-Generate an image from a text prompt. Supports text-to-image and img2img modes.
+Generate an image from a text prompt. The default engine supports text-to-image
+and img2img; `engine: "ltx2"` runs native one-frame LTX-2.3 text-to-image with
+the server's configured LTX weights.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `prompt` | string | **Yes** | Text prompt describing the desired image |
-| `negative_prompt` | string | No | Concepts to avoid (non-distilled models only) |
-| `width` | integer | No | Width in pixels, divisible by 16 (default: 1024) |
-| `height` | integer | No | Height in pixels, divisible by 16 (default: 1024) |
+| `engine` | string | No | `default` or `ltx2`; LTX uses the configured LTX-2.3 model directly |
+| `negative_prompt` | string | No | Concepts to avoid; distilled LTX at guidance 1 ignores it |
+| `width` | integer | No | Width in pixels; LTX requires a multiple of 32 (default: 1280) |
+| `height` | integer | No | Height in pixels; LTX requires a multiple of 32 (default: 704) |
 | `steps` | integer | No | Denoising steps. Distilled: 4-9, Base: 20-50 |
 | `guidance` | number | No | CFG scale. 0.0 for distilled, 3.5-7.0 for base |
 | `seed` | integer | No | Random seed for reproducibility |
@@ -90,6 +93,22 @@ the engine actually produced — the reason this parameter exists (comfybox#288)
   "seed": 42
 }
 ```
+
+**Native LTX image example:**
+```json
+{
+  "prompt": "A red rose in a field of daisies, golden hour lighting",
+  "engine": "ltx2",
+  "width": 1280,
+  "height": 704,
+  "steps": 8,
+  "seed": 42
+}
+```
+
+The LTX engine is text-to-image only and writes PNG. It uses a one-frame LTX
+latent, shifted-flow Euler sampling, STG, and the existing LTX transformer,
+Gemma connector, and VAE—no second image model or ComfyUI process.
 
 **Img2img example:**
 ```json

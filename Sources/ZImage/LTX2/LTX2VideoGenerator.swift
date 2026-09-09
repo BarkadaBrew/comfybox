@@ -36,7 +36,8 @@ public struct LTX2VideoRequest: Sendable {
     public var initImagePath: String?
     public var width: Int
     public var height: Int
-    /// Frames per chunk; must be 1 + 8k (9, 17, 25, …, 97).
+    /// Frames per chunk; 1 generates an image, video uses 1 + 8k
+    /// (9, 17, 25, …, 97).
     public var framesPerChunk: Int
     public var steps: Int
     public var seed: UInt64
@@ -332,7 +333,7 @@ public enum LTX2VideoError: Error, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .invalidFrameCount(let n):
-            return "LTX-2 frames must be 1 + 8k (9, 17, 25, …, 97); got \(n)."
+            return "LTX-2 frames must be 1 (image) or 1 + 8k video frames (9, 17, 25, …, 97); got \(n)."
         case .invalidDimensions(let w, let h):
             return "LTX-2 width/height must be divisible by 32; got \(w)x\(h)."
         case .weightsMissing(let path):
@@ -414,9 +415,9 @@ public final class LTX2VideoGenerator {
 
     // MARK: - Pure planning helpers (testable without the model)
 
-    /// A frame count is valid when it's 1 + 8k and ≥ 9.
+    /// One frame is native LTX image generation; videos are 1 + 8k and ≥ 9.
     public static func isValidFrameCount(_ n: Int) -> Bool {
-        n >= 9 && (n - 1) % 8 == 0
+        n == 1 || (n >= 9 && (n - 1) % 8 == 0)
     }
 
     /// Resolve the Gemma tokenizer max length (LTX2_GEMMA_MAX_LENGTH).
@@ -470,6 +471,12 @@ public final class LTX2VideoGenerator {
     /// re-uses the previous chunk's last frame, so it adds `framesPerChunk - 1`
     /// new frames. `extendToSeconds == 0` → a single chunk.
     public static func chunkPlan(framesPerChunk: Int, extendToSeconds: Float, fps: Int) -> ChunkPlan {
+        // A one-frame image has no continuation boundary. Besides being the
+        // correct semantic result, this avoids dividing by
+        // `framesPerChunk - 1` below.
+        if framesPerChunk == 1 {
+            return ChunkPlan(totalChunks: 1, totalFrames: 1, durationSeconds: 0)
+        }
         let totalChunks: Int
         if extendToSeconds > 0 {
             let targetFrames = Int(extendToSeconds * Float(fps))
@@ -1797,8 +1804,15 @@ public final class LTX2VideoGenerator {
         // file that doesn't exist. `deliveryDims` is what `writeMP4` actually
         // encodes — using `outW`/`outH` here would record the pre-delivery-
         // scale size on a downscaled delivery.
-        let (deliveredW, deliveredH) = LTX2PostProcess.deliveryDims(
-            width: outW, height: outH, shortEdge: pipeline.resolvedConfig.deliveryShortEdge)
+        let isPNGImage = allFrames.count == 1
+            && URL(fileURLWithPath: request.outputPath).pathExtension.lowercased() == "png"
+        let encodedDims = isPNGImage
+            ? (width: outW, height: outH)
+            : LTX2PostProcess.deliveryDims(
+                width: outW, height: outH,
+                shortEdge: pipeline.resolvedConfig.deliveryShortEdge)
+        let deliveredW = encodedDims.width
+        let deliveredH = encodedDims.height
         let generationRecord = VideoGenerationRecord.build(
             request: request,
             transformerFile: config.transformerFile,
@@ -1831,24 +1845,41 @@ public final class LTX2VideoGenerator {
         // ABOVE the cancellation boundary below: that check must stay adjacent
         // to the write (`LTX2CancellationBoundaryTests` pins the adjacency —
         // an interrupted render must not write an MP4).
-        let encodedDims = LTX2PostProcess.deliveryDims(
-            width: outW, height: outH,
-            shortEdge: pipeline.resolvedConfig.deliveryShortEdge)
         try Task.checkCancellation()
         telemetry?.begin(.postProcess)
+        defer { telemetry?.end(.postProcess) }
         startedWrite = true
-        try LTX2PostProcess.writeMP4(
-            frames: allFrames, outputPath: request.outputPath,
-            fps: request.fps, width: outW, height: outH,
-            bitsPerPixelOverride: pipeline.resolvedConfig.videoBitsPerPx,
-            audio: audioTrack,
-            deliveryShortEdge: pipeline.resolvedConfig.deliveryShortEdge,
-            // Bounded per ruling 5 — `atomJSONString` never exceeds
-            // `VideoGenerationRecord.atomSizeCap`; the sidecar below always
-            // carries the full record regardless.
-            generationRecordJSON: generationRecord.atomJSONString)
+        if isPNGImage, let image = allFrames.first {
+            try Task.checkCancellation()
+            let appliedGuidance = request.guidance ?? pipeline.config.guidance
+            try LTX2PostProcess.writePNG(
+                image: image,
+                outputPath: request.outputPath,
+                metadata: .generation(
+                    prompt: request.prompt,
+                    negativePrompt: appliedGuidance > 1
+                        ? QwenImageIO.ImageMetadata.requestNegative(request.negativePrompt)
+                        : nil,
+                    seed: request.seed,
+                    steps: request.steps,
+                    guidance: appliedGuidance,
+                    width: outW,
+                    height: outH,
+                    model: "LTX-2.3"))
+        } else {
+            try Task.checkCancellation()
+            try LTX2PostProcess.writeMP4(
+                frames: allFrames, outputPath: request.outputPath,
+                fps: request.fps, width: outW, height: outH,
+                bitsPerPixelOverride: pipeline.resolvedConfig.videoBitsPerPx,
+                audio: audioTrack,
+                deliveryShortEdge: pipeline.resolvedConfig.deliveryShortEdge,
+                // Bounded per ruling 5 — `atomJSONString` never exceeds
+                // `VideoGenerationRecord.atomSizeCap`; the sidecar below
+                // always carries the full record regardless.
+                generationRecordJSON: generationRecord.atomJSONString)
+        }
         wroteOutput = true
-        telemetry?.end(.postProcess)
 
         // comfybox#401 ruling 2: the sidecar is MANDATORY — best-effort (never
         // fails a render that produced a real clip); `VideoSidecar.write`

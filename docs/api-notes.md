@@ -7,6 +7,24 @@ and never touched by the generator — put prose, schemas and examples here.
 Content below carried verbatim from the pre-Phase-4 hand-maintained reference
 (`docs/api-reference.md` @ 3654f8b4).
 
+## Native LTX image generation
+
+`POST /v1/generate` and `POST /v1/generate/async` accept
+`{prompt, engine: "ltx2", width?, height?, steps?, guidance?, seed?, output_path?, loras?}`.
+This selects native one-frame LTX-2.3 text-to-image generation using the same
+transformer, Gemma connector, VAE, admission gate, and serialized GPU queue as
+local LTX video. It does not load another image model or call ComfyUI.
+
+Defaults are 1280×704, 8 shifted-flow Euler steps, guidance 1, image STG 0.8
+at transformer block 28, guidance rescale 0.7, and PNG output. Width and height
+must be positive multiples of 32. The server must be started with
+`--ltx2-weights` and `--ltx2-gemma`.
+
+This first native surface is text-to-image only. Img2img, ControlNet, presets,
+StylePacks, stage 2, and non-Euler recipe fields are rejected rather than
+silently ignored. An optional `negative_prompt` only affects renders whose
+explicit `guidance` is above 1; the distilled guidance-1 default ignores it.
+
 ## Video generation (LTX-2 / Replicate)
 
 `POST /v1/video/generate`: Video generation. **Local LTX-2** (T2V + I2V) when

@@ -98,7 +98,7 @@ public enum MCPToolRegistry {
 
   static let generateImage = MCPToolDefinition(
     name: "generate_image",
-    description: "Generate an image from a text prompt using the loaded model. Supports text-to-image and img2img. Returns the output file path and render duration.",
+    description: "Generate an image from a text prompt. Uses the loaded image model by default, or native one-frame LTX-2.3 generation when engine is 'ltx2'. Returns the output file path and render duration.",
     inputSchema: [
       "type": "object",
       "properties": [
@@ -106,17 +106,22 @@ public enum MCPToolRegistry {
           "type": "string",
           "description": "Text prompt describing the desired image.",
         ] as [String: Any],
+        "engine": [
+          "type": "string",
+          "enum": ["default", "ltx2"],
+          "description": "Image engine. 'default' uses the loaded image model; 'ltx2' uses the configured LTX-2.3 weights directly as a one-frame image generator (no other model).",
+        ] as [String: Any],
         "negative_prompt": [
           "type": "string",
-          "description": "Negative prompt — concepts to avoid. Only effective on non-distilled models (Z-Image Base, Flux 2 Klein Base, FIBO).",
+          "description": "Negative prompt — concepts to avoid. Effective when the selected engine/model runs CFG; native distilled LTX at guidance 1 ignores it.",
         ] as [String: Any],
         "width": [
           "type": "integer",
-          "description": "Image width in pixels. Must be divisible by 16. Default: model-dependent (typically 1024).",
+          "description": "Image width in pixels. Native LTX requires a multiple of 32 and defaults to 1280.",
         ] as [String: Any],
         "height": [
           "type": "integer",
-          "description": "Image height in pixels. Must be divisible by 16. Default: model-dependent (typically 1024).",
+          "description": "Image height in pixels. Native LTX requires a multiple of 32 and defaults to 704.",
         ] as [String: Any],
         "steps": [
           "type": "integer",

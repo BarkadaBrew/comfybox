@@ -10,14 +10,34 @@ final class LTX2VideoGeneratorTests: XCTestCase {
     }
 
     func testFrameCountValidation() {
-        // Valid: 1 + 8k, at least 9.
-        for n in [9, 17, 25, 33, 97, 121] {
+        // Valid: one frame for native images, or 1 + 8k video frames.
+        for n in [1, 9, 17, 25, 33, 97, 121] {
             XCTAssertTrue(LTX2VideoGenerator.isValidFrameCount(n), "\(n) should be valid")
         }
         // Invalid.
-        for n in [1, 8, 10, 16, 96, 100, 0, -1] {
+        for n in [2, 8, 10, 16, 96, 100, 0, -1] {
             XCTAssertFalse(LTX2VideoGenerator.isValidFrameCount(n), "\(n) should be invalid")
         }
+    }
+
+    func testSingleFrameImagePlanNeverAttemptsContinuationMath() {
+        let plan = LTX2VideoGenerator.chunkPlan(
+            framesPerChunk: 1, extendToSeconds: 12, fps: 1)
+        XCTAssertEqual(plan.totalChunks, 1)
+        XCTAssertEqual(plan.totalFrames, 1)
+        XCTAssertEqual(plan.durationSeconds, 0)
+    }
+
+    func testImageSigmaScheduleIsShiftedUnstretchedFlow() {
+        let sigmas = LTX2PipelineConfig.imageSigmaSchedule(
+            steps: 8, numTokens: (1280 / 32) * (704 / 32))
+        XCTAssertEqual(sigmas.count, 9)
+        XCTAssertEqual(sigmas.first, 1)
+        XCTAssertEqual(sigmas.last, 0)
+        XCTAssertTrue(zip(sigmas, sigmas.dropFirst()).allSatisfy { pair in
+            pair.0 >= pair.1
+        })
+        XCTAssertNotEqual(sigmas, LTX2PipelineConfig.stage1Sigmas)
     }
 
     func testDimensionValidation() {
