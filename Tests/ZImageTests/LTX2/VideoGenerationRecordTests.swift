@@ -14,6 +14,14 @@ final class VideoGenerationRecordTests: XCTestCase {
                    "extend_to_seconds is meaningless without an init image — still t2v")
     XCTAssertEqual(VideoGenerationRecord.kind(initImagePath: "/tmp/src.png", extendToSeconds: 0), "i2v")
     XCTAssertEqual(VideoGenerationRecord.kind(initImagePath: "/tmp/src.png", extendToSeconds: 8), "extend")
+    XCTAssertEqual(
+      VideoGenerationRecord.kind(
+        initImagePath: nil, extendToSeconds: 0, frameCount: 1, outputPath: "/tmp/image.png"),
+      "t2i")
+    XCTAssertEqual(
+      VideoGenerationRecord.kind(
+        initImagePath: nil, extendToSeconds: 0, frameCount: 1, outputPath: "/tmp/video.mp4"),
+      "t2v")
   }
 
   // MARK: - build() matches the request field-for-field (ruling 4: "a test that
@@ -53,6 +61,7 @@ final class VideoGenerationRecordTests: XCTestCase {
     XCTAssertEqual(record.steps, request.steps)
     XCTAssertEqual(record.guidance, request.guidance)
     XCTAssertEqual(record.model, "transformer-distilled")
+    XCTAssertEqual(record.engine, "ltx2")
     XCTAssertEqual(record.width, request.width)
     XCTAssertEqual(record.height, request.height)
     XCTAssertEqual(record.frames, 97)
@@ -79,6 +88,7 @@ final class VideoGenerationRecordTests: XCTestCase {
     XCTAssertEqual(json?["guidance"] as? Double ?? -1, 3.5, accuracy: 0.0001)
     XCTAssertEqual(json?["source"] as? String, "bree")
     XCTAssertEqual(json?["content_mode"] as? String, "apple")
+    XCTAssertEqual(json?["engine"] as? String, "ltx2")
   }
 
   // MARK: - guidance is the value ACTUALLY USED, not just the request field

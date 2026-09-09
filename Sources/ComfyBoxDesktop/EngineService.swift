@@ -13,6 +13,9 @@ import Darwin
 
 /// Generation parameters submitted to the server.
 public struct GenerationRequest: Sendable {
+    /// Local image pipeline. `.active` preserves the warm image-model path;
+    /// `.ltx2` selects native one-frame LTX-2.3 generation.
+    public var engine: ImageGenerationEngine
     public var prompt: String
     public var negativePrompt: String
     public var width: Int
@@ -56,6 +59,7 @@ public struct GenerationRequest: Sendable {
     public var shift: Float?
 
     public init(
+        engine: ImageGenerationEngine = .active,
         prompt: String = "",
         negativePrompt: String = "",
         width: Int = 1024,
@@ -79,6 +83,7 @@ public struct GenerationRequest: Sendable {
         imageStrength: Float? = nil,
         dype: String? = nil
     ) {
+        self.engine = engine
         self.prompt = prompt
         self.negativePrompt = negativePrompt
         self.width = width
@@ -613,6 +618,20 @@ public final class EngineService {
             "outputPath": outputPath
         ]
 
+        if request.engine == .ltx2 {
+            payloadDict["engine"] = request.engine.rawValue
+            // LTX's adapter stack is per-render. An empty array is meaningful:
+            // it clears any daemon-level --ltx2-lora default for this request.
+            payloadDict["loras"] = request.loras.map { lora -> [String: Any] in
+                var entry: [String: Any] = [
+                    "path": lora.filename,
+                    "scale": lora.scale,
+                ]
+                if let role = lora.role, !role.isEmpty { entry["role"] = role }
+                return entry
+            }
+        }
+
         if request.seed > 0 {
             payloadDict["seed"] = request.seed
         }
@@ -620,7 +639,7 @@ public final class EngineService {
         if let sampler = request.sampler?.trimmingCharacters(in: .whitespacesAndNewlines),
            !sampler.isEmpty {
             // `sampler` is the user-facing alias accepted by GeneratePayload;
-            // it maps to the engine's historical `scheduler` field.
+            // both image engines validate it against their own recipe table.
             payloadDict["sampler"] = sampler
         }
         if let schedule = request.sigmaSchedule?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -633,44 +652,50 @@ public final class EngineService {
         }
 
         // img2img: reference image + strength (server maps strength->denoise).
-        if let initImagePath = request.initImagePath, !initImagePath.isEmpty {
-            payloadDict["imagePath"] = initImagePath
-            payloadDict["imageStrength"] = request.imageStrength ?? 0.6
-        }
-        // DyPE high-resolution scaling (ntk / yarn).
-        if let dype = request.dype, dype != "none", !dype.isEmpty {
-            payloadDict["dype"] = dype
-        }
-        // Projector-scale trick: CFG-free prompt-adherence gain. 1.0 = omit
-        // (byte-identical); the engine also treats absent as neutral.
-        if request.projectorScale != 1.0 {
-            payloadDict["projector_scale"] = request.projectorScale
-        }
-        // RES4LYF SDE / bongmath (Clownshark recipe) — emitted only when active
-        // so an ODE render stays byte-identical.
-        if request.eta > 0 {
-            payloadDict["eta"] = request.eta
-        }
-        if request.bongmath {
-            payloadDict["bongmath"] = true
-        }
-        if request.noiseType != "gaussian" {
-            payloadDict["noise_type"] = request.noiseType
-        }
-        if request.noiseAlpha != 0 {
-            payloadDict["noise_alpha"] = request.noiseAlpha
-        }
-        if request.implicitSteps != 0 {
-            payloadDict["implicit_steps"] = request.implicitSteps
-        }
-        if request.c2 != 0.5 {
-            payloadDict["c2"] = request.c2
-        }
-        // #419: an explicit schedule shift (preset-applied or typed). Absent
-        // = the engine's resolution-dependent default, byte-identical to
-        // before this field existed.
-        if let shift = request.shift, shift.isFinite, shift > 0 {
-            payloadDict["shift"] = shift
+        // These controls belong to the warm image-model path. The LTX route
+        // deliberately exposes a narrow T2I recipe and rejects them rather
+        // than silently ignoring them, so the Desktop must not leak retained
+        // Krea/Z-Image form state into an LTX request.
+        if request.engine == .active {
+            if let initImagePath = request.initImagePath, !initImagePath.isEmpty {
+                payloadDict["imagePath"] = initImagePath
+                payloadDict["imageStrength"] = request.imageStrength ?? 0.6
+            }
+            // DyPE high-resolution scaling (ntk / yarn).
+            if let dype = request.dype, dype != "none", !dype.isEmpty {
+                payloadDict["dype"] = dype
+            }
+            // Projector-scale trick: CFG-free prompt-adherence gain. 1.0 = omit
+            // (byte-identical); the engine also treats absent as neutral.
+            if request.projectorScale != 1.0 {
+                payloadDict["projector_scale"] = request.projectorScale
+            }
+            // RES4LYF SDE / bongmath (Clownshark recipe) — emitted only when active
+            // so an ODE render stays byte-identical.
+            if request.eta > 0 {
+                payloadDict["eta"] = request.eta
+            }
+            if request.bongmath {
+                payloadDict["bongmath"] = true
+            }
+            if request.noiseType != "gaussian" {
+                payloadDict["noise_type"] = request.noiseType
+            }
+            if request.noiseAlpha != 0 {
+                payloadDict["noise_alpha"] = request.noiseAlpha
+            }
+            if request.implicitSteps != 0 {
+                payloadDict["implicit_steps"] = request.implicitSteps
+            }
+            if request.c2 != 0.5 {
+                payloadDict["c2"] = request.c2
+            }
+            // #419: an explicit schedule shift (preset-applied or typed). Absent
+            // = the engine's resolution-dependent default, byte-identical to
+            // before this field existed.
+            if let shift = request.shift, shift.isFinite, shift > 0 {
+                payloadDict["shift"] = shift
+            }
         }
 
         return attachingContentMode(payloadDict, mode: contentMode)
@@ -1023,7 +1048,8 @@ public final class EngineService {
 
         // Build the output path.
         let timestamp = Int(Date().timeIntervalSince1970)
-        let outputFilename = "comfybox-\(timestamp).png"
+        let engineSuffix = request.engine == .ltx2 ? "-ltx2" : ""
+        let outputFilename = "comfybox\(engineSuffix)-\(timestamp).png"
 
         // Ensure output directory exists.
         try FileManager.default.createDirectory(

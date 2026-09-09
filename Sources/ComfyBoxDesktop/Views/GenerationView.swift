@@ -41,6 +41,7 @@ struct ResolutionPreset: Identifiable, Hashable {
         ResolutionPreset(id: "1280sq", width: 1280, height: 1280, hint: "1:1 headshot"),
         ResolutionPreset(id: "768x1024", width: 768, height: 1024, hint: "3:4 portrait"),
         ResolutionPreset(id: "1024x768", width: 1024, height: 768, hint: "4:3 landscape"),
+        ResolutionPreset(id: "1280x704", width: 1280, height: 704, hint: "LTX landscape"),
         ResolutionPreset(id: "1024x1536", width: 1024, height: 1536, hint: "2:3 full body"),
         ResolutionPreset(id: "1536x1024", width: 1536, height: 1024, hint: "3:2 landscape"),
         ResolutionPreset(id: "768x1344", width: 768, height: 1344, hint: "9:16 tall"),
@@ -75,6 +76,7 @@ struct GenerationView: View {
     // coming back doesn't wipe your work. @SceneStorage is a drop-in for @State.
     @SceneStorage("gen.prompt") private var prompt: String = ""
     @SceneStorage("gen.negativePrompt") private var negativePrompt: String = ""
+    @SceneStorage("gen.imageEngine") private var imageEngineRaw: String = ImageGenerationEngine.active.rawValue
     @SceneStorage("gen.resolutionId") private var resolutionId: String = ResolutionPreset.presets[2].id
     @State private var selectedResolution: ResolutionPreset = ResolutionPreset.presets[2]
     @SceneStorage("gen.customWidth") private var customWidth: Int = 1024
@@ -103,6 +105,8 @@ struct GenerationView: View {
     /// Empty = let the active model choose its native recipe.
     @SceneStorage("gen.sampler") private var sampler: String = ""
     @SceneStorage("gen.sigmaSchedule") private var sigmaSchedule: String = ""
+    @SceneStorage("gen.ltxImageSampler") private var ltxImageSampler: String = LTX2ImageRecipe.defaultSampler
+    @SceneStorage("gen.ltxImageSigmaSchedule") private var ltxImageSigmaSchedule: String = LTX2ImageRecipe.defaultSigmaSchedule
     @SceneStorage("gen.seedText") private var seedText: String = ""
     @State private var displayedImage: NSImage?
 
@@ -119,6 +123,22 @@ struct GenerationView: View {
     }
     private var effectiveHeight: Int {
         selectedResolution.id == ResolutionPreset.custom.id ? customHeight : selectedResolution.height
+    }
+
+    private var selectedImageEngine: ImageGenerationEngine {
+        ImageGenerationEngine(serverValue: imageEngineRaw)
+    }
+
+    private var isLTX2Image: Bool { backend == .local && selectedImageEngine == .ltx2 }
+
+    private var selectedSampler: String { isLTX2Image ? ltxImageSampler : sampler }
+    private var selectedSigmaSchedule: String { isLTX2Image ? ltxImageSigmaSchedule : sigmaSchedule }
+
+    private var imageEngineSelection: Binding<ImageGenerationEngine> {
+        Binding(
+            get: { selectedImageEngine },
+            set: { selectImageEngine($0, applyRecommendedDefaults: true) }
+        )
     }
 
     private var seedWalkHint: String {
@@ -166,6 +186,39 @@ struct GenerationView: View {
             c2: c2 == 0.5 ? nil : c2,
             projectorScale: projectorScale == 1.0 ? nil : projectorScale
         ))
+    }
+
+    /// One validation surface for both local image engines. LTX uses its own
+    /// dimension/guidance rules and per-request adapter family; the active
+    /// image-model path keeps the existing family-aware sampling validator.
+    private var generationValidationError: String? {
+        if isLTX2Image {
+            if let error = selectedImageEngine.validationError(
+                width: effectiveWidth,
+                height: effectiveHeight,
+                steps: Int(steps),
+                guidance: Float(guidance)
+            ) { return error }
+            if let error = LTX2ImageRecipe.validationError(
+                sampler: ltxImageSampler, sigmaSchedule: ltxImageSigmaSchedule
+            ) { return error }
+
+            let activeModel = "ltx"
+            for selection in selectedLoras {
+                guard let lora = engine.availableLoras.first(where: {
+                    $0.id == selection.id
+                        || $0.filename.caseInsensitiveCompare(selection.filename) == .orderedSame
+                }) else { continue }
+                if case .incompatible(let family, _) = LoRACompatibility.status(
+                    loraCompatibility: lora.modelCompatibility,
+                    modelIdentifier: activeModel
+                ) {
+                    return "\(lora.id) is a \(LoRACompatibility.label(for: family)) LoRA; LTX image mode accepts LTX LoRAs only."
+                }
+            }
+            return nil
+        }
+        return samplingValidationError
     }
 
     // Sidebar sections
@@ -289,66 +342,70 @@ struct GenerationView: View {
             SavePresetSheet(
                 promptTemplate: prompt,
                 negativePrompt: negativePrompt,
-                modelId: engine.currentModel,
+                modelId: isLTX2Image ? nil : engine.currentModel,
                 loras: selectedLoras,
                 steps: Int(steps),
                 guidance: Float(guidance),
                 width: effectiveWidth,
                 height: effectiveHeight,
-                sampler: sampler,
-                sigmaSchedule: sigmaSchedule,
-                eta: eta,
-                bongmath: bongmath,
-                shift: shift.wrappedValue,
+                sampler: selectedSampler,
+                sigmaSchedule: selectedSigmaSchedule,
+                eta: isLTX2Image ? 0 : eta,
+                bongmath: isLTX2Image ? false : bongmath,
+                shift: isLTX2Image ? nil : shift.wrappedValue,
                 onSave: { name, editedNegative in
-                    // Save to the canonical server preset store (shared with
-                    // Bree/Telegram), not the old device-local list.
+                    // Save to the canonical server preset store, not the old
+                    // device-local list. The server can expand the same LTX
+                    // recipe fields later when this preset is selected by name.
                     // Todd 2026-09-04: kroma is a regular LoRA — `loras[]` is
                     // the single source; no separate structured field to
                     // compose here (the server's `kroma` is a deprecated,
                     // derived, read-only echo it recomputes on save).
-                    let preset = ServerPreset(
-                        name: name,
-                        prompt: prompt.isEmpty ? nil : prompt,
-                        negativePrompt: editedNegative.isEmpty ? nil : editedNegative,
-                        steps: Int(steps),
-                        guidance: guidance,
-                        // Neutral values stay absent — never freeze a default.
-                        projectorScale: projectorScale == 1.0 ? nil : projectorScale,
-                        noiseType: noiseType == "gaussian" ? nil : noiseType,
-                        noiseAlpha: noiseAlpha == 0 ? nil : noiseAlpha,
-                        implicitSteps: implicitSteps.rounded() == 0 ? nil : Int(implicitSteps.rounded()),
-                        c2: c2 == 0.5 ? nil : c2,
-                        width: effectiveWidth,
-                        height: effectiveHeight,
-                        loras: selectedLoras.map {
-                            ServerPresetLora(
-                                filename: $0.filename,
-                                scale: Double($0.scale),
-                                role: $0.role
-                            )
-                        },
-                        // Mirror the sampler into the legacy field for older
-                        // preset consumers while the structured fields remain
-                        // the authoritative Krea 2 recipe.
-                        scheduler: sampler.isEmpty ? nil : sampler,
-                        sampler: sampler.isEmpty ? nil : sampler,
-                        sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
-                        // #419: the panel's RES4LYF knobs used to be dropped
-                        // here — a Clownshark session saved as an ODE preset.
-                        // Neutral values stay absent (never freeze a default).
-                        shift: shift.wrappedValue,
-                        eta: eta == 0 ? nil : eta,
-                        bongmath: bongmath ? true : nil
-                    )
-                    var withModel = preset
-                    if let model = engine.currentModel {
-                        if model.hasPrefix("/") { withModel.customModelPath = model }
-                        else { withModel.model = model }
+                    let savedLoras = selectedLoras.map {
+                        ServerPresetLora(
+                            filename: $0.filename,
+                            scale: Double($0.scale),
+                            role: $0.role
+                        )
+                    }
+                    let savedEngine = isLTX2Image ? ImageGenerationEngine.ltx2.rawValue : nil
+                    let savedSampler = selectedSampler.isEmpty ? nil : selectedSampler
+                    let savedSchedule = selectedSigmaSchedule.isEmpty ? nil : selectedSigmaSchedule
+                    var preset = ServerPreset(name: name)
+                    preset.mediaKind = "image"
+                    preset.provider = "local"
+                    preset.engine = savedEngine
+                    preset.contentMode = contentMode.rawValue
+                    preset.prompt = prompt.isEmpty ? nil : prompt
+                    preset.negativePrompt = editedNegative.isEmpty ? nil : editedNegative
+                    preset.steps = Int(steps)
+                    preset.guidance = guidance
+                    preset.projectorScale = isLTX2Image || projectorScale == 1.0 ? nil : projectorScale
+                    preset.noiseType = isLTX2Image || noiseType == "gaussian" ? nil : noiseType
+                    preset.noiseAlpha = isLTX2Image || noiseAlpha == 0 ? nil : noiseAlpha
+                    preset.implicitSteps = isLTX2Image || implicitSteps.rounded() == 0
+                        ? nil
+                        : Int(implicitSteps.rounded())
+                    preset.c2 = isLTX2Image || c2 == 0.5 ? nil : c2
+                    preset.width = effectiveWidth
+                    preset.height = effectiveHeight
+                    preset.loras = savedLoras
+                    // Mirror the sampler into the legacy field for older
+                    // preset consumers while structured fields stay authoritative.
+                    preset.scheduler = savedSampler
+                    preset.sampler = savedSampler
+                    preset.sigmaSchedule = savedSchedule
+                    // Neutral RES4LYF values stay absent so defaults remain live.
+                    preset.shift = isLTX2Image ? nil : shift.wrappedValue
+                    preset.eta = isLTX2Image || eta == 0 ? nil : eta
+                    preset.bongmath = isLTX2Image ? nil : (bongmath ? true : nil)
+                    if !isLTX2Image, let model = engine.currentModel {
+                        if model.hasPrefix("/") { preset.customModelPath = model }
+                        else { preset.model = model }
                     }
                     // Capture the seed so the preset reproduces exactly (0/empty = random).
-                    if let s = UInt64(seedText), s > 0 { withModel.seed = Int(truncatingIfNeeded: s) }
-                    let toSave = withModel
+                    if let s = UInt64(seedText), s > 0 { preset.seed = Int(truncatingIfNeeded: s) }
+                    let toSave = preset
                     Task {
                         try? await engine.savePreset(toSave)
                         await loadServerPresets()
@@ -371,13 +428,20 @@ struct GenerationView: View {
 
                 Divider()
 
-                // Model selector (collapsible)
-                DisclosureGroup(isExpanded: $showModelSelector) {
-                    ModelSelector(engine: engine)
-                        .padding(.top, 4)
-                } label: {
-                    Label("Model", systemImage: "cpu")
-                        .font(.headline)
+                // LTX has its own configured transformer/VAE and must never be
+                // routed through the image-model pool selector.
+                if isLTX2Image {
+                    Label("LTX-2.3 transformer + VAE (server configured)", systemImage: "cpu")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                } else {
+                    DisclosureGroup(isExpanded: $showModelSelector) {
+                        ModelSelector(engine: engine)
+                            .padding(.top, 4)
+                    } label: {
+                        Label("Model", systemImage: "cpu")
+                            .font(.headline)
+                    }
                 }
 
                 // Image assistant (Dan's v1.3) — can populate the controls below.
@@ -421,7 +485,14 @@ struct GenerationView: View {
                 Divider()
 
                 // Reference image (img2img)
-                referenceSection
+                if isLTX2Image {
+                    Label("LTX image mode is text-to-image only. Switch to Active Model for a reference image.",
+                          systemImage: "photo.badge.exclamationmark")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    referenceSection
+                }
 
                 Divider()
 
@@ -432,7 +503,11 @@ struct GenerationView: View {
 
                 // LoRA picker (collapsible)
                 DisclosureGroup(isExpanded: $showLoraPicker) {
-                    LoRAPicker(engine: engine, selectedLoras: $selectedLoras)
+                    LoRAPicker(
+                        engine: engine,
+                        selectedLoras: $selectedLoras,
+                        familyOverride: isLTX2Image ? "ltx" : nil
+                    )
                         .padding(.top, 4)
                     selectedLoraKeywordsRow
                 } label: {
@@ -450,14 +525,18 @@ struct GenerationView: View {
                     }
                 }
 
-                // Studio Packs (collapsible)
-                Divider()
-                DisclosureGroup(isExpanded: $showStudioPacks) {
-                    studioPacksSection
-                        .padding(.top, 4)
-                } label: {
-                    Label("Studio Packs", systemImage: "square.stack.3d.up")
-                        .font(.headline)
+                // Studio Pack recipes may carry image-model/LoRA/sampler
+                // settings that LTX deliberately refuses. Keep the surface
+                // available only on the engine it targets.
+                if !isLTX2Image {
+                    Divider()
+                    DisclosureGroup(isExpanded: $showStudioPacks) {
+                        studioPacksSection
+                            .padding(.top, 4)
+                    } label: {
+                        Label("Studio Packs", systemImage: "square.stack.3d.up")
+                            .font(.headline)
+                    }
                 }
 
                 // Camera / shot directives (collapsible)
@@ -613,6 +692,24 @@ struct GenerationView: View {
                     Text("Renders on \(backend.rawValue). LoRAs and the local model are ignored; steps map to the provider's schema.")
                         .font(.caption2).foregroundStyle(.tertiary)
                 }
+            } else {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Image engine")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Picker("Image engine", selection: imageEngineSelection) {
+                        ForEach(ImageGenerationEngine.allCases) { imageEngine in
+                            Text(imageEngine.label).tag(imageEngine)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    Text(isLTX2Image
+                         ? "Native one-frame LTX-2.3 generation. Uses shifted flow, Euler, image STG, and per-render LTX LoRAs."
+                         : "Uses the active warm image model and its full generation controls.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
     }
@@ -644,7 +741,9 @@ struct GenerationView: View {
                 .onChange(of: contentMode) { _, mode in
                     if let presetId = contentModeDefaultPresets[mode],
                        let preset = serverPresets.first(where: { $0.id == presetId }) {
-                        Task { await applyPreset(preset.toGenerationPreset()) }
+                        // A tier switch changes the recipe, not the subject.
+                        // Preserve the prompt and seed the user is comparing.
+                        Task { await applyPreset(preset.toGenerationPreset(), preserveContent: true) }
                         activePresetName = preset.name
                     }
                 }
@@ -774,6 +873,10 @@ struct GenerationView: View {
     private func consumePendingReference() {
         guard let path = pendingReferenceImage, !path.isEmpty else { return }
         pendingReferenceImage = nil
+        // "Use as Reference" is an img2img action. Native LTX image mode is
+        // intentionally T2I-only, so make the receiving surface usable rather
+        // than retaining an engine that cannot honour the handoff.
+        selectImageEngine(.active, applyRecommendedDefaults: false)
         setReference(path: path)
     }
 
@@ -858,50 +961,64 @@ struct GenerationView: View {
             NumericSliderField(label: "Steps", value: $steps, range: 1...50, step: 1)
 
             // Guidance
-            NumericSliderField(label: "Guidance", value: $guidance, range: 0...20, step: 0.5, fractionDigits: 1)
-
-            // Sampler = solver; Scheduler = sigma/noise schedule. Options are
-            // sourced from the engine's family capability matrix.
-            SamplingRecipePicker(
-                sampler: $sampler,
-                sigmaSchedule: $sigmaSchedule,
-                modelFamily: samplingModelFamily,
-                // The one automatic reset, on the user's OWN pick only. An
-                // `.onChange(of: sampler)` here fired for `applyPreset` too and
-                // judged the preset's sampler against the family still
-                // resident while its model loaded (~70 s) — a Z-Image preset
-                // with ddim + eta 0.6 applied over krea2 lost its eta. Also
-                // suppressed while an apply / model switch is in flight.
-                onUserChange: { newSampler in
-                    let outcome = SamplingGate.userSamplerChange(
-                        to: newSampler, modelFamily: samplingModelFamily,
-                        eta: eta, bongmath: bongmath, applyInFlight: isApplyingPreset)
-                    eta = outcome.eta
-                    bongmath = outcome.bongmath
-                }
+            NumericSliderField(
+                label: "Guidance",
+                value: $guidance,
+                range: isLTX2Image ? 1...20 : 0...20,
+                step: 0.5,
+                fractionDigits: 1
             )
-            .disabled(backend != .local)
 
-            // #419: shift + projector scale + the RES4LYF SDE / bongmath /
-            // noise knobs (the Clownshark recipe) — the SAME family-aware
-            // subview the preset editor shows, so the eta/bongmath gate
-            // exists once. A refused value is greyed with Clear beside it and
-            // `samplingValidationError` refuses the render locally; nothing is
-            // reset when the model changes underneath a loaded value.
-            SamplingAdvancedControls(
-                shift: shift,
-                projectorScale: $projectorScale,
-                eta: $eta,
-                bongmath: $bongmath,
-                noiseType: $noiseType,
-                noiseAlpha: $noiseAlpha,
-                implicitSteps: $implicitSteps,
-                c2: $c2,
-                sampler: sampler,
-                sigmaSchedule: sigmaSchedule,
-                modelFamily: samplingModelFamily,
-                isEnabled: backend == .local
-            )
+            if isLTX2Image {
+                LTX2ImageRecipePicker(
+                    sampler: $ltxImageSampler,
+                    sigmaSchedule: $ltxImageSigmaSchedule
+                )
+                .disabled(backend != .local)
+            } else {
+                // Sampler = solver; Scheduler = sigma/noise schedule. Options are
+                // sourced from the engine's family capability matrix.
+                SamplingRecipePicker(
+                    sampler: $sampler,
+                    sigmaSchedule: $sigmaSchedule,
+                    modelFamily: samplingModelFamily,
+                    // The one automatic reset, on the user's OWN pick only. An
+                    // `.onChange(of: sampler)` here fired for `applyPreset` too and
+                    // judged the preset's sampler against the family still
+                    // resident while its model loaded (~70 s) — a Z-Image preset
+                    // with ddim + eta 0.6 applied over krea2 lost its eta. Also
+                    // suppressed while an apply / model switch is in flight.
+                    onUserChange: { newSampler in
+                        let outcome = SamplingGate.userSamplerChange(
+                            to: newSampler, modelFamily: samplingModelFamily,
+                            eta: eta, bongmath: bongmath, applyInFlight: isApplyingPreset)
+                        eta = outcome.eta
+                        bongmath = outcome.bongmath
+                    }
+                )
+                .disabled(backend != .local)
+
+                // #419: shift + projector scale + the RES4LYF SDE / bongmath /
+                // noise knobs (the Clownshark recipe) — the SAME family-aware
+                // subview the preset editor shows, so the eta/bongmath gate
+                // exists once. A refused value is greyed with Clear beside it and
+                // `generationValidationError` refuses the render locally; nothing is
+                // reset when the model changes underneath a loaded value.
+                SamplingAdvancedControls(
+                    shift: shift,
+                    projectorScale: $projectorScale,
+                    eta: $eta,
+                    bongmath: $bongmath,
+                    noiseType: $noiseType,
+                    noiseAlpha: $noiseAlpha,
+                    implicitSteps: $implicitSteps,
+                    c2: $c2,
+                    sampler: sampler,
+                    sigmaSchedule: sigmaSchedule,
+                    modelFamily: samplingModelFamily,
+                    isEnabled: backend == .local
+                )
+            }
 
             // Seed field
             VStack(alignment: .leading, spacing: 4) {
@@ -952,20 +1069,22 @@ struct GenerationView: View {
                 }
             }
 
-            // DyPE high-resolution scaling
-            VStack(alignment: .leading, spacing: 4) {
-                Text("High-res scaling (DyPE)")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                Picker("", selection: $dype) {
-                    Text("Off").tag("none")
-                    Text("NTK (fast)").tag("ntk")
-                    Text("YaRN (quality)").tag("yarn")
+            if !isLTX2Image {
+                // DyPE high-resolution scaling
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("High-res scaling (DyPE)")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Picker("", selection: $dype) {
+                        Text("Off").tag("none")
+                        Text("NTK (fast)").tag("ntk")
+                        Text("YaRN (quality)").tag("yarn")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    Text("Dynamic Position Extrapolation renders natively above the model's base resolution. Use for large sizes.")
+                        .font(.caption2).foregroundStyle(.tertiary)
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                Text("Dynamic Position Extrapolation renders natively above the model's base resolution. Use for large sizes.")
-                    .font(.caption2).foregroundStyle(.tertiary)
             }
         }
     }
@@ -975,14 +1094,19 @@ struct GenerationView: View {
     /// to be silently dropped.
     private var configSummary: some View {
         VStack(alignment: .leading, spacing: 3) {
-            summaryRow("Model", (engine.currentModel as NSString?)?.lastPathComponent ?? "—")
+            summaryRow("Engine", selectedImageEngine.summaryLabel)
+            summaryRow("Model", isLTX2Image
+                ? "Configured LTX-2.3"
+                : (engine.currentModel as NSString?)?.lastPathComponent ?? "—")
             summaryRow("LoRAs", selectedLoras.isEmpty
                 ? "none"
                 : selectedLoras.map {
                     "\($0.filename.replacingOccurrences(of: ".safetensors", with: "")) @\(String(format: "%g", $0.scale))"
                   }.joined(separator: ", "))
-            summaryRow("Params", "\(Int(steps)) steps · g\(String(format: "%g", guidance)) · sampler \(sampler.isEmpty ? "default" : sampler) · scheduler \(sigmaSchedule.isEmpty ? "default" : sigmaSchedule)\(shift.wrappedValue.map { " · shift \(String(format: "%g", $0))" } ?? "")\(eta > 0 ? " · eta \(String(format: "%g", eta))" : "")\(bongmath ? " · bongmath" : "") · \(effectiveWidth)×\(effectiveHeight) · seed \(seedText.isEmpty ? "random" : seedText) · \(contentMode.rawValue)")
-            if let warning = samplingValidationError, backend == .local {
+            summaryRow("Params", isLTX2Image
+                ? "\(Int(steps)) steps · g\(String(format: "%g", guidance)) · \(ltxImageSampler) / \(ltxImageSigmaSchedule) · image STG · \(effectiveWidth)×\(effectiveHeight) · seed \(seedText.isEmpty ? "random" : seedText) · \(contentMode.rawValue)"
+                : "\(Int(steps)) steps · g\(String(format: "%g", guidance)) · sampler \(sampler.isEmpty ? "default" : sampler) · scheduler \(sigmaSchedule.isEmpty ? "default" : sigmaSchedule)\(shift.wrappedValue.map { " · shift \(String(format: "%g", $0))" } ?? "")\(eta > 0 ? " · eta \(String(format: "%g", eta))" : "")\(bongmath ? " · bongmath" : "") · \(effectiveWidth)×\(effectiveHeight) · seed \(seedText.isEmpty ? "random" : seedText) · \(contentMode.rawValue)")
+            if let warning = generationValidationError, backend == .local {
                 Text(warning).foregroundStyle(.orange)
             }
             if let warn = loraSwapWarning {
@@ -1029,7 +1153,9 @@ struct GenerationView: View {
                     } else {
                         Image(systemName: "wand.and.stars")
                         Text(backend == .local
-                             ? (batchCount > 1 ? "Generate \(batchCount)" : "Generate")
+                             ? (batchCount > 1
+                                ? "Generate \(batchCount) with \(selectedImageEngine.label)"
+                                : "Generate with \(selectedImageEngine.label)")
                              : "Generate on \(backend.rawValue)")
                     }
                 }
@@ -1100,7 +1226,7 @@ struct GenerationView: View {
         let hasPrompt = !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if backend == .local {
             return engine.connectionState.isConnected && !engine.isGenerating && !isApplyingPreset
-                && samplingValidationError == nil && hasPrompt
+                && generationValidationError == nil && hasPrompt
         }
         // Cloud backends don't need the local server, just a key.
         return !isCloudGenerating && hasPrompt && !cloudBackendKey.isEmpty
@@ -1110,7 +1236,7 @@ struct GenerationView: View {
     /// whole point of Add to Queue is stacking variants while one runs.
     private var canQueue: Bool {
         backend == .local && engine.connectionState.isConnected && !isApplyingPreset
-            && samplingValidationError == nil
+            && generationValidationError == nil
             && !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -1237,7 +1363,7 @@ struct GenerationView: View {
     }
 
     private func submitGeneration() {
-        if let error = samplingValidationError {
+        if let error = generationValidationError {
             engine.lastError = error
             return
         }
@@ -1249,6 +1375,7 @@ struct GenerationView: View {
         }
 
         let request = GenerationRequest(
+            engine: backend == .local ? selectedImageEngine : .active,
             prompt: prompt,
             negativePrompt: negativePrompt,
             width: effectiveWidth,
@@ -1263,14 +1390,14 @@ struct GenerationView: View {
             implicitSteps: Int(implicitSteps.rounded()),
             c2: Float(c2),
             shift: shift.wrappedValue.map { Float($0) },
-            sampler: sampler.isEmpty ? nil : sampler,
-            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
+            sampler: selectedSampler.isEmpty ? nil : selectedSampler,
+            sigmaSchedule: selectedSigmaSchedule.isEmpty ? nil : selectedSigmaSchedule,
             seed: seed,
-            modelId: engine.currentModel,
+            modelId: isLTX2Image ? nil : engine.currentModel,
             loras: selectedLoras,
-            initImagePath: referenceImagePath,
-            imageStrength: referenceImagePath != nil ? Float(imageStrength) : nil,
-            dype: dype == "none" ? nil : dype
+            initImagePath: isLTX2Image ? nil : referenceImagePath,
+            imageStrength: isLTX2Image || referenceImagePath == nil ? nil : Float(imageStrength),
+            dype: isLTX2Image || dype == "none" ? nil : dype
         )
 
         // Cloud backend: route to Replicate / Fal instead of the local server.
@@ -1291,7 +1418,7 @@ struct GenerationView: View {
     /// through the same server queue as Generate; still results land in the
     /// Gallery/Compare tab via onGenerated/onBatchComplete.
     private func queueVariant() {
-        if let error = samplingValidationError {
+        if let error = generationValidationError {
             engine.lastError = error
             return
         }
@@ -1303,6 +1430,7 @@ struct GenerationView: View {
         }
 
         let request = GenerationRequest(
+            engine: selectedImageEngine,
             prompt: prompt,
             negativePrompt: negativePrompt,
             width: effectiveWidth,
@@ -1317,14 +1445,14 @@ struct GenerationView: View {
             implicitSteps: Int(implicitSteps.rounded()),
             c2: Float(c2),
             shift: shift.wrappedValue.map { Float($0) },
-            sampler: sampler.isEmpty ? nil : sampler,
-            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
+            sampler: selectedSampler.isEmpty ? nil : selectedSampler,
+            sigmaSchedule: selectedSigmaSchedule.isEmpty ? nil : selectedSigmaSchedule,
             seed: seed,
-            modelId: engine.currentModel,
+            modelId: isLTX2Image ? nil : engine.currentModel,
             loras: selectedLoras,
-            initImagePath: referenceImagePath,
-            imageStrength: referenceImagePath != nil ? Float(imageStrength) : nil,
-            dype: dype == "none" ? nil : dype
+            initImagePath: isLTX2Image ? nil : referenceImagePath,
+            imageStrength: isLTX2Image || referenceImagePath == nil ? nil : Float(imageStrength),
+            dype: isLTX2Image || dype == "none" ? nil : dype
         )
 
         guard backend == .local else { return }  // cloud queueing isn't wired — local server queue only.
@@ -1346,33 +1474,40 @@ struct GenerationView: View {
         // but skipped here rather than attempted and failing the whole
         // swap — only what's actually compatible with the active model
         // goes to the server.
-        let activeModel = engine.currentModelFamily ?? engine.currentModel
-        let (compatibleLoras, skippedLoras) = request.loras.reduce(into: ([LoRASelection](), [LoRASelection]())) { acc, sel in
-            let lora = engine.availableLoras.first { $0.id == sel.id }
-            let compat = lora?.modelCompatibility ?? ""
-            if case .incompatible = LoRACompatibility.status(loraCompatibility: compat, modelIdentifier: activeModel) {
-                acc.1.append(sel)
-            } else {
-                acc.0.append(sel)
+        if request.engine == .ltx2 {
+            // LTX adapters belong to this render request. Sending them through
+            // `/v1/lora/swap` would mutate the active Krea/Z-Image model and
+            // violate the server's separate LTX admission path.
+            await MainActor.run { loraSwapWarning = nil }
+        } else {
+            let activeModel = engine.currentModelFamily ?? engine.currentModel
+            let (compatibleLoras, skippedLoras) = request.loras.reduce(into: ([LoRASelection](), [LoRASelection]())) { acc, sel in
+                let lora = engine.availableLoras.first { $0.id == sel.id }
+                let compat = lora?.modelCompatibility ?? ""
+                if case .incompatible = LoRACompatibility.status(loraCompatibility: compat, modelIdentifier: activeModel) {
+                    acc.1.append(sel)
+                } else {
+                    acc.0.append(sel)
+                }
             }
-        }
 
-        if !compatibleLoras.isEmpty {
-            do {
-                try await engine.swapLoras(compatibleLoras)
+            if !compatibleLoras.isEmpty {
+                do {
+                    try await engine.swapLoras(compatibleLoras)
+                    await MainActor.run {
+                        loraSwapWarning = skippedLoras.isEmpty ? nil
+                            : "Skipped \(skippedLoras.count) LoRA(s) not compatible with the active model: \(skippedLoras.map { $0.filename }.joined(separator: ", "))"
+                    }
+                } catch {
+                    await MainActor.run {
+                        loraSwapWarning = "⚠ LoRA load failed — rendering without them: \(error.localizedDescription)"
+                    }
+                }
+            } else {
                 await MainActor.run {
                     loraSwapWarning = skippedLoras.isEmpty ? nil
                         : "Skipped \(skippedLoras.count) LoRA(s) not compatible with the active model: \(skippedLoras.map { $0.filename }.joined(separator: ", "))"
                 }
-            } catch {
-                await MainActor.run {
-                    loraSwapWarning = "⚠ LoRA load failed — rendering without them: \(error.localizedDescription)"
-                }
-            }
-        } else {
-            await MainActor.run {
-                loraSwapWarning = skippedLoras.isEmpty ? nil
-                    : "Skipped \(skippedLoras.count) LoRA(s) not compatible with the active model: \(skippedLoras.map { $0.filename }.joined(separator: ", "))"
             }
         }
 
@@ -1513,6 +1648,41 @@ struct GenerationView: View {
         engine.lastError = nil
     }
 
+    /// Switch the local image path. A first switch from the untouched active-
+    /// model defaults gets LTX's published image recipe; a customized form is
+    /// never overwritten. The inverse rule restores the familiar defaults
+    /// when the form still exactly matches LTX's defaults.
+    private func selectImageEngine(
+        _ newEngine: ImageGenerationEngine,
+        applyRecommendedDefaults: Bool
+    ) {
+        let oldEngine = selectedImageEngine
+        if newEngine == .ltx2 { backend = .local }
+        guard newEngine != oldEngine else { return }
+
+        let hasActiveDefaults = selectedResolution.id == "1024sq"
+            && Int(steps) == 9 && guidance == 3.5
+        let hasLTXDefaults = selectedResolution.id == "1280x704"
+            && Int(steps) == 8 && guidance == 1.0
+
+        imageEngineRaw = newEngine.rawValue
+        loraSwapWarning = nil
+        engine.lastError = nil
+
+        guard applyRecommendedDefaults else { return }
+        if newEngine == .ltx2, hasActiveDefaults,
+           let ltxResolution = ResolutionPreset.presets.first(where: { $0.id == "1280x704" }) {
+            selectedResolution = ltxResolution
+            steps = 8
+            guidance = 1.0
+        } else if newEngine == .active, hasLTXDefaults,
+                  let activeResolution = ResolutionPreset.presets.first(where: { $0.id == "1024sq" }) {
+            selectedResolution = activeResolution
+            steps = 9
+            guidance = 3.5
+        }
+    }
+
     /// Consume a preset queued by the Presets tab, if any.
     private func consumePendingPreset() {
         guard let preset = pendingPreset else { return }
@@ -1549,6 +1719,7 @@ struct GenerationView: View {
         // explicit fields below still override anything it sets. Awaited so
         // a queued `generate` below never races the pack's model switch.
         if let packId = action.studioPackId, let pack = studioPacks.first(where: { $0.id == packId }) {
+            selectImageEngine(.active, applyRecommendedDefaults: false)
             if let templateId = action.templateId, let template = pack.templates.first(where: { $0.id == templateId }) {
                 await applyStudioPackTemplate(pack, template: template)
             } else {
@@ -1635,7 +1806,7 @@ struct GenerationView: View {
         // silently overwrite whatever the user has set up.
         if !didApplyLaunchDefault {
             didApplyLaunchDefault = true
-            if activePresetName == nil,
+            if activePresetName == nil, selectedImageEngine == .active,
                let def = serverPresets.first(where: {
                    $0.name.caseInsensitiveCompare(Self.defaultPresetName) == .orderedSame
                }) {
@@ -1841,6 +2012,8 @@ struct GenerationView: View {
     /// Presets tab's Apply, both of which should load the preset's own
     /// prompt/seed).
     func applyPreset(_ preset: GenerationPreset, preserveContent: Bool = false) async {
+        let presetEngine = ImageGenerationEngine(serverValue: preset.engine)
+        selectImageEngine(presetEngine, applyRecommendedDefaults: false)
         if !preserveContent {
             prompt = preset.promptTemplate
             // Restore a saved seed (nil/0 = random).
@@ -1854,8 +2027,16 @@ struct GenerationView: View {
         noiseAlpha = Double(preset.noiseAlpha ?? 0)
         implicitSteps = Double(preset.implicitSteps ?? 0)
         c2 = Double(preset.c2 ?? 0.5)
-        sampler = preset.sampler ?? ""
-        sigmaSchedule = preset.sigmaSchedule ?? ""
+        if presetEngine == .ltx2 {
+            ltxImageSampler = preset.sampler ?? LTX2ImageRecipe.defaultSampler
+            ltxImageSigmaSchedule = preset.sigmaSchedule ?? LTX2ImageRecipe.defaultSigmaSchedule
+        } else {
+            sampler = preset.sampler ?? ""
+            sigmaSchedule = preset.sigmaSchedule ?? ""
+        }
+        if let rawMode = preset.contentMode, let mode = ContentMode(rawValue: rawMode) {
+            contentMode = mode
+        }
         // #419: eta / bongmath / shift used to be dropped here, so applying
         // a Clownshark preset (res_2s + eta 0.5, shift 1.15) rendered the
         // default ODE at the default shift. Absent = model default.
@@ -1906,7 +2087,7 @@ struct GenerationView: View {
         // never the server's full path/spec, so resolve before comparing —
         // a raw string mismatch here used to trigger a doomed activate call
         // on nearly every image sent back to Generate.
-        if let modelId = preset.modelId {
+        if presetEngine == .active, let modelId = preset.modelId {
             switch ModelReferenceResolver.resolve(
                 modelId, currentModel: engine.currentModel,
                 availableModels: engine.availableModels.map { ($0.id, $0.displayName) }

@@ -52,6 +52,10 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
   /// Physical model file basename (no directory, no extension) — mirrors
   /// `ImageMetadata.generation`'s `model` field.
   public let model: String
+  /// Native engine that produced the media. Optional for records written by
+  /// older builds; LTX records now declare `ltx2` so still-image recipe
+  /// handoff can restore the correct Generate-tab engine.
+  public let engine: String?
 
   /// Requested budget, not necessarily what was encoded — see `resolvedWidth`/
   /// `resolvedHeight`.
@@ -93,7 +97,7 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
   public let nagTau: Float?
   public let nagApplied: Bool?
   public let audioRefine: Bool?
-  /// `"t2v" | "i2v" | "extend" | "storyboard"` — how this clip was produced.
+  /// `"t2i" | "t2v" | "i2v" | "extend" | "storyboard"` — how this media was produced.
   /// `"extend"` is an i2v render whose request asked for more than one chunk
   /// (`extendToSeconds > 0`); a plain i2v single chunk stays `"i2v"`.
   public let kind: String
@@ -125,7 +129,7 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     prompt: String, negativePrompt: String? = nil, seed: UInt64? = nil, steps: Int? = nil,
     requestedSteps: Int? = nil,
     guidance: Float? = nil,
-    model: String, width: Int, height: Int, frames: Int, fps: Int,
+    model: String, engine: String? = nil, width: Int, height: Int, frames: Int, fps: Int,
     resolvedWidth: Int, resolvedHeight: Int, dimensionReason: String? = nil,
     twoPass: Bool, refine: Bool, refineSkippedReason: String? = nil, audio: Bool,
     sampler: String? = nil, stage1Sigmas: [Float]? = nil, refineSigmas: [Float]? = nil,
@@ -141,6 +145,7 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     self.requestedSteps = requestedSteps
     self.guidance = guidance
     self.model = model
+    self.engine = engine
     self.width = width
     self.height = height
     self.frames = frames
@@ -178,7 +183,14 @@ extension VideoGenerationRecord {
   }
 
   /// Classify what kind of render produced this clip, from the request alone.
-  public static func kind(initImagePath: String?, extendToSeconds: Float) -> String {
+  public static func kind(
+    initImagePath: String?, extendToSeconds: Float, frameCount: Int? = nil,
+    outputPath: String? = nil
+  ) -> String {
+    if frameCount == 1, initImagePath == nil,
+       outputPath.map({ URL(fileURLWithPath: $0).pathExtension.lowercased() == "png" }) == true {
+      return "t2i"
+    }
     guard initImagePath != nil else { return "t2v" }
     return extendToSeconds > 0 ? "extend" : "i2v"
   }
@@ -232,6 +244,7 @@ extension VideoGenerationRecord {
       requestedSteps: request.steps,
       guidance: request.guidance ?? configGuidance,
       model: basename(transformerFile),
+      engine: "ltx2",
       width: request.width,
       height: request.height,
       frames: frameCount,
@@ -251,7 +264,11 @@ extension VideoGenerationRecord {
       nagTau: nagConfig?.tau,
       nagApplied: nagApplied,
       audioRefine: audioRefine,
-      kind: kind(initImagePath: request.initImagePath, extendToSeconds: request.extendToSeconds),
+      kind: kind(
+        initImagePath: request.initImagePath,
+        extendToSeconds: request.extendToSeconds,
+        frameCount: frameCount,
+        outputPath: request.outputPath),
       source: request.source,
       contentMode: request.contentMode,
       loras: request.effectiveLoRAs.map { LoRAEntry(name: basename($0.path), scale: $0.scale) }
@@ -295,7 +312,7 @@ extension VideoGenerationRecord {
     guard let full = try? encodeJSON() else { return nil }
     guard full.count > Self.atomSizeCap else { return full }
     let clipped = VideoGenerationRecord(
-      prompt: String(prompt.prefix(200)), seed: seed, steps: steps, model: model,
+      prompt: String(prompt.prefix(200)), seed: seed, steps: steps, model: model, engine: engine,
       width: width, height: height, frames: frames, fps: fps,
       resolvedWidth: resolvedWidth, resolvedHeight: resolvedHeight,
       twoPass: twoPass, refine: refine, audio: audio, kind: kind, truncated: true)

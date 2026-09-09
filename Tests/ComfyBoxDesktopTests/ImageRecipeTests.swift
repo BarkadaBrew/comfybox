@@ -42,4 +42,31 @@ final class ImageRecipeTests: XCTestCase {
         XCTAssertTrue(r.preset.loras.isEmpty)
         XCTAssertNil(r.contentMode)
     }
+
+    func testLTXMetadataRestoresNativeEngineWithoutTreatingTransformerAsPoolModel() throws {
+        let r = try XCTUnwrap(ImageRecipe.from(params: [
+            "prompt": "a landscape",
+            "engine": "ltx2",
+            "kind": "t2i",
+            "model": "LTX-2.3",
+            "width": 1280,
+            "height": 704,
+            "steps": 8,
+            "guidance": 1,
+        ]))
+        XCTAssertEqual(r.preset.engine, "ltx2")
+        XCTAssertNil(r.preset.modelId)
+        XCTAssertEqual(r.preset.width, 1280)
+        XCTAssertEqual(r.preset.height, 704)
+    }
+
+    func testGenericT2IKindDoesNotSelectLTXWithoutEngineOrLTXModel() throws {
+        let r = try XCTUnwrap(ImageRecipe.from(params: [
+            "prompt": "a landscape",
+            "kind": "t2i",
+            "model": "krea-2-turbo",
+        ]))
+        XCTAssertNil(r.preset.engine)
+        XCTAssertEqual(r.preset.modelId, "krea-2-turbo")
+    }
 }

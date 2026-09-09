@@ -64,7 +64,7 @@ struct ServerPresetTests {
         // in `loras[]` maps like any other, with no separate `kroma` field
         // on `GenerationPreset` (removed, review r2 M: dead state).
         let p = ServerPreset(
-            id: "x", name: "X", model: "z-image-turbo",
+            id: "x", name: "X", engine: "ltx2", model: "z-image-turbo",
             prompt: "a test", steps: 12, guidance: 4.0,
             width: 1280, height: 1280,
             loras: [
@@ -75,6 +75,7 @@ struct ServerPresetTests {
         )
         let g = p.toGenerationPreset()
         #expect(g.promptTemplate == "a test")
+        #expect(g.engine == "ltx2")
         #expect(g.modelId == "z-image-turbo")
         #expect(g.steps == 12)
         #expect(g.width == 1280)
@@ -306,6 +307,23 @@ struct ServerPresetTests {
         #expect(bare.shift == nil)
         #expect(bare.eta == nil)
         #expect(bare.bongmath == nil)
+    }
+
+    @Test("LTX preset carries its engine, fruit tier, and image recipe across mirrors")
+    func ltxPresetCarriesTierAndRecipe() throws {
+        let preset = ServerPreset(
+            id: "ltx-image-apple", name: "LTX Image — Apple",
+            mediaKind: "image", provider: "local", engine: "ltx2",
+            contentMode: "apple", steps: 8, guidance: 1, width: 1280, height: 704,
+            sampler: "euler_cfg_pp", sigmaSchedule: "flow")
+        let data = try JSONEncoder().encode(preset)
+        let decoded = try JSONDecoder().decode(ServerPreset.self, from: data)
+
+        #expect(decoded.contentMode == "apple")
+        #expect(decoded.toGenerationPreset().contentMode == "apple")
+        #expect(decoded.toGenerationPreset().sampler == "euler_cfg_pp")
+        #expect(decoded.toImagePreset().contentMode == "apple")
+        #expect(decoded.toImagePreset().engine == "ltx2")
     }
 
     /// The panel's `ImagePreset` must see the declared look too (it was

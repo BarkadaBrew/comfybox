@@ -210,6 +210,51 @@ struct EngineServiceAsyncGenerateTests {
         #expect(active["c2"] as? Float == 0.66)
     }
 
+    @Test("LTX payload selects the engine, sends LoRAs per request, and drops retained image-model controls")
+    func ltxPayloadUsesNativePerRequestRecipe() throws {
+        let request = GenerationRequest(
+            engine: .ltx2,
+            prompt: "portrait",
+            width: 1280,
+            height: 704,
+            steps: 8,
+            guidance: 1,
+            projectorScale: 1.4,
+            eta: 0.5,
+            bongmath: true,
+            shift: 1.15,
+            sampler: "euler_ancestral_cfg_pp",
+            sigmaSchedule: "flow",
+            loras: [LoRASelection(
+                id: "motion", filename: "motion.safetensors", scale: 0.8)],
+            initImagePath: "/tmp/reference.png",
+            imageStrength: 0.7,
+            dype: "yarn")
+
+        let body = EngineService.generatePayload(
+            request, outputPath: "/tmp/ltx.png", contentMode: .neutral)
+        #expect(body["engine"] as? String == "ltx2")
+        let loras = try #require(body["loras"] as? [[String: Any]])
+        #expect(loras.count == 1)
+        #expect(loras[0]["path"] as? String == "motion.safetensors")
+        #expect(loras[0]["scale"] as? Float == 0.8)
+        #expect(body["imagePath"] == nil)
+        #expect(body["imageStrength"] == nil)
+        #expect(body["dype"] == nil)
+        #expect(body["projector_scale"] == nil)
+        #expect(body["eta"] == nil)
+        #expect(body["bongmath"] == nil)
+        #expect(body["shift"] == nil)
+        #expect(body["sampler"] as? String == "euler_ancestral_cfg_pp")
+        #expect(body["sigma_schedule"] as? String == "flow")
+
+        let noAdapters = EngineService.generatePayload(
+            GenerationRequest(engine: .ltx2, prompt: "clean base render"),
+            outputPath: "/tmp/ltx-base.png", contentMode: .neutral)
+        let emptyStack = try #require(noAdapters["loras"] as? [[String: Any]])
+        #expect(emptyStack.isEmpty)
+    }
+
     /// #419: `shift` rides the Generate path only when an applied preset (or
     /// the panel) set one — absent stays absent, byte-identical to before,
     /// and the wire key is the engine's single word.

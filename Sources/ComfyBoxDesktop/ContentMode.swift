@@ -6,6 +6,7 @@ import Foundation
 
 public enum ContentMode: String, CaseIterable, Identifiable, Sendable {
     case neutral
+    case apple
     case banana
     case avocado
 
@@ -14,7 +15,8 @@ public enum ContentMode: String, CaseIterable, Identifiable, Sendable {
     /// Emoji + name for the segmented control.
     public var label: String {
         switch self {
-        case .neutral: return "🍎 Neutral"
+        case .neutral: return "⚪ Neutral"
+        case .apple:   return "🍎 Apple"
         case .banana:  return "🍌 Banana"
         case .avocado: return "🥑 Avocado"
         }

@@ -25,12 +25,22 @@ public struct ImageRecipe {
             return PresetLoRA(id: name, filename: filename, scale: scale, role: role)
         }
 
+        // `kind: t2i` is generic and may be written by other image engines.
+        // Only an explicit engine marker or the legacy LTX transformer model
+        // name is sufficient to route a Gallery handoff to native LTX.
+        let isLTXStill = (params["model"] as? String)?.lowercased().hasPrefix("ltx-2") == true
+        let imageEngine = ImageGenerationEngine(serverValue:
+            params["engine"] as? String ?? (isLTXStill ? "ltx2" : nil))
         let preset = GenerationPreset(
             id: "from-image",
             name: "From image",
+            engine: imageEngine == .ltx2 ? imageEngine.rawValue : nil,
             promptTemplate: prompt,
             negativePrompt: params["negative_prompt"] as? String,
-            modelId: params["model"] as? String,
+            // An LTX record's `model` is the physical transformer filename,
+            // not an image-model pool id. Restoring it as `modelId` would ask
+            // the Generate tab to load it through the wrong model path.
+            modelId: imageEngine == .ltx2 ? nil : params["model"] as? String,
             loras: loras,
             steps: (params["steps"] as? NSNumber)?.intValue ?? 9,
             guidance: (params["guidance"] as? NSNumber)?.floatValue ?? 3.5,

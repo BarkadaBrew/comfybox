@@ -1971,7 +1971,10 @@ public final class LTX2Pipeline {
           // blend by phi — keeps the action-motion boost, restores seed color.
           // resolvedConfig.guidanceRescale (0 = off) — request/preset capable.
           let phi = resolvedConfig.guidanceRescale
-          if phi > 0 {
+          // A one-frame image applies guidance rescale after CFG *and* STG
+          // have been composed (the LTX image reference's post-CFG hook).
+          // Preserve the established video ordering here.
+          if phi > 0 && f > 1 {
             let stdCond = MLX.sqrt(((x0CondF32 - x0CondF32.mean()) * (x0CondF32 - x0CondF32.mean())).mean())
             let stdGuided = MLX.sqrt(((x0GuidedF32 - x0GuidedF32.mean()) * (x0GuidedF32 - x0GuidedF32.mean())).mean())
             let rescaled = x0GuidedF32 * (stdCond / (stdGuided + 1e-6))
@@ -1985,7 +1988,11 @@ public final class LTX2Pipeline {
       // For distilled cfg=1 this is the primary guidance lever (anti-haze).
       let stgBase = resolvedConfig.stgScale
       if stgBase > 0 {
-        let stgScale = LTX2PipelineConfig.stgScaleForStep(i, base: stgBase)
+        // The native image recipe uses a flat STG scale (0.8 by default).
+        // The boosted first-two-step ramp is a video motion recipe.
+        let stgScale = f == 1
+          ? stgBase
+          : LTX2PipelineConfig.stgScaleForStep(i, base: stgBase)
         let velocitySTG = transformer(
           latent: latentsFlat,
           timestep: timesteps,
@@ -1998,6 +2005,20 @@ public final class LTX2Pipeline {
         eval(velocitySTG)
         let x0STGF32 = latentsFlatF32 - timestepsF32 * velocitySTG.asType(.float32)
         x0GuidedF32 = x0GuidedF32 + MLXArray(stgScale) * (x0CondF32 - x0STGF32)
+      }
+
+      // Diffusers/ComfyUI-style guidance rescale is a post-guidance operation
+      // for LTX images, so it covers both CFG and STG. This is intentionally
+      // image-only; video keeps its validated CFG-before-STG behavior above.
+      if f == 1, resolvedConfig.guidanceRescale > 0,
+         stgBase > 0 || (useCFG && cfgAt(i) > 1.0) {
+        let phi = resolvedConfig.guidanceRescale
+        let condMean = x0CondF32.mean()
+        let guidedMean = x0GuidedF32.mean()
+        let stdCond = MLX.sqrt(((x0CondF32 - condMean) * (x0CondF32 - condMean)).mean())
+        let stdGuided = MLX.sqrt(((x0GuidedF32 - guidedMean) * (x0GuidedF32 - guidedMean)).mean())
+        let rescaled = x0GuidedF32 * (stdCond / (stdGuided + 1e-6))
+        x0GuidedF32 = MLXArray(phi) * rescaled + MLXArray(1 - phi) * x0GuidedF32
       }
 
       // Reshape x0 from token space to spatial
@@ -2606,7 +2627,10 @@ public final class LTX2Pipeline {
     // decouples this from the OUTPUT/playback fps (config.fps) so we can drive
     // motion from a sharp seed without making the mp4 choppy. Default: match
     // playback fps (temporally-correct). See QA-CAMPAIGN-2026-07-26 motion sweep.
-    let fps = resolvedConfig.condFps ?? Float(config.fps)
+    // A still is one frame, not a 1/24-second clip. The native image wrapper
+    // normalizes its frame-rate conditioning to 1; doing the same here keeps
+    // the single temporal coordinate in the image training convention.
+    let fps = latF == 1 ? Float(1) : (resolvedConfig.condFps ?? Float(config.fps))
     let totalF = latF + refFrames
     let numPatches = totalF * latH * latW
 
