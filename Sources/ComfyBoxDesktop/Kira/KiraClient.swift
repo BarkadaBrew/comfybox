@@ -249,7 +249,10 @@ public struct KiraTierConfig: Equatable, Sendable {
             imageCount: (dict["imageCount"] as? NSNumber)?.intValue ?? 2,
             unlimitedImages: dict["unlimitedImages"] as? Bool ?? false,
             videoCount: (dict["videoCount"] as? NSNumber)?.intValue ?? 1,
-            imagePresetId: dict["imagePresetId"] as? String,
+            imagePresetId: (dict["imagePresetId"] as? String).flatMap {
+                let value = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                return value.isEmpty ? nil : value
+            },
             enabled: (dict["enabled"] as? Bool) ?? true)
     }
 
@@ -266,8 +269,9 @@ public struct KiraTierConfig: Equatable, Sendable {
         out["unlimitedImages"] = unlimitedImages
         if !isNeutral { out["videoCount"] = videoCount }
         if !enabled { out["enabled"] = false }   // absent = on (server contract)
-        if let imagePresetId = imagePresetId, !imagePresetId.isEmpty {
-            out["imagePresetId"] = imagePresetId
+        if let imagePresetId {
+            let value = imagePresetId.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !value.isEmpty { out["imagePresetId"] = value }
         }
         return out
     }

@@ -83,6 +83,10 @@ struct KiraView: View {
             portDraft = String(client.binding.port)
             client.startPolling()
         }
+        .task(id: engine.connectionState.isConnected) {
+            guard engine.connectionState.isConnected else { return }
+            await loadPresetChoices()
+        }
         .onDisappear {
             client.stopPolling()
         }
@@ -702,20 +706,14 @@ struct KiraView: View {
         overrideLoras = scheduler.videoLoras.map {
             LoRASelection(id: $0.name, filename: $0.name, scale: Float($0.scale))
         }
-        if imagePresetChoices.isEmpty {
-            Task {
-                let presets = await engine.fetchPresets()
-                // mediaKind is unset on every existing preset, so the id is
-                // the working signal: "video" ids are the LTX presets
-                // (kira-video-*), everything else is an image preset.
-                imagePresetChoices = presets
-                    .filter { !$0.id.contains("video") && ($0.mediaKind ?? "image") == "image" }
-                    .sorted { $0.id < $1.id }
-                videoPresets = presets
-                    .filter { $0.id.contains("video") || $0.mediaKind == "video" }
-                    .sorted { $0.id < $1.id }
-            }
-        }
+    }
+
+    /// The tier pickers live outside the collapsed run-overrides disclosure,
+    /// so their inventory must follow the Kira view's own lifecycle too.
+    private func loadPresetChoices() async {
+        let choices = KiraPresetCatalog.choices(from: await engine.fetchPresets())
+        imagePresetChoices = choices.images
+        videoPresets = choices.videos
     }
 
     private func applyVideoLoras() {
@@ -829,7 +827,9 @@ struct KiraView: View {
                         get: { scheduler.imagePreset ?? "" },
                         set: { v in Task { await client.updateSchedulerPolicy(["imagePreset": v.isEmpty ? NSNull() : v]) } })) {
                         Text("Implicit render set").tag("")
-                        ForEach(imagePresetChoices) { preset in Text(preset.name).tag(preset.id) }
+                        ForEach(imagePresetChoices) { preset in
+                            Text(KiraPresetCatalog.displayLabel(for: preset)).tag(preset.id)
+                        }
                     }
                     .labelsHidden().frame(maxWidth: 240)
                     .disabled(client.actionInFlight)
@@ -902,8 +902,10 @@ struct KiraView: View {
             .toggleStyle(.checkbox)
             .disabled(client.actionInFlight)
 
+            Text("preset").font(.caption2).foregroundStyle(.tertiary)
+            tierPresetPicker(mode)
+
             if let tier = scheduler.tiers[mode] {
-                tierPresetPicker(mode)
                 Toggle("window", isOn: Binding(
                     get: { tier.activeHoursStart != nil },
                     set: { on in
@@ -966,15 +968,16 @@ struct KiraView: View {
         return Picker("", selection: tierPresetBinding(mode)) {
             Text("Default").tag("")
             ForEach(imagePresetChoices) { preset in
-                Text(preset.name).tag(preset.id)
+                Text(KiraPresetCatalog.displayLabel(for: preset)).tag(preset.id)
             }
             if savedUnavailable {
                 Text("Unavailable: \(savedId)").tag(savedId)
             }
         }
         .labelsHidden()
-        .frame(width: 140)
+        .frame(width: 190)
         .disabled(client.actionInFlight)
+        .accessibilityLabel("Image preset for \(mode)")
         .help("Image preset used for this tier's scheduled stills and i2v seed frames.")
     }
 
@@ -983,9 +986,17 @@ struct KiraView: View {
             get: { client.scheduler?.tiers[mode]?.imagePresetId ?? "" },
             set: { v in
                 putTiers { tiers in
-                    guard var tier = tiers[mode] else { return }
-                    tier.imagePresetId = v.isEmpty ? nil : v
-                    tiers[mode] = tier
+                    if var tier = tiers[mode] {
+                        tier.imagePresetId = v.isEmpty ? nil : v
+                        tiers[mode] = tier
+                    } else if !v.isEmpty {
+                        tiers[mode] = KiraTierConfig(
+                            activeHoursStart: nil, activeHoursEnd: nil,
+                            imageCount: 2, unlimitedImages: false,
+                            videoCount: mode == "neutral" ? 0 : 1,
+                            imagePresetId: v.isEmpty ? nil : v,
+                            enabled: false)
+                    }
                 }
             })
     }

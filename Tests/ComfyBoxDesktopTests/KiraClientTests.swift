@@ -76,6 +76,47 @@ final class KiraClientTests: XCTestCase {
     XCTAssertNil(KiraSchedulerStatus.parse(Data(#"{"ok":true}"#.utf8)), "no paused field → nil")
   }
 
+  func testSchedulerTierImagePresetRoundTripsWithoutBeingDropped() throws {
+    let payload = #"{"ok":true,"paused":false,"config":{"enabled":true,"tiers":{"avocado":{"activeHours":null,"imageCount":0,"unlimitedImages":true,"videoCount":0,"imagePresetId":"ltx-image-avocado"}}}}"#
+    let status = try XCTUnwrap(KiraSchedulerStatus.parse(Data(payload.utf8)))
+    let tier = try XCTUnwrap(status.tiers["avocado"])
+
+    XCTAssertEqual(tier.imagePresetId, "ltx-image-avocado")
+    XCTAssertEqual(tier.payload(isNeutral: false)["imagePresetId"] as? String, "ltx-image-avocado")
+  }
+
+  func testSchedulerTierBlankImagePresetIsNormalizedAndOmitted() {
+    let tier = KiraTierConfig.parse([
+      "activeHours": NSNull(), "imageCount": 2,
+      "unlimitedImages": false, "videoCount": 0,
+      "imagePresetId": "   ",
+    ])
+
+    XCTAssertNil(tier.imagePresetId)
+    XCTAssertNil(tier.payload(isNeutral: false)["imagePresetId"])
+  }
+
+  func testKiraPresetCatalogOffersOnlyValidPresetsInTheCorrectMenu() {
+    let image = ServerPreset(id: "ltx-image-avocado", name: "LTX Image — Avocado", mediaKind: "image")
+    let legacyImage = ServerPreset(id: "legacy-still", name: "Legacy still")
+    let video = ServerPreset(id: "kira-video-t2v", name: "Kira video", mediaKind: "video")
+    let explicitImage = ServerPreset(id: "video-cover-image", name: "Video cover", mediaKind: "image")
+    let legacyVideo = ServerPreset(id: "KIRA-VIDEO-I2V", name: "Legacy video")
+    var invalid = ServerPreset(id: "broken-image", name: "Broken", mediaKind: "image")
+    invalid.invalid = true
+
+    let choices = KiraPresetCatalog.choices(
+      from: [video, invalid, legacyImage, explicitImage, legacyVideo, image])
+
+    XCTAssertEqual(
+      choices.images.map(\.id),
+      ["legacy-still", "ltx-image-avocado", "video-cover-image"])
+    XCTAssertEqual(choices.videos.map(\.id), ["kira-video-t2v", "KIRA-VIDEO-I2V"])
+    XCTAssertEqual(
+      KiraPresetCatalog.displayLabel(for: image),
+      "LTX Image — Avocado · ltx-image-avocado")
+  }
+
   func testSuggestionParses() throws {
     let item: [String: Any] = [
       "id": "989dd184171c", "kind": "image",
