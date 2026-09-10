@@ -989,7 +989,7 @@ struct KiraView: View {
                     if var tier = tiers[mode] {
                         tier.imagePresetId = v.isEmpty ? nil : v
                         tiers[mode] = tier
-                    } else {
+                    } else if !v.isEmpty {
                         tiers[mode] = KiraTierConfig(
                             activeHoursStart: nil, activeHoursEnd: nil,
                             imageCount: 2, unlimitedImages: false,

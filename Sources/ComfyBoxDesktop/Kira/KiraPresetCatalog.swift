@@ -16,9 +16,9 @@ enum KiraPresetCatalog {
         return Choices(
             images: valid
                 .filter { preset in
-                    preset.mediaKind != "video"
-                        && (preset.mediaKind == nil || preset.mediaKind == "image")
-                        && !preset.id.localizedCaseInsensitiveContains("video")
+                    preset.mediaKind == "image"
+                        || (preset.mediaKind == nil
+                            && !preset.id.localizedCaseInsensitiveContains("video"))
                 }
                 .sorted(by: displayOrder),
             videos: valid
