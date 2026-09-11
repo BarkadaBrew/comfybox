@@ -163,3 +163,28 @@ final class WarmServerBeatScheduleEnhancementTests: XCTestCase {
     XCTAssertNil(outcome.enhancementSkippedReason)
   }
 }
+
+final class WarmServerI2VBeatSchedulePolicyTests: XCTestCase {
+  private let beats = [BeatSegment(text: "she steps closer", startFrac: 0, endFrac: 1)]
+
+  func testSinglePassI2VKeepsBeatSchedule() {
+    let result = WarmServer.resolveVideoBeatSchedule(
+      requested: beats, isT2V: false, totalChunks: 1)
+    XCTAssertEqual(result.effective, beats)
+    XCTAssertNil(result.ignoredReason)
+  }
+
+  func testChunkedI2VRejectsBeatScheduleHonestly() {
+    let result = WarmServer.resolveVideoBeatSchedule(
+      requested: beats, isT2V: false, totalChunks: 2)
+    XCTAssertNil(result.effective)
+    XCTAssertEqual(result.ignoredReason, "multi_chunk_unsupported")
+  }
+
+  func testT2VKeepsBeatSchedule() {
+    let result = WarmServer.resolveVideoBeatSchedule(
+      requested: beats, isT2V: true, totalChunks: 1)
+    XCTAssertEqual(result.effective, beats)
+    XCTAssertNil(result.ignoredReason)
+  }
+}

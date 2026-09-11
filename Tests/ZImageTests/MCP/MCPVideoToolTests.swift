@@ -104,8 +104,10 @@ final class MCPVideoToolTests: XCTestCase {
     XCTAssertNotNil(beatSchedule, "generate_video must expose beat_schedule")
     XCTAssertEqual(beatSchedule?["type"] as? String, "array")
     let description = beatSchedule?["description"] as? String
-    XCTAssertTrue(description?.localizedCaseInsensitiveContains("T2V ONLY") == true,
-                  "the schema must document the T2V-only restriction (comfybox#328 finding 5)")
+    XCTAssertTrue(description?.localizedCaseInsensitiveContains("SINGLE-PASS T2V/I2V") == true,
+                  "the schema must document single-pass support")
+    XCTAssertTrue(description?.localizedCaseInsensitiveContains("multi-chunk") == true,
+                  "the schema must document the remaining continuation restriction")
   }
 
   func testGenerateVideoSchemaOnlyPromptRequired() {

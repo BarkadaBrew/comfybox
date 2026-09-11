@@ -624,7 +624,7 @@ public enum MCPToolRegistry {
         ] as [String: Any],
         "beat_schedule": [
           "type": "array",
-          "description": "T2V ONLY (comfybox#328) — ignored with a warning on I2V (image_path set). Temporal beat scheduling: [{text, start_frac, end_frac, strength?}]. Each beat's `text` must be a VERBATIM substring of `prompt` — the engine locates it there and drops (fail-open, logged) any beat it can't find. A non-empty beat_schedule makes the server SKIP prompt enhancement for this request (enhancement rewrites the prompt wholesale, which strands every beat) — send an already-composed prompt, not a raw one expecting server-side enhancement.",
+          "description": "SINGLE-PASS T2V/I2V — multi-chunk continuation requests ignore it with an explicit reason. Temporal beat scheduling: [{text, start_frac, end_frac, strength?}]. Each beat's `text` must be a VERBATIM substring of `prompt` — the engine locates it there and drops (fail-open, logged) any beat it can't find. I2V source/keyframe/reference frames remain unbiased. A non-empty active beat_schedule makes the server SKIP prompt enhancement for this request (enhancement rewrites the prompt wholesale, which strands every beat) — send an already-composed prompt, not a raw one expecting server-side enhancement.",
           "items": ["type": "object"] as [String: Any],
         ] as [String: Any],
         "fps": [

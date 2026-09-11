@@ -6,6 +6,63 @@ import XCTest
 /// no model weights — per intent.md's "agents run unit tests only".
 final class VideoGenerationRecordTests: XCTestCase {
 
+  func testResolvedRecipeHashIsDeterministicAndRenderSensitive() throws {
+    var tuning = LTX2VideoTuning()
+    tuning.colorAnchor = 0
+    tuning.nagScale = 11
+    let snapshot = LTX2ConfigResolver.resolveTyped(
+      request: tuning, preset: nil,
+      environment: ["LTX2_SAMPLER": "euler_ancestral_cfg_pp"], configFile: [:])
+    var request = LTX2VideoRequest(
+      prompt: "she steps closer, then turns", negativePrompt: "ghosting",
+      initImagePath: "/tmp/source.png", width: 512, height: 320,
+      framesPerChunk: 289, steps: 8, seed: 42, guidance: 1,
+      loras: [.init(path: "/tmp/motion.safetensors", scale: 0.8)],
+      outputPath: "/tmp/out.mp4",
+      resolvedConfigSnapshot: snapshot,
+      beatSchedule: [
+        .init(text: "she steps closer", startFrac: 0, endFrac: 0.5),
+        .init(text: "then turns", startFrac: 0.5, endFrac: 1),
+      ])
+
+    let accepted = try ResolvedVideoRecipe.build(
+      request: request, transformerFile: "transformer-distilled.safetensors")
+    XCTAssertEqual(try accepted.fingerprint().count, 64)
+    XCTAssertEqual(
+      try accepted.fingerprint(),
+      try ResolvedVideoRecipe.build(
+        request: request, transformerFile: "transformer-distilled.safetensors").fingerprint())
+
+    request.prompt += ", smiling"
+    let changed = try ResolvedVideoRecipe.build(
+      request: request, transformerFile: "transformer-distilled.safetensors")
+    XCTAssertNotEqual(try changed.fingerprint(), try accepted.fingerprint())
+  }
+
+  func testResolvedRecipeUsesTheAcceptedConfigSnapshot() throws {
+    let acceptedConfig = LTX2ConfigResolver.resolveTyped(
+      request: nil, preset: nil,
+      environment: ["LTX2_COLOR_ANCHOR": "0", "LTX2_SAMPLER": "accepted"],
+      configFile: [:])
+    let laterConfig = LTX2ConfigResolver.resolveTyped(
+      request: nil, preset: nil,
+      environment: ["LTX2_COLOR_ANCHOR": "1", "LTX2_SAMPLER": "changed"],
+      configFile: [:])
+    let base = LTX2VideoRequest(
+      prompt: "p", framesPerChunk: 97, outputPath: "/tmp/o.mp4",
+      resolvedConfigSnapshot: acceptedConfig)
+    let later = LTX2VideoRequest(
+      prompt: "p", framesPerChunk: 97, outputPath: "/tmp/o.mp4",
+      resolvedConfigSnapshot: laterConfig)
+
+    let accepted = try ResolvedVideoRecipe.build(request: base, transformerFile: "t.safetensors")
+    let changed = try ResolvedVideoRecipe.build(request: later, transformerFile: "t.safetensors")
+    XCTAssertNotEqual(try accepted.fingerprint(), try changed.fingerprint(),
+                      "config drift must produce a different recipe identity")
+    XCTAssertEqual(accepted.parameters.first { $0.name == "color_anchor" }?.value, "0")
+    XCTAssertEqual(accepted.parameters.first { $0.name == "sampler" }?.value, "accepted")
+  }
+
   // MARK: - kind()
 
   func testKindClassifiesFromInitImageAndExtend() {
