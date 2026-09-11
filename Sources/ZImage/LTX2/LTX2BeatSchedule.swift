@@ -21,17 +21,12 @@
 // `beat_schedule` (empty resolved list) yields `nil` from both builders —
 // byte-identical to today's no-bias code path.
 //
-// SCOPE: T2V ONLY (comfybox#328, Codex round 1 finding 5). Resolved beats
-// are forwarded into the T2V render path only — every I2V branch omits
-// them, and `generateI2VResumable` has no beat parameter at all. That
-// omission used to be a SILENT no-op: a `beat_schedule` on an I2V request
-// could locate cleanly and still never affect the render. WarmServer now
-// strips `beat_schedule` before it reaches the generator on any I2V
-// request and records `beat_schedule_ignored: "i2v_unsupported"` on the
-// response/trace instead of rendering it invisible. Wiring beats into I2V
-// needs its own design (I2V's frame axis and keyframe chaining differ
-// enough from T2V's single continuous timeline) and is not part of this
-// fix — do not assume beat_schedule does anything on an I2V request.
+// SCOPE: SINGLE-PASS T2V AND I2V. I2V's source/keyframe queries and appended
+// IC-control references are deliberately left unbiased: those frames are
+// identity constraints, not motion slots. Multi-chunk requests remain
+// unsupported because repeating a clip-global fractional schedule inside
+// every continuation chunk would be dishonest; WarmServer strips those
+// schedules and records `beat_schedule_ignored: "multi_chunk_unsupported"`.
 //
 // Also T2V-adjacent gotcha (comfybox#328, finding 3): a non-empty
 // `beat_schedule` makes WarmServer skip server-side prompt enhancement for
@@ -269,18 +264,28 @@ public enum LTX2BeatScheduleBuilder {
     resolved: [LTX2ResolvedBeat],
     frames: Int,
     tokensPerFrame: Int,
-    textLen: Int
+    textLen: Int,
+    /// Number of frames on the actual clip timeline. This differs from
+    /// `frames` when I2V appends IC-control reference frames to the query
+    /// axis. Nil preserves the original T2V behavior (`frames`).
+    timelineFrames: Int? = nil,
+    /// Query-frame rows that must receive no temporal penalty. I2V supplies
+    /// its source/keyframe indices plus appended reference-frame indices.
+    unbiasedFrameIndices: Set<Int> = []
   ) -> MLXArray? {
     guard !resolved.isEmpty, frames > 0, tokensPerFrame > 0, textLen > 0 else { return nil }
+    let geometryFrames = min(max(timelineFrames ?? frames, 1), frames)
     let videoTokens = frames * tokensPerFrame
     var cost = [Float](repeating: 0, count: videoTokens * textLen)
     var anyNonZero = false
 
     for beat in resolved {
       guard beat.tokenEnd > beat.tokenStart, beat.tokenStart >= 0, beat.tokenEnd <= textLen else { continue }
-      let (midpoint, window) = frameGeometry(beat, frames: frames)
+      let (midpoint, window) = frameGeometry(beat, frames: geometryFrames)
       for q in 0..<videoTokens {
-        let frame = Float(q / tokensPerFrame)
+        let frameIndex = q / tokensPerFrame
+        guard !unbiasedFrameIndices.contains(frameIndex) else { continue }
+        let frame = Float(frameIndex)
         let over = max(abs(frame - midpoint) - window, 0)
         guard over > 0 else { continue }
         let penalty = -(beat.strength * over * over / (2 * sigma * sigma))
@@ -307,7 +312,10 @@ public enum LTX2BeatScheduleBuilder {
     totalFrames: Int,
     fps: Float,
     audioTokenMidSeconds: [Float],
-    textLen: Int
+    textLen: Int,
+    /// Actual audio timeline duration. When supplied, fractional beat windows
+    /// map to it directly instead of the model-conditioning fps axis.
+    durationSeconds: Float? = nil
   ) -> MLXArray? {
     guard !resolved.isEmpty, totalFrames > 0, fps > 0, !audioTokenMidSeconds.isEmpty, textLen > 0 else { return nil }
     let audioTokens = audioTokenMidSeconds.count
@@ -317,8 +325,10 @@ public enum LTX2BeatScheduleBuilder {
     for beat in resolved {
       guard beat.tokenEnd > beat.tokenStart, beat.tokenStart >= 0, beat.tokenEnd <= textLen else { continue }
       let (midpointFrame, windowFrame) = frameGeometry(beat, frames: totalFrames)
-      let midpointSec = midpointFrame / fps
-      let windowSec = windowFrame / fps
+      let timelineSeconds = durationSeconds ?? (Float(max(totalFrames - 1, 1)) / fps)
+      let frameSeconds = timelineSeconds / Float(max(totalFrames - 1, 1))
+      let midpointSec = midpointFrame * frameSeconds
+      let windowSec = windowFrame * frameSeconds
       for q in 0..<audioTokens {
         let over = max(abs(audioTokenMidSeconds[q] - midpointSec) - windowSec, 0)
         guard over > 0 else { continue }

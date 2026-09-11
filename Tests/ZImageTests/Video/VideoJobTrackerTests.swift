@@ -52,6 +52,17 @@ final class VideoJobTrackerTests: XCTestCase {
     XCTAssertEqual(tracker.status(jobId: i2vId)?.mode, .i2v)
   }
 
+  func testAcceptedRecipeHashSurvivesEveryStatusTransition() {
+    let tracker = VideoJobTracker()
+    let (jobId, accepted) = tracker.register(
+      source: "api", mode: .i2v, recipeHash: "recipe-sha")
+    XCTAssertEqual(accepted.recipeHash, "recipe-sha")
+    tracker.markProcessing(jobId)
+    XCTAssertEqual(tracker.status(jobId: jobId)?.recipeHash, "recipe-sha")
+    tracker.markSucceeded(jobId, result: result())
+    XCTAssertEqual(tracker.status(jobId: jobId)?.recipeHash, "recipe-sha")
+  }
+
   // MARK: - queued → processing
 
   func testMarkProcessing() {

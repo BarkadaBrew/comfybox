@@ -251,6 +251,9 @@ public struct VideoJobStatus: Codable, Sendable {
   /// local LTX-2 backend; nil while queued/processing, on failure, and on
   /// the Replicate cloud path (no local render to record).
   public let generationRecord: VideoGenerationRecord?
+  /// Stable identity of the admission-time render recipe. Present on local
+  /// LTX jobs from the 2026-09 composer contract onward, including HTTP 202.
+  public let recipeHash: String?
 
   public init(
     jobId: String,
@@ -271,7 +274,8 @@ public struct VideoJobStatus: Codable, Sendable {
     frameCount: Int? = nil,
     interrupted: Bool? = nil,
     refineSkipped: String? = nil,
-    generationRecord: VideoGenerationRecord? = nil
+    generationRecord: VideoGenerationRecord? = nil,
+    recipeHash: String? = nil
   ) {
     self.jobId = jobId
     self.status = status
@@ -292,5 +296,6 @@ public struct VideoJobStatus: Codable, Sendable {
     self.interrupted = interrupted
     self.refineSkipped = refineSkipped
     self.generationRecord = generationRecord
+    self.recipeHash = recipeHash
   }
 }

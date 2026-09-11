@@ -157,9 +157,8 @@ public final class RenderTraceStore: @unchecked Sendable {
     /// to surface this via the raw submitted payload, but this summary type
     /// is what that endpoint actually returns, and it dropped the field.
     public let enhancementSkipped: String?
-    /// comfybox#328: non-nil (`"i2v_unsupported"`) when a `beat_schedule`
-    /// on this render's (I2V) request was dropped before reaching the
-    /// generator.
+    /// Non-nil (currently `"multi_chunk_unsupported"`) when a clip-global
+    /// beat schedule was dropped before reaching the generator.
     public let beatScheduleIgnored: String?
     /// comfybox#307 (review r2, item 1): non-nil when `two_stage` was
     /// requested and the refine pass could not run (upsampler unavailable,

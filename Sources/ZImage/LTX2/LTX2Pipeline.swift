@@ -1002,6 +1002,7 @@ public final class LTX2Pipeline {
     faceAnchorStrength: Float = 0,
     refineAnchorImage: MLXArray? = nil,
     audioSeconds: Float? = nil,
+    beatSchedule: [LTX2ResolvedBeat] = [],
     progressCallback: ((Int, Int) -> Void)? = nil
   ) throws -> LTX2PipelineOutput {
     try nonPreemptible("generateI2V") {
@@ -1012,6 +1013,7 @@ public final class LTX2Pipeline {
         negativeInputIds: negativeInputIds, negativeAttentionMask: negativeAttentionMask,
         faceAnchorMask: faceAnchorMask, faceAnchorStrength: faceAnchorStrength,
         refineAnchorImage: refineAnchorImage, audioSeconds: audioSeconds,
+        beatSchedule: beatSchedule,
         progressCallback: progressCallback)
     }
   }
@@ -1034,6 +1036,7 @@ public final class LTX2Pipeline {
     faceAnchorStrength: Float = 0,
     refineAnchorImage: MLXArray? = nil,
     audioSeconds: Float? = nil,
+    beatSchedule: [LTX2ResolvedBeat] = [],
     preemption: PreemptionSignal? = nil,
     telemetry: LTX2PhaseTelemetry? = nil,
     resume: LTX2ResumeState? = nil,
@@ -1261,6 +1264,10 @@ public final class LTX2Pipeline {
     }
 
     // Step 6: Denoising loop with I2V state
+    var i2vUnbiasedFrames: Set<Int> = [0]
+    if icRefFrames > 0 {
+      i2vUnbiasedFrames.formUnion(latF..<(latF + icRefFrames))
+    }
     let latentsAll: MLXArray
     if skipBaseLoop, let resumed = resumedLatents {
       latentsAll = resumed
@@ -1282,6 +1289,9 @@ public final class LTX2Pipeline {
         preemption: preemption,
         telemetry: telemetry,
         chunkIndex: chunkIndex,
+        beatSchedule: beatSchedule,
+        beatTimelineFrames: latF,
+        beatUnbiasedFrameIndices: i2vUnbiasedFrames,
         progressCallback: progressCallback
       ) {
       case .completed(let l): latentsAll = l
@@ -1314,6 +1324,7 @@ public final class LTX2Pipeline {
         cfgScale: cfgScale, seed: seed,
         refineAnchorImage: refineAnchorImage,
         avState: avState,
+        beatSchedule: beatSchedule,
         preemption: preemption, telemetry: telemetry,
         resume: resume, chunkIndex: chunkIndex,
         progressCallback: progressCallback) {
@@ -1402,6 +1413,7 @@ public final class LTX2Pipeline {
     guidance: Float? = nil,
     negativeInputIds: MLXArray? = nil,
     negativeAttentionMask: MLXArray? = nil,
+    beatSchedule: [LTX2ResolvedBeat] = [],
     progressCallback: ((Int, Int) -> Void)? = nil
   ) throws -> LTX2PipelineOutput {
     try nonPreemptible("generateMultiKeyframe") {
@@ -1410,6 +1422,7 @@ public final class LTX2Pipeline {
         width: width, height: height, numFrames: numFrames, steps: steps,
         seed: seed, guidance: guidance,
         negativeInputIds: negativeInputIds, negativeAttentionMask: negativeAttentionMask,
+        beatSchedule: beatSchedule,
         progressCallback: progressCallback)
     }
   }
@@ -1427,6 +1440,7 @@ public final class LTX2Pipeline {
     guidance: Float? = nil,
     negativeInputIds: MLXArray? = nil,
     negativeAttentionMask: MLXArray? = nil,
+    beatSchedule: [LTX2ResolvedBeat] = [],
     preemption: PreemptionSignal? = nil,
     telemetry: LTX2PhaseTelemetry? = nil,
     resume: LTX2ResumeState? = nil,
@@ -1501,6 +1515,7 @@ public final class LTX2Pipeline {
       let latentFrameIndex = min(kf.videoFrameIndex / temporalCompression, latF - 1)
       return LTX2VideoCondition(latent: latent, frameIndex: latentFrameIndex, strength: kf.strength)
     }
+    let conditionedBeatFrames = Set(conditions.map(\.frameIndex))
 
     // Step 4: Create initial noisy state, apply ALL keyframe conditions.
     if let seed = seed {
@@ -1572,6 +1587,9 @@ public final class LTX2Pipeline {
         preemption: preemption,
         telemetry: telemetry,
         chunkIndex: chunkIndex,
+        beatSchedule: beatSchedule,
+        beatTimelineFrames: latF,
+        beatUnbiasedFrameIndices: conditionedBeatFrames,
         progressCallback: progressCallback
       ) {
       case .completed(let l): latents = l
@@ -1601,6 +1619,8 @@ public final class LTX2Pipeline {
         nagEmbeddings: nagEmbeddings, nag: nagConfig,
         cfgScale: cfgScale, seed: seed,
         refineAnchorImage: nil,
+        beatSchedule: beatSchedule,
+        beatUnbiasedFrameIndices: conditionedBeatFrames,
         preemption: preemption, telemetry: telemetry,
         resume: resume, chunkIndex: chunkIndex,
         progressCallback: progressCallback) {
@@ -1686,6 +1706,11 @@ public final class LTX2Pipeline {
     // Empty (the default) builds nil bias both places — byte-identical to
     // before this feature existed.
     beatSchedule: [LTX2ResolvedBeat] = [],
+    // I2V can append IC-control reference queries beyond the actual timeline.
+    // Resolve fractional beat geometry against the timeline only, and leave
+    // source/keyframe/reference queries unbiased.
+    beatTimelineFrames: Int? = nil,
+    beatUnbiasedFrameIndices: Set<Int> = [],
     progressCallback: ((Int, Int) -> Void)?
   ) throws -> LTX2DenoiseResult {
     // #1479 phase timing. `defer` so a yield closes the phase too: a preempted
@@ -1760,11 +1785,15 @@ public final class LTX2Pipeline {
     // `.to(dtype)` on its cached matrix. Adversarial review F1: without the
     // conversion the fp32 bias rode into the bf16 attention (and doubled
     // the tensor's allocation).
+    let beatTimelineFrameCount = min(
+      max(beatTimelineFrames ?? latents.dim(2), 1), latents.dim(2))
     let videoBeatBias: MLXArray? = LTX2BeatScheduleBuilder.buildVideoBias(
       resolved: beatSchedule,
       frames: latents.dim(2),
       tokensPerFrame: latents.dim(3) * latents.dim(4),
-      textLen: textEmbeddings.dim(1))?.asType(dtype)
+      textLen: textEmbeddings.dim(1),
+      timelineFrames: beatTimelineFrameCount,
+      unbiasedFrameIndices: beatUnbiasedFrameIndices)?.asType(dtype)
     let audioBeatBias: MLXArray? = {
       guard !beatSchedule.isEmpty, let av = avState else { return nil }
       let audioFrames = av.audioLatents.dim(2)
@@ -1772,13 +1801,19 @@ public final class LTX2Pipeline {
       let starts = LTX2AudioPatchifier.latentTimesSeconds(from: 0, to: audioFrames)
       let ends = LTX2AudioPatchifier.latentTimesSeconds(from: 1, to: audioFrames + 1)
       let midSeconds = zip(starts, ends).map { ($0 + $1) / 2 }
-      let fps = resolvedConfig.condFps ?? Float(config.fps)
+      // `latents.dim(2)` is temporally compressed. Audio tokens live on real
+      // seconds, so expand the actual timeline back to output-frame units and
+      // map fractions onto the audio tokens' measured time span. Conditioning
+      // fps is intentionally irrelevant here: it is a motion/RoPE dial, not
+      // playback duration.
+      let outputFrames = (beatTimelineFrameCount - 1) * temporalCompression + 1
       return LTX2BeatScheduleBuilder.buildAudioBias(
         resolved: beatSchedule,
-        totalFrames: latents.dim(2),
-        fps: fps,
+        totalFrames: outputFrames,
+        fps: Float(config.fps),
         audioTokenMidSeconds: midSeconds,
-        textLen: av.audioContext.dim(1))?.asType(dtype)
+        textLen: av.audioContext.dim(1),
+        durationSeconds: ends.last)?.asType(dtype)
     }()
 
     for i in startStep..<numSteps {
@@ -2350,6 +2385,8 @@ public final class LTX2Pipeline {
     seed: UInt64?,
     refineAnchorImage: MLXArray?,
     avState: LTX2AVDenoiseState? = nil,
+    beatSchedule: [LTX2ResolvedBeat] = [],
+    beatUnbiasedFrameIndices: Set<Int> = [0],
     preemption: PreemptionSignal? = nil,
     telemetry: LTX2PhaseTelemetry? = nil,
     resume: LTX2ResumeState? = nil,
@@ -2590,6 +2627,9 @@ public final class LTX2Pipeline {
       telemetry: telemetry,
       loopPhase: .refineDenoise,
       chunkIndex: chunkIndex,
+      beatSchedule: beatSchedule,
+      beatTimelineFrames: rF,
+      beatUnbiasedFrameIndices: beatUnbiasedFrameIndices,
       progressCallback: progressCallback) {
     case .completed(let l):
       refined = l

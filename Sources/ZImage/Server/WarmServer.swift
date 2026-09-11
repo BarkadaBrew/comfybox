@@ -2336,12 +2336,11 @@ public final class WarmServer {
     /// engine can't act on (unlocatable text, degenerate fracs) — a caller
     /// bug should be loud, a tokenizer merge should not.
     ///
-    /// T2V ONLY (comfybox#328, see LTX2BeatSchedule.swift's header for why):
-    /// on an I2V request (`image_path` set) this is stripped before it
-    /// reaches the generator and the response/trace records
-    /// `beat_schedule_ignored: "i2v_unsupported"` instead. A non-empty
-    /// schedule also makes the server SKIP prompt enhancement for this
-    /// request — see `enhance`.
+    /// Supported for single-pass T2V and I2V. A multi-chunk continuation
+    /// cannot yet map clip-global fractions across chunk boundaries, so its
+    /// schedule is stripped and the response/trace records
+    /// `beat_schedule_ignored: "multi_chunk_unsupported"`. A non-empty active
+    /// schedule also makes the server SKIP prompt enhancement — see `enhance`.
     let beatSchedule: [BeatSegment]?
   }
 
@@ -2372,9 +2371,11 @@ public final class WarmServer {
     /// was skipped so the request's beats would locate. Absent field on
     /// older engines/clients is the byte-identical no-op case.
     let enhancementSkipped: String?
-    /// comfybox#328: non-nil (`"i2v_unsupported"`) when a `beat_schedule`
-    /// on this I2V request was dropped before reaching the generator.
+    /// Non-nil (`"multi_chunk_unsupported"`) when a clip-global schedule
+    /// could not be represented by a continuation render.
     let beatScheduleIgnored: String?
+    /// SHA-256 of the immutable recipe accepted for this render.
+    let recipeHash: String?
     /// comfybox#307: non-nil only when `two_stage` was requested and the
     /// refine pass could not run — see `LTX2RefineGate`.
     let refineSkipped: String?
@@ -2566,11 +2567,11 @@ public final class WarmServer {
     /// `beat_schedule` would survive verbatim in the composed prompt —
     /// stamped onto the response/trace as `enhancement_skipped`.
     let enhancementSkippedReason: String?
-    /// comfybox#328 (Codex round 1, finding 5): non-nil (`"i2v_unsupported"`)
-    /// when a non-empty `beat_schedule` arrived on an I2V request and was
-    /// dropped before reaching the generator — stamped onto the
+    /// Non-nil (`"multi_chunk_unsupported"`) when a non-empty clip-global
+    /// schedule was dropped before a continuation render — stamped onto the
     /// response/trace as `beat_schedule_ignored`.
     let beatScheduleIgnoredReason: String?
+    let recipeHash: String
     /// comfybox#405: how the render dims were decided (`source_aspect` |
     /// `explicit` | `default`) plus the budget they were fitted into —
     /// stamped onto the response and the render trace so a wrong-shaped clip
@@ -2690,6 +2691,31 @@ public final class WarmServer {
     /// (`enhance:false`, no provider configured, kill switch off) — Codex
     /// round 1, finding 3: a false "beat_schedule" marker is worse than none.
     let enhancementSkippedReason: String?
+  }
+
+  /// Resolve whether a caller's clip-global temporal schedule can be applied
+  /// truthfully. Single-pass T2V and I2V share one continuous latent timeline;
+  /// continuation renders do not, so replaying the same fractional schedule
+  /// inside every chunk would misrepresent the request.
+  struct VideoBeatScheduleResolution: Equatable {
+    let effective: [BeatSegment]?
+    let ignoredReason: String?
+  }
+
+  static func resolveVideoBeatSchedule(
+    requested: [BeatSegment]?, isT2V: Bool, totalChunks: Int
+  ) -> VideoBeatScheduleResolution {
+    guard let requested, !requested.isEmpty else {
+      return VideoBeatScheduleResolution(effective: requested, ignoredReason: nil)
+    }
+    guard totalChunks <= 1 else {
+      return VideoBeatScheduleResolution(
+        effective: nil, ignoredReason: "multi_chunk_unsupported")
+    }
+    // `isT2V` is intentionally part of this decision's contract: both modes
+    // are supported for a single pass, and tests pin that symmetry explicitly.
+    _ = isT2V
+    return VideoBeatScheduleResolution(effective: requested, ignoredReason: nil)
   }
 
   /// comfybox#328 (Codex round 1, finding 1): the beat-schedule-vs-
@@ -2924,6 +2950,7 @@ public final class WarmServer {
     renderWidth: Int, renderHeight: Int,
     foldedFramesPerChunk: Int, foldedExtendSeconds: Float,
     resolvedLoRAs: [LTX2LoRAReference], effectiveBeatSchedule: [BeatSegment]?,
+    resolvedConfigSnapshot: LTX2ResolvedVideoConfig? = nil,
     resolvedOutput: String,
     dimensionReason: String? = nil,
     forceSingleStage: Bool = false,
@@ -2982,6 +3009,7 @@ public final class WarmServer {
       outputPath: resolvedOutput,
       tuning: resolvedTuning,
       presetTuning: videoPreset?.videoTuning,
+      resolvedConfigSnapshot: resolvedConfigSnapshot,
       audio: req.audio ?? false,
       beatSchedule: effectiveBeatSchedule,
       // comfybox#401 (review round 2, ruling 1): carried through only for
@@ -3336,24 +3364,21 @@ public final class WarmServer {
       characterDesc = entry.resolvedDescription(for: charMode)
     }
 
-    // comfybox#328 (Codex round 1, finding 5): temporal beat scheduling is
-    // T2V-only — `LTX2VideoGenerator` never forwards resolved beats into any
-    // I2V render path (its I2V branches don't take a beat parameter), so a
-    // `beat_schedule` on an I2V request was a SILENT no-op — locate could
-    // even succeed and the bias would still be thrown away downstream.
-    // Rather than wire beats into I2V in this PR (I2V's frame axis and
-    // keyframe chaining differ enough from T2V's single continuous timeline
-    // to need its own design), make the no-op loud: strip the schedule
-    // before it reaches the generator and record why.
-    var beatScheduleIgnoredReason: String? = nil
-    let effectiveBeatSchedule: [BeatSegment]?
-    if !isT2V, let beats = req.beatSchedule, !beats.isEmpty {
-      beatScheduleIgnoredReason = "i2v_unsupported"
-      effectiveBeatSchedule = nil
+    // Temporal beat schedules are clip-global. A single-pass T2V or I2V has
+    // one continuous timeline and can honor them; continuation chunks cannot
+    // yet map global fractions without splitting the schedule per chunk.
+    let beatRenderPlan = LTX2VideoGenerator.chunkPlan(
+      framesPerChunk: foldedFramesPerChunk,
+      extendToSeconds: foldedExtendSeconds,
+      fps: req.fps ?? 24)
+    let beatResolution = Self.resolveVideoBeatSchedule(
+      requested: req.beatSchedule, isT2V: isT2V,
+      totalChunks: beatRenderPlan.totalChunks)
+    let effectiveBeatSchedule = beatResolution.effective
+    let beatScheduleIgnoredReason = beatResolution.ignoredReason
+    if let reason = beatScheduleIgnoredReason {
       logger.warning(
-        "Video: beat_schedule ignored — I2V rendering doesn't support temporal beat scheduling yet (\(beats.count) beat(s) dropped, comfybox#328: T2V-only). Send a T2V request (no image_path) for beat_schedule.")
-    } else {
-      effectiveBeatSchedule = req.beatSchedule
+        "Video: beat_schedule ignored — \(reason) (\(req.beatSchedule?.count ?? 0) beat(s) dropped).")
     }
 
     // Auto-enhance the video prompt through the configured prompt-optimization
@@ -3376,9 +3401,9 @@ public final class WarmServer {
     // `req.beatSchedule`) feeds this — an I2V-ignored schedule shouldn't
     // also cost enhancement quality for beats that will never apply.
     let aiProviderConfig = ServerConfigStore.shared.current().config
-    let beatScheduleEnabled = LTX2ConfigResolver.resolveTyped(
-      request: req.tuning, preset: videoPreset?.videoTuning
-    ).beatScheduleEnabled
+    // Use the admission snapshot. Re-resolving here would let an env/config
+    // change split the enhancement decision from the recipe we hash/execute.
+    let beatScheduleEnabled = resolvedVideoConfig.beatScheduleEnabled
     let enhancement = await Self.resolveVideoEnhancement(
       prompt: req.prompt,
       enhance: req.enhance,
@@ -3433,17 +3458,22 @@ public final class WarmServer {
       stage1Height: resolvedTwoStage ? renderHeight : nil,
       ceilingPreClamp: ceilingPreClamp)
 
-    let videoRequest = Self.buildLocalVideoRequest(
+    var videoRequest = Self.buildLocalVideoRequest(
       req: req, videoPreset: videoPreset,
       effectivePrompt: effectivePrompt, effectiveInitImage: effectiveInitImage,
       renderWidth: renderWidth, renderHeight: renderHeight,
       foldedFramesPerChunk: foldedFramesPerChunk, foldedExtendSeconds: foldedExtendSeconds,
       resolvedLoRAs: resolvedLoRAs, effectiveBeatSchedule: effectiveBeatSchedule,
+      resolvedConfigSnapshot: resolvedVideoConfig,
       resolvedOutput: resolvedOutput,
       dimensionReason: renderDimensions.reason.rawValue,
       forceSingleStage: twoStageRequested && !resolvedTwoStage,
       twoStageRequested: twoStageRequested,
       refineSkippedReasonHint: refineSkippedReasonHint)
+    let recipe = try ResolvedVideoRecipe.build(
+      request: videoRequest, transformerFile: generator.config.transformerFile)
+    let recipeHash = try recipe.fingerprint()
+    videoRequest.recipeHash = recipeHash
     // Validate before enqueuing so bad frames/dims fail fast.
     try generator.validate(videoRequest)
 
@@ -3455,6 +3485,7 @@ public final class WarmServer {
       optimizationAttemptId: req.optimizationAttemptId,
       enhancementSkippedReason: enhancementSkippedReason,
       beatScheduleIgnoredReason: beatScheduleIgnoredReason,
+      recipeHash: recipeHash,
       resolvedDimensions: renderDimensions)
   }
 
@@ -3488,6 +3519,7 @@ public final class WarmServer {
     if let reason = prep.beatScheduleIgnoredReason {
       tracePayload["beat_schedule_ignored"] = reason
     }
+    tracePayload["recipe_hash"] = prep.recipeHash
     // Winner actions (2026-08-10): store the sanitized request + the
     // resolved seed/dims so this render_id is replayable — /v1/video/rerender
     // replays it at 720p, /v1/video/extend chains a continuation.
@@ -3602,6 +3634,7 @@ public final class WarmServer {
       payload["output_height"] = String(result.outputHeight)
     }
     if let record = result.generationRecord {
+      if let recipeHash = record.recipeHash { payload["recipe_hash"] = recipeHash }
       if let steps = record.steps { payload["steps"] = String(steps) }
       if let requested = record.requestedSteps {
         payload["requested_steps"] = String(requested)
@@ -3650,8 +3683,8 @@ public final class WarmServer {
         source: prep.source, mode: prep.mode, coordinator: coordinator,
         // Snapshot at SUBMIT time (finding #15): the authoritative resolution
         // this render will use, durable on the job status.
-        resolvedConfig: LTX2ConfigResolver.resolveTyped(
-          request: prep.request.tuning, preset: prep.request.presetTuning).params,
+        resolvedConfig: prep.request.resolvedConfigSnapshot?.params,
+        recipeHash: prep.recipeHash,
         tracePayload: tracePayload,
         wantsAudio: prep.request.audio
       ) { report in
@@ -3911,6 +3944,7 @@ public final class WarmServer {
         backend: "ltx2-local",
         enhancementSkipped: prep.enhancementSkippedReason,
         beatScheduleIgnored: prep.beatScheduleIgnoredReason,
+        recipeHash: prep.recipeHash,
         refineSkipped: result.refineSkippedReason,
         predictedWidth: prep.resolvedDimensions.width,
         predictedHeight: prep.resolvedDimensions.height,
@@ -8509,6 +8543,8 @@ private final class LocalVideoJob: @unchecked Sendable {
   var refineSkippedReason: String?
   /// comfybox#401: set on success — see `VideoJobStatus.generationRecord`.
   var generationRecord: VideoGenerationRecord?
+  /// Frozen at admission and unchanged for the job's full lifetime.
+  var recipeHash: String?
 
   init(id: String, source: String, mode: VideoMode) {
     self.id = id
@@ -8537,7 +8573,8 @@ private final class LocalVideoJob: @unchecked Sendable {
       frameCount: frameCount,
       interrupted: interrupted ? true : nil,
       refineSkipped: refineSkippedReason,
-      generationRecord: generationRecord
+      generationRecord: generationRecord,
+      recipeHash: recipeHash
     )
   }
 }
@@ -8576,11 +8613,13 @@ final class VideoJobTracker: @unchecked Sendable {
   func register(
     source: String, mode: VideoMode,
     resolvedConfig: [LTX2ResolvedParam]? = nil,
+    recipeHash: String? = nil,
     tracePayload: [String: String] = [:]
   ) -> (jobId: String, status: VideoJobStatus) {
     let jobId = UUID().uuidString
     let job = LocalVideoJob(id: jobId, source: source, mode: mode)
     job.resolvedConfig = resolvedConfig
+    job.recipeHash = recipeHash
     lock.lock(); jobs[jobId] = job; lock.unlock()
     var payload = tracePayload
     payload["source"] = source
@@ -8603,12 +8642,14 @@ final class VideoJobTracker: @unchecked Sendable {
     mode: VideoMode,
     coordinator: WarmServerCoordinator,
     resolvedConfig: [LTX2ResolvedParam]? = nil,
+    recipeHash: String? = nil,
     tracePayload: [String: String] = [:],
     wantsAudio: Bool = false,
     render: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2RenderOutcome
   ) -> VideoJobStatus {
     let (jobId, queued) = register(
       source: source, mode: mode, resolvedConfig: resolvedConfig,
+      recipeHash: recipeHash,
       tracePayload: tracePayload)
     Task { [weak self] in
       guard let self else { return }

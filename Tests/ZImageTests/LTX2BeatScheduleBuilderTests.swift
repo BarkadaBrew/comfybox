@@ -136,4 +136,46 @@ final class LTX2BeatScheduleBuilderTests: XCTestCase {
     XCTAssertNil(LTX2BeatScheduleBuilder.buildAudioBias(
       resolved: [], totalFrames: 8, fps: 4, audioTokenMidSeconds: [0.1, 0.2], textLen: 6))
   }
+
+  func testAudioBiasUsesMeasuredDurationInsteadOfConditioningFPS() {
+    let beat = LTX2ResolvedBeat(
+      tokenStart: 0, tokenEnd: 1, startFrac: 0.5, endFrac: 1.0, strength: 1.0)
+    let mids: [Float] = [1, 4, 7, 10]
+    let slowConditioning = LTX2BeatScheduleBuilder.buildAudioBias(
+      resolved: [beat], totalFrames: 25, fps: 8,
+      audioTokenMidSeconds: mids, textLen: 2, durationSeconds: 12)
+    let fastConditioning = LTX2BeatScheduleBuilder.buildAudioBias(
+      resolved: [beat], totalFrames: 25, fps: 30,
+      audioTokenMidSeconds: mids, textLen: 2, durationSeconds: 12)
+    XCTAssertEqual(
+      slowConditioning?.asArray(Float.self), fastConditioning?.asArray(Float.self),
+      "conditioning fps is a motion dial and must not move audio beat timing")
+  }
+
+  // MARK: I2V conditioning isolation
+
+  func testI2VSourceAndReferenceFramesRemainUnbiased() {
+    // Four timeline frames plus one appended IC-control reference frame.
+    // Frame 0 is the source condition and frame 4 is the appended reference;
+    // neither may receive a temporal prompt penalty. Geometry must still be
+    // resolved against the four-frame timeline, not the five query frames.
+    let beat = LTX2ResolvedBeat(
+      tokenStart: 0, tokenEnd: 2, startFrac: 0.5, endFrac: 1.0, strength: 1.0)
+    guard let bias = LTX2BeatScheduleBuilder.buildVideoBias(
+      resolved: [beat], frames: 5, tokensPerFrame: 2, textLen: 3,
+      timelineFrames: 4, unbiasedFrameIndices: [0, 4]
+    ) else {
+      XCTFail("expected timeline frames to retain a non-zero beat bias")
+      return
+    }
+
+    let rows = bias.reshaped([10, 3]).asArray(Float.self)
+    for frame in [0, 4] {
+      let start = frame * 2 * 3
+      XCTAssertTrue(rows[start..<(start + 2 * 3)].allSatisfy { $0 == 0 },
+                    "conditioned frame \(frame) must remain unbiased")
+    }
+    XCTAssertTrue(rows[(1 * 2 * 3)..<(2 * 2 * 3)].contains { $0 < 0 },
+                  "an unconditioned timeline frame should retain the beat penalty")
+  }
 }

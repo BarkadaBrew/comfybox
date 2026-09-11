@@ -97,6 +97,8 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
   public let nagTau: Float?
   public let nagApplied: Bool?
   public let audioRefine: Bool?
+  /// SHA-256 of the immutable recipe accepted before queueing.
+  public let recipeHash: String?
   /// `"t2i" | "t2v" | "i2v" | "extend" | "storyboard"` — how this media was produced.
   /// `"extend"` is an i2v render whose request asked for more than one chunk
   /// (`extendToSeconds > 0`); a plain i2v single chunk stays `"i2v"`.
@@ -134,7 +136,7 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     twoPass: Bool, refine: Bool, refineSkippedReason: String? = nil, audio: Bool,
     sampler: String? = nil, stage1Sigmas: [Float]? = nil, refineSigmas: [Float]? = nil,
     nagScale: Float? = nil, nagAlpha: Float? = nil, nagTau: Float? = nil,
-    nagApplied: Bool? = nil, audioRefine: Bool? = nil,
+    nagApplied: Bool? = nil, audioRefine: Bool? = nil, recipeHash: String? = nil,
     kind: String, source: String? = nil, contentMode: String? = nil, truncated: Bool = false,
     loras: [LoRAEntry] = []
   ) {
@@ -165,6 +167,7 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     self.nagTau = nagTau
     self.nagApplied = nagApplied
     self.audioRefine = audioRefine
+    self.recipeHash = recipeHash
     self.kind = kind
     self.source = source
     self.contentMode = contentMode
@@ -264,6 +267,7 @@ extension VideoGenerationRecord {
       nagTau: nagConfig?.tau,
       nagApplied: nagApplied,
       audioRefine: audioRefine,
+      recipeHash: request.recipeHash,
       kind: kind(
         initImagePath: request.initImagePath,
         extendToSeconds: request.extendToSeconds,

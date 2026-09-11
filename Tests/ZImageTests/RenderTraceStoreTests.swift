@@ -88,7 +88,7 @@ final class RenderTraceStoreTests: XCTestCase {
       payload: ["prompt": "she walks closer", "enhancement_skipped": "beat_schedule"]))
     store.append(RenderTraceEvent(
       renderId: "r-i2v-beats", event: .submitted, taskKind: .videoRender,
-      payload: ["prompt": "a portrait", "beat_schedule_ignored": "i2v_unsupported"]))
+      payload: ["prompt": "a portrait", "beat_schedule_ignored": "multi_chunk_unsupported"]))
     store.append(RenderTraceEvent(
       renderId: "r-plain", event: .submitted, taskKind: .videoRender,
       payload: ["prompt": "no beats here"]))
@@ -97,7 +97,7 @@ final class RenderTraceStoreTests: XCTestCase {
     let summaries = Dictionary(uniqueKeysWithValues: store.recentSummaries(limit: 10).map { ($0.renderId, $0) })
     XCTAssertEqual(summaries["r-beats"]?.enhancementSkipped, "beat_schedule")
     XCTAssertNil(summaries["r-beats"]?.beatScheduleIgnored)
-    XCTAssertEqual(summaries["r-i2v-beats"]?.beatScheduleIgnored, "i2v_unsupported")
+    XCTAssertEqual(summaries["r-i2v-beats"]?.beatScheduleIgnored, "multi_chunk_unsupported")
     XCTAssertNil(summaries["r-i2v-beats"]?.enhancementSkipped)
     XCTAssertNil(summaries["r-plain"]?.enhancementSkipped)
     XCTAssertNil(summaries["r-plain"]?.beatScheduleIgnored)

@@ -58,6 +58,7 @@ final class VideoTracePayloadTests: XCTestCase {
       optimizationAttemptId: nil,
       enhancementSkippedReason: nil,
       beatScheduleIgnoredReason: nil,
+      recipeHash: "abc123",
       resolvedDimensions: ResolvedVideoDimensions(
         width: predicted.0, height: predicted.1, reason: reason,
         budgetWidth: 832, budgetHeight: 480,
@@ -93,6 +94,7 @@ final class VideoTracePayloadTests: XCTestCase {
     XCTAssertEqual(payload["width"], "512")
     XCTAssertEqual(payload["height"], "320")
     XCTAssertEqual(payload["image_path"], "/tmp/kira-405.png")
+    XCTAssertEqual(payload["recipe_hash"], "abc123")
   }
 
   func testBothRoutesUseTheSameSubmittedBuilderSoTheyCannotDrift() {

@@ -77,6 +77,13 @@ public struct LTX2VideoRequest: Sendable {
     /// the full five-level resolution.
     public var tuning: LTX2VideoTuning?
     public var presetTuning: LTX2VideoTuning?
+    /// Immutable resolution captured when the server accepts the request.
+    /// The generator consumes this instead of consulting mutable process/env
+    /// defaults again after the job has waited in the queue.
+    public var resolvedConfigSnapshot: LTX2ResolvedVideoConfig?
+    /// SHA-256 of the canonical accepted recipe. Set by WarmServer after every
+    /// render-shaping field and the config snapshot have been resolved.
+    public var recipeHash: String?
     /// Generate synchronized audio (task #21). T2V single-chunk only in v1;
     /// loads the audio branch (+~11GiB) into the transformer on first use.
     public var audio: Bool
@@ -145,6 +152,8 @@ public struct LTX2VideoRequest: Sendable {
         outputPath: String,
         tuning: LTX2VideoTuning? = nil,
         presetTuning: LTX2VideoTuning? = nil,
+        resolvedConfigSnapshot: LTX2ResolvedVideoConfig? = nil,
+        recipeHash: String? = nil,
         audio: Bool = false,
         beatSchedule: [BeatSegment]? = nil,
         source: String? = nil,
@@ -181,6 +190,8 @@ public struct LTX2VideoRequest: Sendable {
         self.outputPath = outputPath
         self.tuning = tuning
         self.presetTuning = presetTuning
+        self.resolvedConfigSnapshot = resolvedConfigSnapshot
+        self.recipeHash = recipeHash
     }
 }
 
@@ -329,6 +340,7 @@ public enum LTX2VideoError: Error, LocalizedError {
     case unsupportedPlatform
     case audioUnsupported(String)
     case resumeContextMissing
+    case recipeMismatch(accepted: String, executed: String)
 
     public var errorDescription: String? {
         switch self {
@@ -346,6 +358,8 @@ public enum LTX2VideoError: Error, LocalizedError {
             return "LTX-2 audio: \(why)"
         case .resumeContextMissing:
             return "LTX-2 resume: the checkpoint carries no render context — it cannot name the request to resume (#1479)."
+        case .recipeMismatch(let accepted, let executed):
+            return "LTX-2 recipe changed after admission (accepted \(accepted), executed \(executed))"
         }
     }
 }
@@ -1143,6 +1157,14 @@ public final class LTX2VideoGenerator {
             }
         }
         try validate(request)
+        if let acceptedHash = request.recipeHash {
+            let executedHash = try ResolvedVideoRecipe.build(
+                request: request, transformerFile: config.transformerFile).fingerprint()
+            guard executedHash == acceptedHash else {
+                throw LTX2VideoError.recipeMismatch(
+                    accepted: acceptedHash, executed: executedHash)
+            }
+        }
 
         // #1479: the continuation the resume came in with, READ-ONLY from here
         // on. Each checkpoint gets its own fresh box (below), so a render that
@@ -1234,7 +1256,8 @@ public final class LTX2VideoGenerator {
         // the pipeline so render code reads it instead of raw env (Codex
         // finding #14). Request/preset tuning joins in the wire-format
         // increment; until then this resolves configFile > env > builtin.
-        let typedConfig = LTX2ConfigResolver.resolveTyped(request: request.tuning, preset: request.presetTuning)
+        let typedConfig = request.resolvedConfigSnapshot
+            ?? LTX2ConfigResolver.resolveTyped(request: request.tuning, preset: request.presetTuning)
         pipeline.resolvedConfig = typedConfig
         // comfybox#307 (review r1): unconditionally reset — `pipeline
         // .lastRefineSkipReason` is now scoped to THIS render() invocation
@@ -1562,6 +1585,7 @@ public final class LTX2VideoGenerator {
                         guidance: request.guidance,
                         negativeInputIds: negBatch?.inputIds,
                         negativeAttentionMask: negBatch?.attentionMask,
+                        beatSchedule: resolvedBeats,
                         preemption: preemption, telemetry: telemetry,
                         resume: chunkResume, chunkIndex: chunk,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
@@ -1591,6 +1615,7 @@ public final class LTX2VideoGenerator {
                         guidance: request.guidance,
                         negativeInputIds: negBatch?.inputIds,
                         negativeAttentionMask: negBatch?.attentionMask,
+                        beatSchedule: resolvedBeats,
                         preemption: preemption, telemetry: telemetry,
                         resume: chunkResume, chunkIndex: chunk,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
@@ -1608,6 +1633,7 @@ public final class LTX2VideoGenerator {
                         refineAnchorImage: chunk == 0 ? refineAnchorImage : nil,
                         audioSeconds: wantAudio && chunk == 0
                             ? Float(request.framesPerChunk) / Float(request.fps) : nil,
+                        beatSchedule: resolvedBeats,
                         preemption: preemption, telemetry: telemetry,
                         resume: chunkResume, chunkIndex: chunk,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
