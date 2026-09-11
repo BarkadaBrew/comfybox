@@ -45,7 +45,9 @@ expect LTX2_NAG_SCALE 11.0
 expect LTX2_NAG_ALPHA 0.25
 expect LTX2_NAG_TAU 2.5
 expect LTX2_I2V_COMPRESSION 22
-expect LTX2_COLOR_ANCHOR 1.0
+# Todd 2026-09-11: color anchoring produced veiled color ghosts in high-motion
+# areas. Keep it disabled while the lower 0.8 reasoning-LoRA soak is evaluated.
+expect LTX2_COLOR_ANCHOR 0
 expect LTX2_AUDIO_TARGET_DB -24
 
 upsampler=$(read_value LTX2_UPSAMPLER_PATH)
