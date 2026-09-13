@@ -204,6 +204,9 @@ public struct LTX2VideoResult: Sendable {
     /// was requested for this render — nil when it ran, wasn't requested, or
     /// (montage/storyboard assembly) doesn't apply. See `LTX2RefineGate`.
     public let refineSkippedReason: String?
+    /// Audio was requested but its decode failed; the clip is video-only.
+    /// Mirrors `generationRecord.audioError` for callers that don't parse the record.
+    public let audioError: String?
     /// comfybox#401: the record written to the sidecar (and, when encodable,
     /// the mp4 atom) for this render. `nil` for the montage/storyboard
     /// assembly result (`WarmServer.runStoryboard`), which composes
@@ -228,8 +231,10 @@ public struct LTX2VideoResult: Sendable {
         outputPath: String, frameCount: Int, durationSeconds: Float, elapsedSeconds: Double,
         refineSkippedReason: String? = nil, generationRecord: VideoGenerationRecord? = nil,
         outputWidth: Int = 0, outputHeight: Int = 0,
-        refineApplied: Bool = false, refineScale: Float = 1.0
+        refineApplied: Bool = false, refineScale: Float = 1.0,
+        audioError: String? = nil
     ) {
+        self.audioError = audioError
         self.outputPath = outputPath
         self.frameCount = frameCount
         self.durationSeconds = durationSeconds
@@ -1168,7 +1173,8 @@ public final class LTX2VideoGenerator {
         try validate(request)
         if let acceptedHash = request.recipeHash {
             let executedHash = try ResolvedVideoRecipe.build(
-                request: request, transformerFile: config.transformerFile).fingerprint()
+                request: request, transformerFile: config.transformerFile,
+                weightsDir: config.weightsDir, gemmaPath: config.gemmaPath, engineBuild: BuildInfo.gitSHA).fingerprint()
             guard executedHash == acceptedHash else {
                 throw LTX2VideoError.recipeMismatch(
                     accepted: acceptedHash, executed: executedHash)
@@ -1268,6 +1274,7 @@ public final class LTX2VideoGenerator {
         let typedConfig = request.resolvedConfigSnapshot
             ?? LTX2ConfigResolver.resolveTyped(request: request.tuning, preset: request.presetTuning)
         pipeline.resolvedConfig = typedConfig
+        pipeline.requestFps = request.fps
         // comfybox#307 (review r1): unconditionally reset — `pipeline
         // .lastRefineSkipReason` is now scoped to THIS render() invocation
         // only (it may be a brand-new pipeline instance after an eviction, or
@@ -1793,6 +1800,7 @@ public final class LTX2VideoGenerator {
         // reference-parity codec chain, muxed as AAC. Decode failure degrades
         // to a video-only file rather than failing the render.
         var audioTrack: LTX2PostProcess.AudioTrack? = nil
+        var audioError: String? = nil
         if let al = audioLatents {
             // comfybox#322: audio decode (VAE + BigVGAN/BWE vocoder) is a
             // single multi-second tensor pass with no inner loop, so this is
@@ -1845,7 +1853,12 @@ public final class LTX2VideoGenerator {
                     logger.info("LTX-2 audio: decoded \(clamped.dim(1)) samples (\(String(format: "%.2f", Double(clamped.dim(1)) / Double(audioSR)))s stereo @\(audioSR)Hz).")
                 }
             } catch {
-                logger.error("LTX-2 audio: decode failed (\(error)) — writing video-only output.")
+                // Codex review 2026-09-13: the job used to succeed as video-only
+                // with nothing but a log line — the daemon's audibility gate
+                // then re-rendered it. The failure now rides the result and
+                // the record (`audio_error`) so callers can decide.
+                audioError = "\(error)"
+                logger.error("LTX-2 audio: decode failed (\(error)) — writing video-only output (audio_error recorded).")
             }
         }
 
@@ -1876,6 +1889,8 @@ public final class LTX2VideoGenerator {
             refineSkippedReason: refineSkippedReason,
             temporalUpscale: temporalFactor == 2 ? 2 : nil,
             outputFps: temporalFactor == 2 ? outputFps : nil,
+            weightsDir: config.weightsDir, gemmaPath: config.gemmaPath, engineBuild: BuildInfo.gitSHA,
+            audioError: audioError,
             audioWritten: audioTrack != nil,
             configGuidance: pipeline.config.guidance,
             actualSteps: pipeline.resolvedConfig.stage1SigmasOrNil.map { $0.count - 1 }
@@ -1963,7 +1978,8 @@ public final class LTX2VideoGenerator {
             outputWidth: encodedDims.width, outputHeight: encodedDims.height,
             refineApplied: pipeline.resolvedConfig.twoStage && refineSkippedReason == nil,
             refineScale: pipeline.resolvedConfig.refineScale
-        ))
+        ,
+            audioError: audioError))
         #else
         throw LTX2VideoError.unsupportedPlatform
         #endif

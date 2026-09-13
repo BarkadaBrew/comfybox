@@ -535,3 +535,31 @@ extension VideoGenerationRecordTests {
     XCTAssertEqual(VideoDimensionReason.default.rawValue, "default")
   }
 }
+
+// MARK: - Codex review 2026-09-13: resolved checkpoint identity + explicit audio error
+
+extension VideoGenerationRecordTests {
+  func testRecipeFingerprintChangesWithResolvedCheckpointIdentity() throws {
+    var req = LTX2VideoRequest(prompt: "p", outputPath: "/tmp/x.mp4")
+    req.resolvedConfigSnapshot = LTX2ConfigResolver.resolveTyped(request: nil, preset: nil, environment: [:], configFile: [:])
+    let a = try ResolvedVideoRecipe.build(request: req, transformerFile: "transformer-distilled")
+    let b = try ResolvedVideoRecipe.build(request: req, transformerFile: "transformer-distilled", weightsDir: "/models/pinkcherry-v18", gemmaPath: "/models/gemma", engineBuild: "abc123")
+    let c = try ResolvedVideoRecipe.build(request: req, transformerFile: "transformer-distilled", weightsDir: "/models/pinkcherry-v19", gemmaPath: "/models/gemma", engineBuild: "abc123")
+    XCTAssertEqual(a.version, 3)
+    XCTAssertNotEqual(try a.fingerprint(), try b.fingerprint(), "identity is part of the recipe")
+    XCTAssertNotEqual(try b.fingerprint(), try c.fingerprint(), "a monolith swap with the same filename changes the hash")
+    XCTAssertEqual(try b.fingerprint(), try ResolvedVideoRecipe.build(request: req, transformerFile: "transformer-distilled", weightsDir: "/models/pinkcherry-v18", gemmaPath: "/models/gemma", engineBuild: "abc123").fingerprint(), "deterministic")
+  }
+
+  func testRecordCarriesIdentityAndAudioErrorInSnakeCase() throws {
+    let rec = VideoGenerationRecord(
+      prompt: "p", model: "transformer-distilled", width: 704, height: 448, frames: 145, fps: 24,
+      weightsDir: "/models/pinkcherry-v18", gemma: "/models/gemma", engineBuild: "abc123", audioError: "vocoder failed",
+      resolvedWidth: 704, resolvedHeight: 448, twoPass: false, refine: false, audio: false, kind: "t2v")
+    let enc = JSONEncoder(); enc.keyEncodingStrategy = .convertToSnakeCase; enc.outputFormatting = [.withoutEscapingSlashes]
+    let json = String(decoding: try enc.encode(rec), as: UTF8.self)
+    for key in ["\"weights_dir\":\"/models/pinkcherry-v18\"", "\"gemma\":\"/models/gemma\"", "\"engine_build\":\"abc123\"", "\"audio_error\":\"vocoder failed\"", "\"audio\":false"] {
+      XCTAssertTrue(json.contains(key), "missing \(key) in \(json)")
+    }
+  }
+}

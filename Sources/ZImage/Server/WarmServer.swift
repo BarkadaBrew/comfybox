@@ -2356,6 +2356,9 @@ public final class WarmServer {
     let landscape: (Int, Int)
     switch res {
     case "480p": landscape = (832, 480)
+    // Todd 2026-09-13 detail matrix: the 576p tier (896x576, multiples of 64)
+    // carried 380 px of real detail vs 287 at 480p's 704x448 for +80% time.
+    case "576p": landscape = (896, 576)
     case "720p": landscape = (1280, 720)
     case "1080p": landscape = (1920, 1080)
     default: return nil
@@ -3475,7 +3478,9 @@ public final class WarmServer {
       twoStageRequested: twoStageRequested,
       refineSkippedReasonHint: refineSkippedReasonHint)
     let recipe = try ResolvedVideoRecipe.build(
-      request: videoRequest, transformerFile: generator.config.transformerFile)
+      request: videoRequest, transformerFile: generator.config.transformerFile,
+      weightsDir: generator.config.weightsDir, gemmaPath: generator.config.gemmaPath,
+      engineBuild: BuildInfo.gitSHA)
     let recipeHash = try recipe.fingerprint()
     videoRequest.recipeHash = recipeHash
     // Validate before enqueuing so bad frames/dims fail fast.

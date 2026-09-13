@@ -99,3 +99,14 @@ final class LTX2TemporalUpsamplerTests: XCTestCase {
     XCTAssertLessThan(relErr(out, taps["out"]!), 4e-2, "callAsFunction end to end")
   }
 }
+
+// MARK: - Codex review 2026-09-13: conditioning fps follows the request's generation fps
+
+extension LTX2TemporalUpsamplerTests {
+  func testConditioningFpsDefaultsToRequestFpsWithCondFpsAsOverride() {
+    XCTAssertEqual(LTX2Pipeline.conditioningFps(latF: 19, condFps: nil, requestFps: 30, configFps: 24), 30, "a 30 fps request conditions at 30")
+    XCTAssertEqual(LTX2Pipeline.conditioningFps(latF: 19, condFps: nil, requestFps: nil, configFps: 24), 24, "no request fps → pipeline default")
+    XCTAssertEqual(LTX2Pipeline.conditioningFps(latF: 19, condFps: 12, requestFps: 30, configFps: 24), 12, "cond_fps stays the explicit motion dial")
+    XCTAssertEqual(LTX2Pipeline.conditioningFps(latF: 1, condFps: 12, requestFps: 30, configFps: 24), 1, "a still is conditioned at 1")
+  }
+}

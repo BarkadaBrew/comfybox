@@ -67,6 +67,14 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
   /// what a replay must send). With the temporal upscaler on, the FILE is
   /// muxed at `outputFps` (fps x 2) and `frames` counts the upscaled frames.
   public let fps: Int
+  /// Resolved checkpoint identity (Codex review 2026-09-13): the weights
+  /// directory, Gemma snapshot and engine build that produced this clip —
+  /// `model` alone is a filename shared across monolith swaps.
+  public let weightsDir: String?
+  public let gemma: String?
+  public let engineBuild: String?
+  /// Audio was requested but the decode failed; the clip is video-only.
+  public let audioError: String?
   /// ltx-2.3 temporal upscaler factor when it ran (2); nil when off.
   public let temporalUpscale: Int?
   /// The muxed frame rate when it differs from `fps` (temporal upscaler on).
@@ -140,6 +148,7 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     guidance: Float? = nil,
     model: String, engine: String? = nil, width: Int, height: Int, frames: Int, fps: Int,
     temporalUpscale: Int? = nil, outputFps: Int? = nil,
+    weightsDir: String? = nil, gemma: String? = nil, engineBuild: String? = nil, audioError: String? = nil,
     resolvedWidth: Int, resolvedHeight: Int, dimensionReason: String? = nil,
     twoPass: Bool, refine: Bool, refineSkippedReason: String? = nil, audio: Bool,
     sampler: String? = nil, stage1Sigmas: [Float]? = nil, refineSigmas: [Float]? = nil,
@@ -162,6 +171,10 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     self.fps = fps
     self.temporalUpscale = temporalUpscale
     self.outputFps = outputFps
+    self.weightsDir = weightsDir
+    self.gemma = gemma
+    self.engineBuild = engineBuild
+    self.audioError = audioError
     self.resolvedWidth = resolvedWidth
     self.resolvedHeight = resolvedHeight
     self.dimensionReason = dimensionReason
@@ -241,6 +254,10 @@ extension VideoGenerationRecord {
     refineSkippedReason: String?,
     temporalUpscale: Int? = nil,
     outputFps: Int? = nil,
+    weightsDir: String? = nil,
+    gemmaPath: String? = nil,
+    engineBuild: String? = nil,
+    audioError: String? = nil,
     audioWritten: Bool,
     configGuidance: Float,
     actualSteps: Int? = nil,
@@ -266,6 +283,10 @@ extension VideoGenerationRecord {
       fps: request.fps,
       temporalUpscale: temporalUpscale,
       outputFps: outputFps,
+      weightsDir: weightsDir,
+      gemma: gemmaPath,
+      engineBuild: engineBuild,
+      audioError: audioError,
       resolvedWidth: resolvedWidth,
       resolvedHeight: resolvedHeight,
       dimensionReason: request.dimensionReason,

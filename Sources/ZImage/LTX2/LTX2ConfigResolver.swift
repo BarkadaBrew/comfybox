@@ -40,6 +40,9 @@ public enum LTX2ConfigResolver {
     case boolNotZero
     case string
     case floatList
+    /// A sigma schedule: finite, within [0, 1], strictly decreasing (first ≤ 1,
+    /// last ≥ 0). Codex review 2026-09-13: `[1, 0.5, 0.75, 0]` was accepted.
+    case sigmaList
     case path
   }
 
@@ -59,8 +62,8 @@ public enum LTX2ConfigResolver {
     // Tier A — render-shaping
     Entry(name: "guidance_rescale", envKey: "LTX2_GUIDANCE_RESCALE", tier: "A", kind: .float(0...1), builtin: "0"),
     Entry(name: "cfg_schedule", envKey: "LTX2_CFG_SCHEDULE", tier: "A", kind: .floatList, builtin: ""),
-    Entry(name: "stage1_sigmas", envKey: "LTX2_STAGE1_SIGMAS", tier: "A", kind: .floatList, builtin: ""),
-    Entry(name: "refine_sigmas", envKey: "LTX2_REFINE_SIGMAS", tier: "A", kind: .floatList, builtin: ""),
+    Entry(name: "stage1_sigmas", envKey: "LTX2_STAGE1_SIGMAS", tier: "A", kind: .sigmaList, builtin: ""),
+    Entry(name: "refine_sigmas", envKey: "LTX2_REFINE_SIGMAS", tier: "A", kind: .sigmaList, builtin: ""),
     Entry(name: "two_stage", envKey: "LTX2_TWO_STAGE", tier: "A", kind: .boolExactOne, builtin: "false"),
     // ltx-2.3 temporal upscaler (2026-09-13): 2 doubles the latent frame count
     // right before decode (F -> 2F-1; 289 -> 577 pixel frames), delivered at
@@ -209,6 +212,20 @@ public enum LTX2ConfigResolver {
         return .reject("'\(p)' is not a finite number")
       }
       return .ok(parts.joined(separator: ","))
+    case .sigmaList:
+      let parts = trimmed.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+      if parts.isEmpty { return .ok("") }  // empty = "use the pipeline's built-in schedule"
+      var values: [Double] = []
+      for p in parts {
+        guard let v = Double(p), v.isFinite else { return .reject("'\(p)' is not a finite number") }
+        guard (0...1).contains(v) else { return .reject("sigma \(p) outside [0, 1]") }
+        values.append(v)
+      }
+      guard values.count >= 2 else { return .reject("a sigma schedule needs at least 2 values") }
+      for (a, b) in zip(values, values.dropFirst()) where b >= a {
+        return .reject("sigma schedule must be strictly decreasing (\(a) then \(b))")
+      }
+      return .ok(parts.joined(separator: ","))
     case .path:
       guard fileExists(trimmed) else { return .keepButFlag(trimmed, "path does not exist") }
       return .ok(trimmed)
@@ -345,6 +362,9 @@ public struct LTX2ResolvedVideoConfig: Sendable {
 
   public let provenance: [String: LTX2ParamSource]
   public var params: [LTX2ResolvedParam]
+  /// Request/preset overrides that failed validation and fell through
+  /// (name → reason). Empty when every override landed.
+  public var overrideRejections: [String: String] = [:]
 
   // Sampler-family helpers mirroring the legacy env conventions.
   public var samplerIsAncestral: Bool { sampler.lowercased().contains("ancestral") }
@@ -427,9 +447,42 @@ extension LTX2ConfigResolver {
     }
 
     /// request > preset for one field; records provenance on override.
+    /// Codex review 2026-09-13: overrides used to bypass the validation env
+    /// values get (cond_fps 0, non-monotonic sigmas were accepted). A typed
+    /// override is rendered to its wire string and run through the SAME
+    /// validator; a rejected value falls through to the next source and the
+    /// rejection is recorded on the readout row.
+    var overrideRejections: [String: String] = [:]
+    func render<T>(_ v: T) -> String {
+      // Typed picks arrive as Optional<T> for optional fields (cond_fps): unwrap
+      // before matching, or "Optional(0.0)" would be validated as text.
+      var any: Any = v
+      if case Optional<Any>.some(let inner) = any { any = inner }
+      switch any {
+      case let f as Float: return canonicalNumber(Double(f))
+      case let d as Double: return canonicalNumber(d)
+      case let i as Int: return String(i)
+      case let b as Bool: return b ? "1" : "0"
+      case let s as String: return s
+      case let l as [Float]: return l.map { canonicalNumber(Double($0)) }.joined(separator: ",")
+      default: return "\(v)"
+      }
+    }
+    func accepts<T>(_ name: String, _ v: T, from source: LTX2ParamSource) -> Bool {
+      // An optional field's `nil` (cond_fps: Float?) is "no override", not a
+      // value to validate — never record it as a rejection.
+      if case Optional<Any>.none = (v as Any) { return false }
+      guard let kind = registry.first(where: { $0.name == name })?.kind else { return true }
+      let rendered = render(v)
+      if case .reject(let why) = validate(rendered, raw: rendered, kind: kind, fileExists: fileExists) {
+        overrideRejections[name] = "\(source.rawValue) override '\(rendered)' rejected: \(why)"
+        return false
+      }
+      return true
+    }
     func pick<T>(_ name: String, _ base: T, _ presetV: T?, _ requestV: T?) -> T {
-      if let requestV { provenance[name] = .request; return requestV }
-      if let presetV { provenance[name] = .preset; return presetV }
+      if let requestV, accepts(name, requestV, from: .request) { provenance[name] = .request; return requestV }
+      if let presetV, accepts(name, presetV, from: .preset) { provenance[name] = .preset; return presetV }
       return base
     }
 
@@ -477,12 +530,25 @@ extension LTX2ConfigResolver {
     // "verify your override landed" discipline (found via the tarn1 sigma
     // A/B: renders were correct, the log said env).
     config.params = base.map { row in
-      guard let src = provenance[row.name] else { return row }
+      let rejection = overrideRejections[row.name]
+      guard let src = provenance[row.name] else {
+        // No override landed; an override may still have been REJECTED here —
+        // say so on the row instead of silently showing the fallback.
+        guard let rejection else { return row }
+        return LTX2ResolvedParam(
+          name: row.name, envKey: row.envKey, tier: row.tier, value: row.value,
+          source: row.source, valid: row.valid,
+          note: [row.note, rejection].compactMap { $0 }.joined(separator: "; "))
+      }
       return LTX2ResolvedParam(
         name: row.name, envKey: row.envKey, tier: row.tier,
         value: config.valueString(for: row.name) ?? row.value,
-        source: src, valid: row.valid, note: row.note)
+        source: src, valid: row.valid,
+        note: [row.note, rejection].compactMap { $0 }.joined(separator: "; ").nilIfEmpty)
     }
+    config.overrideRejections = overrideRejections
     return config
   }
 }
+
+extension String { fileprivate var nilIfEmpty: String? { isEmpty ? nil : self } }
