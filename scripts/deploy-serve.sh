@@ -105,6 +105,14 @@ done
 (( waited < DRAIN_TIMEOUT )) || fail "render still active after ${DRAIN_TIMEOUT}s; current binary was not switched"
 
 prev=$(readlink "$BIN_DIR/current" 2>/dev/null || echo none)
+# 2026-09-13: a render that JUST finished is not delivered yet — the daemon
+# polls /v1/video/status every 5s and then scp's the file. Restarting the
+# instant the active slot clears wipes the in-memory job tracker before that
+# poll lands (the daemon then reports "lost by ComfyBox" and re-renders, and
+# the finished clip goes to Recovered). Give the client a grace window.
+DELIVERY_GRACE=${DEPLOY_DELIVERY_GRACE:-45}
+say "   drained; waiting ${DELIVERY_GRACE}s for the client to collect the last result before restart"
+sleep "$DELIVERY_GRACE"
 ln -sfn "ComfyBox-$sha" "$BIN_DIR/current"
 say "   current -> ComfyBox-$sha (previous: $prev)"
 
