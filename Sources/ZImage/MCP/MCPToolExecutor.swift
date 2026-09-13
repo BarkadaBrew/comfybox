@@ -730,6 +730,9 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let fps = params?.integer("fps") {
       body["fps"] = fps
     }
+    if let temporalUpscale = params?.integer("temporal_upscale") {
+      body["temporal_upscale"] = temporalUpscale
+    }
     if let attemptId = params?.string("optimization_attempt_id") {
       body["optimization_attempt_id"] = attemptId
     }

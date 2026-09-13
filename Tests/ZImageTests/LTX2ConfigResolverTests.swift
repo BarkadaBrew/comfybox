@@ -246,3 +246,25 @@ extension LTX2ConfigResolverTests {
     XCTAssertEqual(resolved.provenance["two_stage"], .request)
   }
 }
+
+// MARK: - ltx-2.3 temporal upscaler (2026-09-13)
+
+extension LTX2ConfigResolverTests {
+  func testTemporalUpscaleResolvesOffByDefaultAndFollowsPrecedence() {
+    let off = LTX2ConfigResolver.resolveTyped(request: nil, preset: nil, environment: [:], configFile: [:])
+    XCTAssertEqual(off.temporalUpscale, 1, "off unless asked")
+    XCTAssertEqual(off.temporalUpsamplerPath, "")
+
+    var request = LTX2VideoTuning(); request.temporalUpscale = 2
+    let on = LTX2ConfigResolver.resolveTyped(
+      request: request, preset: nil,
+      environment: ["LTX2_TEMPORAL_UPSAMPLER_PATH": "/tmp/nope.safetensors"], configFile: [:])
+    XCTAssertEqual(on.temporalUpscale, 2)
+    XCTAssertEqual(on.provenance["temporal_upscale"], .request)
+    XCTAssertEqual(on.temporalUpsamplerPath, "/tmp/nope.safetensors")
+    XCTAssertTrue(on.params.contains { $0.name == "temporal_upscale" && $0.value == "2" }, "reported in the resolved-config list")
+
+    let bad = LTX2ConfigResolver.resolveTyped(request: nil, preset: nil, environment: ["LTX2_TEMPORAL_UPSCALE": "3"], configFile: [:])
+    XCTAssertEqual(bad.temporalUpscale, 1, "3 is out of range (1...2) → builtin")
+  }
+}

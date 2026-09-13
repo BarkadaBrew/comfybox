@@ -160,6 +160,9 @@ public final class LTX2Pipeline {
 
   /// Optional latent upsampler for two-stage pipeline.
   public var upsampler: LTX2LatentUpsampler?  // var: lazy-loaded on first two_stage request (finding #18)
+  /// ltx-2.3 temporal upscaler (2026-09-13); lazy-loaded on the first
+  /// request that resolves `temporal_upscale: 2`, same pattern as `upsampler`.
+  public var temporalUpsampler: LTX2LatentUpsampler?
 
   /// Logger.
   private let logger: Logger
@@ -752,7 +755,7 @@ public final class LTX2Pipeline {
     // Step 7: Decode latents via VAE
     logger.info("Decoding latents via VAE...")
     telemetry?.begin(.vaeDecode)
-    let decoded = try decodeAdaptive(latents)
+    let decoded = try decodeAdaptive(temporalUpscaleIfRequested(latents))
     eval(decoded)
 
     // Convert from [-1, 1] to [0, 1] range (VAE outputs centered at 0)
@@ -766,7 +769,7 @@ public final class LTX2Pipeline {
 
     var output = LTX2PipelineOutput(
       decoded: clamped,
-      numFrames: numFrames,
+      numFrames: clamped.dim(2),
       width: width,
       height: height,
       elapsedSeconds: elapsed
@@ -942,7 +945,7 @@ public final class LTX2Pipeline {
     // Decode latents via VAE
     logger.info("Decoding latents via VAE...")
     telemetry?.begin(.vaeDecode)
-    let decoded = try decodeAdaptive(latents)
+    let decoded = try decodeAdaptive(temporalUpscaleIfRequested(latents))
     eval(decoded)
 
     // Convert from [-1, 1] to [0, 1] range (VAE outputs centered at 0)
@@ -956,7 +959,7 @@ public final class LTX2Pipeline {
 
     return .completed(LTX2PipelineOutput(
       decoded: clamped,
-      numFrames: numFrames,
+      numFrames: clamped.dim(2),
       width: width,
       height: height,
       elapsedSeconds: elapsed
@@ -1344,7 +1347,7 @@ public final class LTX2Pipeline {
     // Step 7: Decode
     logger.info("Decoding latents via VAE...")
     telemetry?.begin(.vaeDecode)
-    let decoded = try decodeAdaptive(latents)
+    let decoded = try decodeAdaptive(temporalUpscaleIfRequested(latents))
     eval(decoded)
 
     let rescaled = (decoded.asType(.float32) + 1.0) / 2.0
@@ -1357,7 +1360,7 @@ public final class LTX2Pipeline {
 
     var output = LTX2PipelineOutput(
       decoded: clamped,
-      numFrames: numFrames,
+      numFrames: clamped.dim(2),
       width: width,
       height: height,
       elapsedSeconds: elapsed
@@ -1640,7 +1643,7 @@ public final class LTX2Pipeline {
     // Step 7: Decode
     logger.info("Decoding latents via VAE...")
     telemetry?.begin(.vaeDecode)
-    let decoded = try decodeAdaptive(refinedLatents)
+    let decoded = try decodeAdaptive(temporalUpscaleIfRequested(refinedLatents))
     eval(decoded)
 
     let rescaled = (decoded.asType(.float32) + 1.0) / 2.0
@@ -1653,7 +1656,7 @@ public final class LTX2Pipeline {
 
     return .completed(LTX2PipelineOutput(
       decoded: clamped,
-      numFrames: numFrames,
+      numFrames: clamped.dim(2),
       width: width,
       height: height,
       elapsedSeconds: elapsed
@@ -2294,6 +2297,35 @@ public final class LTX2Pipeline {
   /// normal clips, exact streamed decode above the safety gate. Mode switch:
   /// LTX2_DECODE_MODE=auto|stream|tile|plain. Threshold tunable
   /// via LTX2_PLAIN_DECODE_MAX_LATF (latent frames; ~8x fewer than output frames).
+  /// ltx-2.3 temporal upscaler (design 2026-09-13): when the resolved config
+  /// asks for `temporal_upscale: 2` and the weights are loaded, double the
+  /// latent frame count (F -> 2F-1) on UN-normalized latents right before the
+  /// decode. Decode-only — no second denoise — so a same-latent A/B judges
+  /// the upscaler alone. The caller muxes at fps x 2 (`LTX2VideoGenerator`
+  /// reads `temporalUpscaleFactor`). Requested-but-unloaded logs and renders
+  /// at 24 (never a silent half-speed clip: the factor reports 1 then).
+  func temporalUpscaleIfRequested(_ latents: MLXArray) -> MLXArray {
+    guard resolvedConfig.temporalUpscale == 2 else { return latents }
+    guard let temporal = temporalUpsampler, temporal.mode == .temporal2x else {
+      logger.warning("temporal_upscale=2 requested but no temporal upsampler is loaded (temporal_upsampler_path?) — rendering at the base frame rate.")
+      return latents
+    }
+    let latF = latents.dim(2)
+    logger.info("Temporal upscale: \(latF) -> \(2 * latF - 1) latent frames (ltx-2.3-temporal-upscaler-x2)...")
+    let stats = vae.decoder.perChannelStatistics
+    let denorm = stats.unNormalize(latents.asType(.float32))
+    let up = temporal(denorm)
+    let out = stats.normalize(up).asType(latents.dtype)
+    eval(out)
+    return out
+  }
+
+  /// 2 when the NEXT decode will double the frame count, else 1 — the mux fps
+  /// and duration multiplier for `LTX2VideoGenerator`.
+  public var temporalUpscaleFactor: Int {
+    (resolvedConfig.temporalUpscale == 2 && temporalUpsampler?.mode == .temporal2x) ? 2 : 1
+  }
+
   private func decodeAdaptive(_ latents: MLXArray) throws -> MLXArray {
     let latF = latents.dim(2)
     let latH = latents.dim(3)

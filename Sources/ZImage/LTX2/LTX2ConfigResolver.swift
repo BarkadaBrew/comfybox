@@ -62,6 +62,10 @@ public enum LTX2ConfigResolver {
     Entry(name: "stage1_sigmas", envKey: "LTX2_STAGE1_SIGMAS", tier: "A", kind: .floatList, builtin: ""),
     Entry(name: "refine_sigmas", envKey: "LTX2_REFINE_SIGMAS", tier: "A", kind: .floatList, builtin: ""),
     Entry(name: "two_stage", envKey: "LTX2_TWO_STAGE", tier: "A", kind: .boolExactOne, builtin: "false"),
+    // ltx-2.3 temporal upscaler (2026-09-13): 2 doubles the latent frame count
+    // right before decode (F -> 2F-1; 289 -> 577 pixel frames), delivered at
+    // fps x 2. Latent-space, decode-only — no second denoise. 1 = off.
+    Entry(name: "temporal_upscale", envKey: "LTX2_TEMPORAL_UPSCALE", tier: "A", kind: .int(1...2), builtin: "1"),
     // Refine the AUDIO track on the second pass as well as the video. Was
     // ProcessInfo-only (LTX2_AUDIO_REFINE=1), so it could not be set per
     // render — only globally, with an engine restart. Tier A so it can ride
@@ -104,6 +108,7 @@ public enum LTX2ConfigResolver {
     Entry(name: "decode_mode", envKey: "LTX2_DECODE_MODE", tier: "B", kind: .string, builtin: "auto"),
     Entry(name: "decode_tile", envKey: "LTX2_DECODE_TILE", tier: "B", kind: .string, builtin: ""),
     Entry(name: "upsampler_path", envKey: "LTX2_UPSAMPLER_PATH", tier: "B", kind: .path, builtin: ""),
+    Entry(name: "temporal_upsampler_path", envKey: "LTX2_TEMPORAL_UPSAMPLER_PATH", tier: "B", kind: .path, builtin: ""),
     Entry(name: "video_bits_per_px", envKey: "LTX2_VIDEO_BITS_PER_PX", tier: "B", kind: .float(0.01...20), builtin: "0.5"),
   ]
 
@@ -242,6 +247,8 @@ public struct LTX2VideoTuning: Codable, Sendable, Equatable {
   public var stage1Sigmas: [Float]?
   public var refineSigmas: [Float]?
   public var twoStage: Bool?
+  /// ltx-2.3 temporal upscaler: 2 = double the frame rate in latent space. 1/nil = off.
+  public var temporalUpscale: Int?
   public var audioRefine: Bool?
   public var condFps: Float?
   public var imgCompression: Int?
@@ -274,10 +281,18 @@ public struct LTX2VideoTuning: Codable, Sendable, Equatable {
   /// on conflict. `twoPass == nil` (absent or explicit JSON `null`) changes
   /// nothing: `base` is returned untouched, deferring to whatever
   /// `tuning.two_stage`/preset/configFile/env/builtin would already resolve.
-  public static func merging(_ base: LTX2VideoTuning?, twoPass: Bool?) -> LTX2VideoTuning? {
-    guard let twoPass, base?.twoStage == nil else { return base }
-    var merged = base ?? LTX2VideoTuning()
-    merged.twoStage = twoPass
+  public static func merging(_ base: LTX2VideoTuning?, twoPass: Bool?, temporalUpscale: Int? = nil) -> LTX2VideoTuning? {
+    var merged = base
+    if let twoPass, base?.twoStage == nil {
+      merged = merged ?? LTX2VideoTuning()
+      merged!.twoStage = twoPass
+    }
+    // Same convenience rule for the top-level `temporal_upscale`: the nested
+    // `tuning.temporal_upscale` is the more specific one and wins.
+    if let temporalUpscale, base?.temporalUpscale == nil {
+      merged = merged ?? LTX2VideoTuning()
+      merged!.temporalUpscale = temporalUpscale
+    }
     return merged
   }
 }
@@ -293,6 +308,8 @@ public struct LTX2ResolvedVideoConfig: Sendable {
   public let stage1Sigmas: [Float]
   public let refineSigmas: [Float]
   public let twoStage: Bool
+  /// 2 = temporal upscaler on (F latent frames -> 2F-1 before decode). 1 = off.
+  public let temporalUpscale: Int
   public let audioRefine: Bool
   public let condFps: Float?          // nil = model default fps
   public let imgCompression: Int
@@ -323,6 +340,7 @@ public struct LTX2ResolvedVideoConfig: Sendable {
   public let decodeMode: String
   public let decodeTile: String
   public let upsamplerPath: String
+  public let temporalUpsamplerPath: String
   public let videoBitsPerPx: Double
 
   public let provenance: [String: LTX2ParamSource]
@@ -356,6 +374,7 @@ public struct LTX2ResolvedVideoConfig: Sendable {
     case "stage1_sigmas": return stage1Sigmas.map(fmt).joined(separator: ",")
     case "refine_sigmas": return refineSigmas.map(fmt).joined(separator: ",")
     case "two_stage": return twoStage ? "true" : "false"
+    case "temporal_upscale": return String(temporalUpscale)
     case "audio_refine": return audioRefine ? "true" : "false"
     case "cond_fps": return condFps.map(fmt) ?? "model"
     case "img_compression": return String(imgCompression)
@@ -422,6 +441,7 @@ extension LTX2ConfigResolver {
       stage1Sigmas: pick("stage1_sigmas", list("stage1_sigmas"), preset?.stage1Sigmas, request?.stage1Sigmas),
       refineSigmas: pick("refine_sigmas", list("refine_sigmas"), preset?.refineSigmas, request?.refineSigmas),
       twoStage: pick("two_stage", b("two_stage"), preset?.twoStage, request?.twoStage),
+      temporalUpscale: pick("temporal_upscale", i("temporal_upscale"), preset?.temporalUpscale, request?.temporalUpscale),
       audioRefine: pick("audio_refine", b("audio_refine"), preset?.audioRefine, request?.audioRefine),
       condFps: pick("cond_fps", condFpsBase, preset?.condFps, request?.condFps),
       imgCompression: pick("img_compression", i("img_compression"), preset?.imgCompression, request?.imgCompression),
@@ -446,6 +466,7 @@ extension LTX2ConfigResolver {
       decodeMode: str("decode_mode"),
       decodeTile: str("decode_tile"),
       upsamplerPath: str("upsampler_path"),
+      temporalUpsamplerPath: str("temporal_upsampler_path"),
       videoBitsPerPx: Double(str("video_bits_per_px")) ?? 0.5,
       provenance: provenance,
       params: base

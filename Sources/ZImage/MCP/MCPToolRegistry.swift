@@ -631,6 +631,10 @@ public enum MCPToolRegistry {
           "type": "integer",
           "description": "Generation frame-rate basis (default 24). Lower = slower on-screen motion per generated frame; duration maps onto the frame grid at this rate.",
         ] as [String: Any],
+        "temporal_upscale": [
+          "type": "integer",
+          "description": "ltx-2.3 temporal upscaler: 2 doubles the frame rate in latent space before decode (24 -> 48 fps, same duration, same audio; decode ~2x). 1/omitted = off.",
+        ] as [String: Any],
         "enhance": [
           "type": "boolean",
           "description": "Whether the server should optimize the prompt (default true). Send FALSE when the caller has ALREADY run its own prompt optimizer — a second rewrite drifts the prompt away from concrete staging (limb placement, figure count) and double-injects the character description.",

@@ -1285,6 +1285,20 @@ public final class LTX2VideoGenerator {
            FileManager.default.fileExists(atPath: typedConfig.upsamplerPath) {
             pipeline.upsampler = Self.loadUpsampler(path: typedConfig.upsamplerPath, logger: logger)
         }
+        // Same lazy pattern for the ltx-2.3 temporal upscaler (2026-09-13).
+        // A checkpoint that is not the temporal variant is refused here so a
+        // spatial file at this path can never double the frame rate by error.
+        if typedConfig.temporalUpscale == 2, pipeline.temporalUpsampler == nil,
+           !typedConfig.temporalUpsamplerPath.isEmpty,
+           FileManager.default.fileExists(atPath: typedConfig.temporalUpsamplerPath) {
+            if let up = Self.loadUpsampler(path: typedConfig.temporalUpsamplerPath, logger: logger) {
+                if up.mode == .temporal2x {
+                    pipeline.temporalUpsampler = up
+                } else {
+                    logger.error("LTX-2: temporal_upsampler_path is a \(up.mode.rawValue) checkpoint — temporal upscale stays OFF")
+                }
+            }
+        }
         let summary = resolved.map { "\($0.name)=\($0.value)(\($0.source.rawValue))" }.joined(separator: " ")
         logger.info("[LTX2] effective-config: \(summary)")
         for p in resolved where !p.valid {
@@ -1770,6 +1784,10 @@ public final class LTX2VideoGenerator {
         // all the refine detail. framesToImages carries per-frame dims.
         let outW = allFrames.first?.width ?? request.width
         let outH = allFrames.first?.height ?? request.height
+        // ltx-2.3 temporal upscaler: the decode produced 2F-1 frames, so the
+        // clip is muxed and timed at fps x 2 (same duration, same audio).
+        let temporalFactor = pipeline.temporalUpscaleFactor
+        let outputFps = request.fps * temporalFactor
 
         // Audio decode (task #21): final audio latents -> 48kHz stereo via the
         // reference-parity codec chain, muxed as AAC. Decode failure degrades
@@ -1811,7 +1829,7 @@ public final class LTX2VideoGenerator {
                     // Trim to the actual video duration (ceil(s*25) latent
                     // quantization overshoots; Codex #8). Shorter audio is
                     // left as-is — AAC tolerates a short tail.
-                    let videoSamples = Int((Double(allFrames.count) / Double(request.fps) * Double(audioSR)).rounded(.up))
+                    let videoSamples = Int((Double(allFrames.count) / Double(outputFps) * Double(audioSR)).rounded(.up))
                     if clamped.dim(1) > videoSamples {
                         clamped = clamped[0..., 0..<videoSamples]
                     }
@@ -1856,6 +1874,8 @@ public final class LTX2VideoGenerator {
             resolvedHeight: deliveredH,
             twoStageRequested: request.twoStageRequested ?? pipeline.resolvedConfig.twoStage,
             refineSkippedReason: refineSkippedReason,
+            temporalUpscale: temporalFactor == 2 ? 2 : nil,
+            outputFps: temporalFactor == 2 ? outputFps : nil,
             audioWritten: audioTrack != nil,
             configGuidance: pipeline.config.guidance,
             actualSteps: pipeline.resolvedConfig.stage1SigmasOrNil.map { $0.count - 1 }
@@ -1909,7 +1929,7 @@ public final class LTX2VideoGenerator {
             try Task.checkCancellation()
             try LTX2PostProcess.writeMP4(
                 frames: allFrames, outputPath: request.outputPath,
-                fps: request.fps, width: outW, height: outH,
+                fps: outputFps, width: outW, height: outH,
                 bitsPerPixelOverride: pipeline.resolvedConfig.videoBitsPerPx,
                 audio: audioTrack,
                 deliveryShortEdge: pipeline.resolvedConfig.deliveryShortEdge,
@@ -1928,7 +1948,7 @@ public final class LTX2VideoGenerator {
         return .completed(LTX2VideoResult(
             outputPath: request.outputPath,
             frameCount: allFrames.count,
-            durationSeconds: Float(allFrames.count) / Float(request.fps),
+            durationSeconds: Float(allFrames.count) / Float(outputFps),
             // #1479: RENDER time, summed across segments — wall clock from a
             // single start would bill the preemptor's runtime to this render.
             elapsedSeconds: ctx.accumulatedSeconds + max(0, CFAbsoluteTimeGetCurrent() - segmentStart),

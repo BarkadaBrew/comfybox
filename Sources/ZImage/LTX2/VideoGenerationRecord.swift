@@ -63,7 +63,14 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
   public let height: Int
 
   public let frames: Int
+  /// Generation frame-rate basis (what the model was conditioned on and
+  /// what a replay must send). With the temporal upscaler on, the FILE is
+  /// muxed at `outputFps` (fps x 2) and `frames` counts the upscaled frames.
   public let fps: Int
+  /// ltx-2.3 temporal upscaler factor when it ran (2); nil when off.
+  public let temporalUpscale: Int?
+  /// The muxed frame rate when it differs from `fps` (temporal upscaler on).
+  public let outputFps: Int?
   /// Actual encoded pixel dimensions. With two-stage refine on, this is the
   /// 2x-refined size, not `width`/`height` (`LTX2VideoGenerator.render` uses
   /// the decoded frame dims for exactly this reason — see its comment above
@@ -132,6 +139,7 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     requestedSteps: Int? = nil,
     guidance: Float? = nil,
     model: String, engine: String? = nil, width: Int, height: Int, frames: Int, fps: Int,
+    temporalUpscale: Int? = nil, outputFps: Int? = nil,
     resolvedWidth: Int, resolvedHeight: Int, dimensionReason: String? = nil,
     twoPass: Bool, refine: Bool, refineSkippedReason: String? = nil, audio: Bool,
     sampler: String? = nil, stage1Sigmas: [Float]? = nil, refineSigmas: [Float]? = nil,
@@ -152,6 +160,8 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     self.height = height
     self.frames = frames
     self.fps = fps
+    self.temporalUpscale = temporalUpscale
+    self.outputFps = outputFps
     self.resolvedWidth = resolvedWidth
     self.resolvedHeight = resolvedHeight
     self.dimensionReason = dimensionReason
@@ -229,6 +239,8 @@ extension VideoGenerationRecord {
     resolvedHeight: Int,
     twoStageRequested: Bool,
     refineSkippedReason: String?,
+    temporalUpscale: Int? = nil,
+    outputFps: Int? = nil,
     audioWritten: Bool,
     configGuidance: Float,
     actualSteps: Int? = nil,
@@ -252,6 +264,8 @@ extension VideoGenerationRecord {
       height: request.height,
       frames: frameCount,
       fps: request.fps,
+      temporalUpscale: temporalUpscale,
+      outputFps: outputFps,
       resolvedWidth: resolvedWidth,
       resolvedHeight: resolvedHeight,
       dimensionReason: request.dimensionReason,
