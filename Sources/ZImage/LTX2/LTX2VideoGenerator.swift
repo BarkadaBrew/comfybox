@@ -1014,11 +1014,20 @@ public final class LTX2VideoGenerator {
     /// loudly — when the file's keys do not bind the module completely: a
     /// partially bound upsampler renders a periodic mesh (2026-08-01).
     static func loadUpsampler(path: String, logger: Logger) -> LTX2LatentUpsampler? {
-        let up = LTX2LatentUpsampler()
-        guard let w = try? MLX.loadArrays(url: URL(fileURLWithPath: path)) else {
+        // The checkpoint's embedded `config` names the variant (spatial x2 mid
+        // 1024 vs temporal x2 mid 512 — ltx-2.3-temporal-upscaler-x2, 2026-09-13).
+        // A checkpoint without metadata is the spatial upscaler (the only kind
+        // this loader knew before).
+        let url = URL(fileURLWithPath: path)
+        guard let (w, meta) = try? MLX.loadArraysAndMetadata(url: url) else {
             logger.error("LTX-2: upsampler file unreadable: \(path)")
             return nil
         }
+        guard let variant = LTX2LatentUpsampler.modeFromCheckpointConfig(meta["config"]) else {
+            logger.error("LTX-2: upsampler checkpoint config not supported (spatiotemporal or 2-D): \(meta["config"] ?? "")")
+            return nil
+        }
+        let up = LTX2LatentUpsampler(midChannels: variant.midChannels, mode: variant.mode)
         // Checkpoint stores conv weights in PyTorch layout (out, in, *spatial);
         // MLX conv layers are channels-last. Permute conv weights by ndim;
         // 1D params pass through untouched. Sequential index 0 renames to the
