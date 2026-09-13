@@ -268,3 +268,35 @@ extension LTX2ConfigResolverTests {
     XCTAssertEqual(bad.temporalUpscale, 1, "3 is out of range (1...2) → builtin")
   }
 }
+
+// MARK: - Codex review 2026-09-13: overrides validated like env; sigma schedules monotonic
+
+extension LTX2ConfigResolverTests {
+  func testRequestOverridesGoThroughTheSameValidatorAndFallThroughWhenRejected() {
+    var request = LTX2VideoTuning()
+    request.condFps = 0                          // .float(1...120): out of range
+    request.stage1Sigmas = [1, 0.5, 0.75, 0]     // non-monotonic
+    request.nagScale = 7                          // valid, must still land
+    let r = LTX2ConfigResolver.resolveTyped(request: request, preset: nil, environment: ["LTX2_COND_FPS": "24"], configFile: [:])
+    XCTAssertEqual(r.condFps, 24, "cond_fps 0 rejected → env value stands")
+    XCTAssertNotEqual(r.provenance["cond_fps"], .request)
+    XCTAssertTrue((r.overrideRejections["cond_fps"] ?? "").contains("rejected"), "\(r.overrideRejections)")
+    XCTAssertNotEqual(r.stage1Sigmas, [1, 0.5, 0.75, 0], "non-monotonic schedule rejected")
+    XCTAssertTrue((r.overrideRejections["stage1_sigmas"] ?? "").contains("strictly decreasing"))
+    XCTAssertEqual(r.nagScale, 7); XCTAssertEqual(r.provenance["nag_scale"], .request)
+    let row = r.params.first { $0.name == "cond_fps" }
+    XCTAssertTrue((row?.note ?? "").contains("request override '0' rejected"), "the readout row explains the fall-through: \(row?.note ?? "nil")")
+  }
+
+  func testPresetOutOfRangeFallsThroughToEnvAndSigmaEnvRuleApplies() {
+    var preset = LTX2VideoTuning(); preset.reanchorInterval = 99_999   // .int(0...10_000)
+    let r = LTX2ConfigResolver.resolveTyped(request: nil, preset: preset, environment: ["LTX2_REANCHOR_INTERVAL": "3", "LTX2_REFINE_SIGMAS": "0.85,0.9,0.4,0"], configFile: [:])
+    XCTAssertEqual(r.reanchorInterval, 3)
+    XCTAssertTrue((r.overrideRejections["reanchor_interval"] ?? "").contains("preset override"))
+    let sig = r.params.first { $0.name == "refine_sigmas" }
+    XCTAssertEqual(sig?.valid, false, "env sigma schedule that rises is rejected too")
+    XCTAssertTrue((sig?.note ?? "").contains("strictly decreasing"))
+    let ok = LTX2ConfigResolver.resolveTyped(request: nil, preset: nil, environment: ["LTX2_STAGE1_SIGMAS": "1,0.9953,0.9836,0.949,0.848,0.675,0.452,0.243,0.1,0.028,0"], configFile: [:])
+    XCTAssertEqual(ok.params.first { $0.name == "stage1_sigmas" }?.valid, true, "the production schedule passes")
+  }
+}

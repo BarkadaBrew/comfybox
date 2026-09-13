@@ -19,7 +19,16 @@ public struct ResolvedVideoRecipe: Codable, Sendable, Equatable {
   }
 
   public let version: Int
+  /// Configured transformer filename (kept for readers of version-2 recipes).
   public let model: String
+  /// Codex review 2026-09-13: the filename alone ("transformer-distilled")
+  /// is the same across monolith swaps. Resolved identity: the weights
+  /// directory, the transformer file size in bytes, the Gemma snapshot, and
+  /// the engine build. Any of these changing changes the fingerprint.
+  public let weightsDir: String?
+  public let transformerBytes: Int?
+  public let gemmaPath: String?
+  public let engineBuild: String?
   public let prompt: String
   public let negativePrompt: String?
   public let initImagePath: String?
@@ -51,15 +60,27 @@ public struct ResolvedVideoRecipe: Codable, Sendable, Equatable {
     return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
   }
 
+  /// Size of the transformer weights file, or nil when it cannot be read.
+  public static func transformerBytes(weightsDir: String, transformerFile: String) -> Int? {
+    let path = (weightsDir as NSString).appendingPathComponent(transformerFile)
+    let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+    return (attrs?[.size] as? NSNumber)?.intValue
+  }
+
   public static func build(
-    request: LTX2VideoRequest, transformerFile: String
+    request: LTX2VideoRequest, transformerFile: String,
+    weightsDir: String? = nil, gemmaPath: String? = nil, engineBuild: String? = nil
   ) throws -> ResolvedVideoRecipe {
     guard let snapshot = request.resolvedConfigSnapshot else {
       throw ResolvedVideoRecipeError.missingConfigSnapshot
     }
     return ResolvedVideoRecipe(
-      version: 2,
+      version: 3,
       model: transformerFile,
+      weightsDir: weightsDir,
+      transformerBytes: weightsDir.flatMap { transformerBytes(weightsDir: $0, transformerFile: transformerFile) },
+      gemmaPath: gemmaPath,
+      engineBuild: engineBuild,
       prompt: request.prompt,
       negativePrompt: request.negativePrompt,
       initImagePath: request.initImagePath,

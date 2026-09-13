@@ -110,6 +110,18 @@ public final class LTX2Pipeline {
   /// to a no-request/no-preset resolution so standalone pipeline use behaves
   /// exactly like the old inline env reads. Single-render server (admission
   /// gate) — no concurrent mutation.
+  /// The request's generation frame rate (what `frames` was derived from and
+  /// what the mp4 plays at). Codex review 2026-09-13: temporal conditioning
+  /// silently stayed at the pipeline's fixed `config.fps` (24) for a 30 fps
+  /// request, so playback ran fast against a 24 fps motion prior. Set per
+  /// render by the generator; `cond_fps` remains the explicit override.
+  public var requestFps: Int?
+  /// Temporal-RoPE conditioning fps: `cond_fps` if set, else the request's
+  /// generation fps, else the pipeline default. A still is conditioned at 1.
+  static func conditioningFps(latF: Int, condFps: Float?, requestFps: Int?, configFps: Int) -> Float {
+    if latF == 1 { return 1 }
+    return condFps ?? Float(requestFps ?? configFps)
+  }
   public var resolvedConfig: LTX2ResolvedVideoConfig =
     LTX2ConfigResolver.resolveTyped(request: nil, preset: nil)
 
@@ -1813,7 +1825,7 @@ public final class LTX2Pipeline {
       return LTX2BeatScheduleBuilder.buildAudioBias(
         resolved: beatSchedule,
         totalFrames: outputFrames,
-        fps: Float(config.fps),
+        fps: Float(requestFps ?? config.fps),
         audioTokenMidSeconds: midSeconds,
         textLen: av.audioContext.dim(1),
         durationSeconds: ends.last)?.asType(dtype)
@@ -2702,7 +2714,7 @@ public final class LTX2Pipeline {
     // A still is one frame, not a 1/24-second clip. The native image wrapper
     // normalizes its frame-rate conditioning to 1; doing the same here keeps
     // the single temporal coordinate in the image training convention.
-    let fps = latF == 1 ? Float(1) : (resolvedConfig.condFps ?? Float(config.fps))
+    let fps = Self.conditioningFps(latF: latF, condFps: resolvedConfig.condFps, requestFps: requestFps, configFps: config.fps)
     let totalF = latF + refFrames
     let numPatches = totalF * latH * latW
 
