@@ -172,6 +172,45 @@ final class LTX2SpatialUpsampler2x: Module {
   }
 }
 
+// MARK: - Temporal Upsampler 2x
+
+/// 2x temporal upsampler (ltx-2.3-temporal-upscaler-x2): Conv3d(mid -> 2*mid)
+/// then a temporal pixel shuffle `b (c p) f h w -> b c (f p) h w`, p = 2, then
+/// the FIRST output frame is dropped (the first latent frame encodes exactly
+/// one pixel frame). F latent frames -> 2F - 1.
+///
+/// Reference: upsampler/model.py (temporal_upsample branch) + PixelShuffleND(1).
+final class LTX2TemporalUpsampler2x: Module {
+  // Checkpoint key `upsampler.0.*` is remapped to `upsampler.conv.*` by the loader.
+  @ModuleInfo(key: "conv") var conv: LTX2UpsamplerConv3d
+
+  init(midChannels: Int = 512) {
+    self._conv.wrappedValue = LTX2UpsamplerConv3d(
+      inChannels: midChannels, outChannels: 2 * midChannels, kernelSize: 3, padding: 1)
+    super.init()
+  }
+
+  /// Temporal pixel shuffle on channels-last `(N, D, H, W, 2C)` -> `(N, 2D, H, W, C)`.
+  /// Channel `2c + p` of input frame `d` becomes channel `c` of output frame `2d + p`
+  /// (einops `(c p)` = c-major, p-minor).
+  static func temporalShuffle(_ x: MLXArray) -> MLXArray {
+    let n = x.dim(0), d = x.dim(1), h = x.dim(2), w = x.dim(3), c2 = x.dim(4)
+    let c = c2 / 2
+    // (N, D, H, W, C, P) -> (N, D, P, H, W, C) -> (N, D*P, H, W, C)
+    return x.reshaped(n, d, h, w, c, 2)
+      .transposed(0, 1, 5, 2, 3, 4)
+      .reshaped(n, d * 2, h, w, c)
+  }
+
+  func callAsFunction(_ x: MLXArray) -> MLXArray {
+    // x: (N, D, H, W, C)
+    var y = conv(x)                      // (N, D, H, W, 2C)
+    y = Self.temporalShuffle(y)          // (N, 2D, H, W, C)
+    // Drop the first output frame: F -> 2F - 1.
+    return y[0..., 1...]
+  }
+}
+
 // MARK: - ResBlock3D
 
 /// Residual block with two Conv3d + GroupNorm + SiLU.
@@ -212,23 +251,53 @@ final class LTX2UpsamplerResBlock: Module {
 /// Operates in channels-last format internally but accepts/returns channels-first
 /// `(B, C, F, H, W)` for pipeline compatibility.
 public final class LTX2LatentUpsampler: Module {
+  /// Which axis the learned upsample stage doubles. `.spatial2x` is the
+  /// two-stage refine's ltx-2.3-spatial-upscaler-x2 (mid 1024); `.temporal2x`
+  /// is ltx-2.3-temporal-upscaler-x2 (mid 512), F latent frames -> 2F - 1.
+  public enum Mode: String, Sendable { case spatial2x, temporal2x }
+
   @ModuleInfo(key: "initial_conv") var initialConv: LTX2UpsamplerConv3d
   @ModuleInfo(key: "initial_norm") var initialNorm: LTX2GroupNorm3d
   @ModuleInfo(key: "res_blocks") var resBlocks: [LTX2UpsamplerResBlock]
-  @ModuleInfo(key: "upsampler") var upsampler: LTX2SpatialUpsampler2x
+  @ModuleInfo(key: "upsampler") var upsampler: Module
   @ModuleInfo(key: "post_upsample_res_blocks") var postResBlocks: [LTX2UpsamplerResBlock]
   @ModuleInfo(key: "final_conv") var finalConv: LTX2UpsamplerConv3d
 
   public let inChannels: Int
   public let midChannels: Int
+  public let mode: Mode
+
+  /// Typed views of the upsample stage (one is non-nil, per `mode`).
+  var spatialStage: LTX2SpatialUpsampler2x? { upsampler as? LTX2SpatialUpsampler2x }
+  var temporalStage: LTX2TemporalUpsampler2x? { upsampler as? LTX2TemporalUpsampler2x }
+
+  /// The checkpoint's embedded `config` decides the mode and width:
+  /// `{"spatial_upsample": false, "temporal_upsample": true, "mid_channels": 512}`
+  /// is the temporal upscaler; the spatial one is the default. Returns nil
+  /// for a spatiotemporal (both true) or dims-2 checkpoint — not ported.
+  public static func modeFromCheckpointConfig(_ json: String?) -> (mode: Mode, midChannels: Int)? {
+    guard let json, let data = json.data(using: .utf8),
+          let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      return (.spatial2x, 1024)
+    }
+    let spatial = (cfg["spatial_upsample"] as? Bool) ?? true
+    let temporal = (cfg["temporal_upsample"] as? Bool) ?? false
+    let dims = (cfg["dims"] as? Int) ?? 3
+    guard dims == 3 else { return nil }
+    if spatial && temporal { return nil }
+    let mid = (cfg["mid_channels"] as? Int) ?? (temporal ? 512 : 1024)
+    return temporal ? (.temporal2x, mid) : (.spatial2x, mid)
+  }
 
   public init(
     inChannels: Int = 128,
     midChannels: Int = 1024,
-    numBlocksPerStage: Int = 4
+    numBlocksPerStage: Int = 4,
+    mode: Mode = .spatial2x
   ) {
     self.inChannels = inChannels
     self.midChannels = midChannels
+    self.mode = mode
 
     self._initialConv.wrappedValue = LTX2UpsamplerConv3d(
       inChannels: inChannels, outChannels: midChannels, kernelSize: 3, padding: 1)
@@ -238,7 +307,10 @@ public final class LTX2LatentUpsampler: Module {
       LTX2UpsamplerResBlock(channels: midChannels)
     }
 
-    self._upsampler.wrappedValue = LTX2SpatialUpsampler2x(midChannels: midChannels)
+    switch mode {
+    case .spatial2x: self._upsampler.wrappedValue = LTX2SpatialUpsampler2x(midChannels: midChannels)
+    case .temporal2x: self._upsampler.wrappedValue = LTX2TemporalUpsampler2x(midChannels: midChannels)
+    }
 
     self._postResBlocks.wrappedValue = (0..<numBlocksPerStage).map { _ in
       LTX2UpsamplerResBlock(channels: midChannels)
@@ -250,10 +322,10 @@ public final class LTX2LatentUpsampler: Module {
     super.init()
   }
 
-  /// Upsample latents 2x spatially.
+  /// Upsample latents 2x along the mode's axis.
   ///
   /// - Parameter latent: Input `(B, C, F, H, W)` channels-first.
-  /// - Returns: Upsampled `(B, C, F, H*2, W*2)` channels-first.
+  /// - Returns: `.spatial2x`: `(B, C, F, H*2, W*2)`; `.temporal2x`: `(B, C, 2F-1, H, W)`.
   public func callAsFunction(_ latent: MLXArray) -> MLXArray {
     // Convert to channels-last: (B, C, F, H, W) -> (B, F, H, W, C)
     var x = latent.transposed(0, 2, 3, 4, 1)
@@ -266,7 +338,11 @@ public final class LTX2LatentUpsampler: Module {
       x = block(x)
     }
 
-    x = upsampler(x)
+    switch upsampler {
+    case let s as LTX2SpatialUpsampler2x: x = s(x)
+    case let t as LTX2TemporalUpsampler2x: x = t(x)
+    default: fatalError("LTX2LatentUpsampler: unknown upsample stage")
+    }
 
     for block in postResBlocks {
       x = block(x)
@@ -292,7 +368,7 @@ public final class LTX2LatentUpsampler: Module {
 ///   - upsampler: The latent upsampler network.
 ///   - latentMean: Per-channel mean `(C,)`.
 ///   - latentStd: Per-channel std `(C,)`.
-/// - Returns: Upsampled latent `(B, C, F, H*2, W*2)`.
+/// - Returns: Upsampled latent (`(B, C, F, H*2, W*2)` spatial, `(B, C, 2F-1, H, W)` temporal).
 public func ltx2UpsampleLatents(
   _ latent: MLXArray,
   upsampler: LTX2LatentUpsampler,

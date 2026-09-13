@@ -1537,7 +1537,7 @@ public final class WarmServer {
       do {
         let q = (try? decode(EffectiveVideoConfigQuery.self, from: request.body)) ?? EffectiveVideoConfigQuery(
           width: nil, height: nil, frames: nil, duration: nil, fps: nil, tuning: nil,
-          preset: nil, twoPass: nil, diagnostic: nil)
+          preset: nil, twoPass: nil, temporalUpscale: nil, diagnostic: nil)
         let videoPreset: ImagePreset? = q.preset.flatMap { presetStore.get($0) }
         let effectiveTuning = Self.effectiveVideoTuning(for: q)
         let resolvedTyped = LTX2ConfigResolver.resolveTyped(
@@ -2214,6 +2214,8 @@ public final class WarmServer {
     /// env/preset/builtin answer, silently ignoring the very field it was
     /// probing.
     let twoPass: Bool?
+    /// Top-level convenience for `tuning.temporal_upscale` (ltx-2.3 temporal upscaler, 2 = on).
+    let temporalUpscale: Int?
     /// Explicit escape hatch for short clips and CFG experiments. Production
     /// callers omit this and receive the validated quality contract.
     let diagnostic: Bool?
@@ -2268,6 +2270,8 @@ public final class WarmServer {
     /// unchanged. When BOTH this and `tuning.two_stage` are set, the more
     /// specific `tuning.two_stage` wins (see `LTX2VideoTuning.merging`).
     let twoPass: Bool?
+    /// Top-level convenience for `tuning.temporal_upscale` (ltx-2.3 temporal upscaler, 2 = on).
+    let temporalUpscale: Int?
     /// Explicit escape hatch for quality experiments (short clips, CFG+NAG).
     /// It is intentionally opt-in rather than inferred from dimensions/source.
     let diagnostic: Bool?
@@ -2799,14 +2803,14 @@ public final class WarmServer {
   /// test can decode a real wire-format `LocalVideoRequest` and assert on
   /// this exact call, not a re-implementation of it.
   static func effectiveVideoTuning(for req: LocalVideoRequest) -> LTX2VideoTuning? {
-    LTX2VideoTuning.merging(req.tuning, twoPass: req.twoPass)
+    LTX2VideoTuning.merging(req.tuning, twoPass: req.twoPass, temporalUpscale: req.temporalUpscale)
   }
 
   /// Same merge, for the `/v1/video/config/effective` preflight's query
   /// shape (comfybox#307 review r1, item 2) — one merge rule, two wire
   /// shapes that both carry it.
   static func effectiveVideoTuning(for query: EffectiveVideoConfigQuery) -> LTX2VideoTuning? {
-    LTX2VideoTuning.merging(query.tuning, twoPass: query.twoPass)
+    LTX2VideoTuning.merging(query.tuning, twoPass: query.twoPass, temporalUpscale: query.temporalUpscale)
   }
 
   /// F3 (comfybox#324, adversarial review of Phase 3 config): the ACTUAL

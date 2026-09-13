@@ -210,3 +210,29 @@ final class LocalVideoRequestDecodeTests: XCTestCase {
     XCTAssertNil(request.guidance, "no request override, no preset — the generator falls back to pipeline.config.guidance itself")
   }
 }
+
+// MARK: - ltx-2.3 temporal upscaler (2026-09-13): top-level `temporal_upscale`
+// convenience mirrors `two_pass` — folded into `tuning` by the exact function
+// `prepareLocalVideo` calls; the nested `tuning.temporal_upscale` wins.
+
+extension LocalVideoRequestDecodeTests {
+  func testTemporalUpscaleDecodesAndFoldsIntoTuning() throws {
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+    let req = try decoder.decode(WarmServer.LocalVideoRequest.self, from: Data(#"{"prompt":"x","temporal_upscale":2}"#.utf8))
+    XCTAssertEqual(req.temporalUpscale, 2)
+    XCTAssertEqual(WarmServer.effectiveVideoTuning(for: req)?.temporalUpscale, 2, "top-level convenience reaches the resolver via tuning")
+    XCTAssertNil(WarmServer.effectiveVideoTuning(for: req)?.twoStage, "does not disturb two_stage")
+
+    let nested = try decoder.decode(WarmServer.LocalVideoRequest.self, from: Data(#"{"prompt":"x","temporal_upscale":2,"tuning":{"temporal_upscale":1}}"#.utf8))
+    XCTAssertEqual(WarmServer.effectiveVideoTuning(for: nested)?.temporalUpscale, 1, "the nested tuning field is the more specific one and wins")
+
+    let absent = try decoder.decode(WarmServer.LocalVideoRequest.self, from: Data(#"{"prompt":"x"}"#.utf8))
+    XCTAssertNil(absent.temporalUpscale)
+    XCTAssertNil(WarmServer.effectiveVideoTuning(for: absent), "no convenience, no tuning → nil, exactly as before")
+
+    let both = try decoder.decode(WarmServer.LocalVideoRequest.self, from: Data(#"{"prompt":"x","two_pass":true,"temporal_upscale":2}"#.utf8))
+    let t = WarmServer.effectiveVideoTuning(for: both)
+    XCTAssertEqual(t?.twoStage, true); XCTAssertEqual(t?.temporalUpscale, 2)
+  }
+}

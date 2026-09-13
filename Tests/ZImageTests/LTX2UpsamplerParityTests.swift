@@ -70,7 +70,7 @@ final class LTX2UpsamplerParityTests: XCTestCase {
     check("t2_initial_act", h)
     for block in up.resBlocks { h = block(h) }
     check("t3_resblocks", h)
-    h = up.upsampler(h)
+    h = up.spatialStage!(h)
     check("t4_upsampler", h)
     for block in up.postResBlocks { h = block(h) }
     check("t5_postblocks", h)
