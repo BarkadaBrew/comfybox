@@ -798,6 +798,12 @@ public final class MCPToolExecutor: @unchecked Sendable {
       if successStatuses.contains(status) {
         return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
       }
+      // "Local mode" (AdmissionGate, 2026-09-15): the engine is reserved for
+      // callers on its own Mac; a remote submit is deferred, not failed.
+      // Surface it by name so the daemon/Bree can say WHY instead of "503".
+      if status == 503, Self.isLocalModeRefusal(data) {
+        return MCPToolResult(error: "engine is in local mode — submission deferred (admission_mode=local; check /health admission_mode, retry when it reads open)")
+      }
       guard status == 503, Self.isQueueRecoveryRefusal(data) else {
         return Self.mapHTTPResponse(status: status, data: data)
       }
@@ -820,6 +826,12 @@ public final class MCPToolExecutor: @unchecked Sendable {
   private static func isQueueRecoveryRefusal(_ data: Data) -> Bool {
     guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
     return (json["error_code"] as? String) == QueueRecoveryGate.errorCode
+  }
+
+  /// The AdmissionGate 503: `{"deferred": true, "admission_mode": "local"}`.
+  static func isLocalModeRefusal(_ data: Data) -> Bool {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+    return (json["admission_mode"] as? String) == AdmissionMode.local.rawValue && (json["deferred"] as? Bool) == true
   }
 
   private static func parseRetryAfterSeconds(from data: Data) -> Int? {

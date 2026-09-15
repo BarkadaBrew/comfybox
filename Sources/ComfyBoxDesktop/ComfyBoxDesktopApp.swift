@@ -324,6 +324,15 @@ struct ComfyBoxDesktopApp: App {
                 Text("⚠ Down: \(down.joined(separator: ", "))")
             }
             Divider()
+            // "Local mode" (Todd 2026-09-15): keep the engine for this Mac —
+            // the server daemons' submissions are deferred (503 deferred:true),
+            // not refused, so they simply wait. Visible to them on /health.
+            Button(engine.localMode
+                   ? "✓ Local Mode — remote callers deferred"
+                   : "Local Mode (defer remote callers)") {
+                Task { try? await engine.setLocalMode(!engine.localMode) }
+            }
+            .disabled(!engine.connectionState.isConnected)
             Button("Restart ComfyBox Daemon") {
                 Task {
                     try? await ServiceController().perform(.restart, on: WatchedService(
@@ -350,6 +359,7 @@ struct ComfyBoxDesktopApp: App {
     /// symbol rather than color): coffee cup when healthy, warning otherwise.
     private var menuBarSymbol: String {
         if let down = downServices, !down.isEmpty { return "exclamationmark.triangle.fill" }
+        if engine.localMode { return "lock.fill" }   // Local mode: the engine is yours
         return engine.connectionState.isConnected ? "cup.and.saucer.fill" : "cup.and.saucer"
     }
 
