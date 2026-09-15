@@ -126,7 +126,7 @@ final class LTX2ConfigResolverTests: XCTestCase {
     let names = Set(params.map(\.name))
     for expected in [
       "guidance_rescale", "cfg_schedule", "stage1_sigmas", "refine_sigmas",
-      "two_stage", "cond_fps", "img_compression", "sampler", "stg_scale",
+      "two_stage", "cond_fps", "img_compression", "sampler", "stg_scale", "stg_head_boost",
       "face_anchor_strength", "ic_control", "nag_scale", "nag_alpha", "nag_tau",
       "plain_decode_max_vol", "refine_max_vol", "decode_mode", "upsampler_path",
       "video_bits_per_px",
@@ -298,5 +298,40 @@ extension LTX2ConfigResolverTests {
     XCTAssertTrue((sig?.note ?? "").contains("strictly decreasing"))
     let ok = LTX2ConfigResolver.resolveTyped(request: nil, preset: nil, environment: ["LTX2_STAGE1_SIGMAS": "1,0.9953,0.9836,0.949,0.848,0.675,0.452,0.243,0.1,0.028,0"], configFile: [:])
     XCTAssertEqual(ok.params.first { $0.name == "stage1_sigmas" }?.valid, true, "the production schedule passes")
+  }
+}
+
+
+// 2026-09-14: STG head boost — configurable so STG can run flat on the
+// tone-setting early steps (the legacy +1.0/+0.5 head burned PinkCherry v1.8
+// output even at base 0.5 while fixing the motion ghost).
+final class LTX2STGHeadBoostTests: XCTestCase {
+  func testHeadBoostDefaultsToLegacyRamp() {
+    XCTAssertEqual(LTX2PipelineConfig.stgScaleForStep(0, base: 0.5), 1.5)
+    XCTAssertEqual(LTX2PipelineConfig.stgScaleForStep(1, base: 0.5), 1.0)
+    XCTAssertEqual(LTX2PipelineConfig.stgScaleForStep(2, base: 0.5), 0.5)
+  }
+  func testHeadBoostZeroIsFlat() {
+    for i in 0..<5 {
+      XCTAssertEqual(LTX2PipelineConfig.stgScaleForStep(i, base: 0.5, headBoost: 0), 0.5, "step \(i)")
+    }
+  }
+  func testHeadBoostHalfScalesTheRamp() {
+    XCTAssertEqual(LTX2PipelineConfig.stgScaleForStep(0, base: 0.5, headBoost: 0.5), 1.0)
+    XCTAssertEqual(LTX2PipelineConfig.stgScaleForStep(1, base: 0.5, headBoost: 0.5), 0.75)
+  }
+  func testResolverExposesStgHeadBoostBuiltinAndRequest() {
+    let base = LTX2ConfigResolver.resolveTyped(request: nil, preset: nil, environment: [:], configFile: [:])
+    XCTAssertEqual(base.stgHeadBoost, 1, "builtin = legacy ramp")
+    XCTAssertEqual(base.provenance["stg_head_boost"], .builtin)
+    var req = LTX2VideoTuning(); req.stgHeadBoost = 0
+    let r = LTX2ConfigResolver.resolveTyped(request: req, preset: nil, environment: [:], configFile: [:])
+    XCTAssertEqual(r.stgHeadBoost, 0)
+    XCTAssertEqual(r.provenance["stg_head_boost"], .request)
+    let row = r.params.first { $0.name == "stg_head_boost" }
+    XCTAssertEqual(row?.value, "0", "readout row carries the request value")
+    // env path + range clamp: 2 is the top of the range, above it falls through to builtin
+    let e = LTX2ConfigResolver.resolveTyped(request: nil, preset: nil, environment: ["LTX2_STG_HEAD_BOOST": "0.5"], configFile: [:])
+    XCTAssertEqual(e.stgHeadBoost, 0.5); XCTAssertEqual(e.provenance["stg_head_boost"], .env)
   }
 }

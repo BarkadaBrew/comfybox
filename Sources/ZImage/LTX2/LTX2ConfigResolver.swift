@@ -81,6 +81,12 @@ public enum LTX2ConfigResolver {
     Entry(name: "sampler", envKey: "LTX2_SAMPLER", tier: "A", kind: .string, builtin: ""),
     Entry(name: "stg_scale", envKey: "LTX2_STG_SCALE", tier: "A", kind: .float(0...20), builtin: "0"),
     Entry(name: "stg_blocks", envKey: "LTX2_STG_BLOCKS", tier: "A", kind: .string, builtin: ""),
+    // 2026-09-14: the video STG ramp boosts steps 0/1 by +1.0/+0.5 over the base
+    // (Vantage 10Eros motion recipe). On PinkCherry v1.8 that head over-guides
+    // the tone-setting early steps and burns/posterizes even at base 0.5 while
+    // still fixing the motion ghost. `stg_head_boost` scales that head: 1 =
+    // legacy ramp, 0 = flat (base on every step).
+    Entry(name: "stg_head_boost", envKey: "LTX2_STG_HEAD_BOOST", tier: "A", kind: .float(0...2), builtin: "1"),
     Entry(name: "face_anchor_strength", envKey: "LTX2_FACE_ANCHOR_STRENGTH", tier: "A", kind: .float(0...1), builtin: "0.5"),
     Entry(name: "ic_control", envKey: "LTX2_IC_CONTROL", tier: "A", kind: .boolNotZero, builtin: "true"),
     Entry(name: "ic_ref_strength", envKey: "LTX2_IC_REF_STRENGTH", tier: "A", kind: .float(0...1), builtin: "1.0"),
@@ -278,6 +284,7 @@ public struct LTX2VideoTuning: Codable, Sendable, Equatable {
   public var sampler: String?
   public var stgScale: Float?
   public var stgBlocks: String?
+  public var stgHeadBoost: Float?
   public var faceAnchorStrength: Float?
   public var icControl: Bool?
   public var icRefStrength: Float?
@@ -335,6 +342,7 @@ public struct LTX2ResolvedVideoConfig: Sendable {
   public let sampler: String
   public let stgScale: Float
   public let stgBlocks: String
+  public let stgHeadBoost: Float
   public let faceAnchorStrength: Float
   public let icControl: Bool
   public let icRefStrength: Float
@@ -403,6 +411,7 @@ public struct LTX2ResolvedVideoConfig: Sendable {
     case "sampler": return sampler
     case "stg_scale": return fmt(stgScale)
     case "stg_blocks": return stgBlocks
+    case "stg_head_boost": return fmt(stgHeadBoost)
     case "face_anchor_strength": return fmt(faceAnchorStrength)
     case "ic_control": return icControl ? "true" : "false"
     case "ic_ref_strength": return fmt(icRefStrength)
@@ -503,6 +512,7 @@ extension LTX2ConfigResolver {
       sampler: pick("sampler", str("sampler"), preset?.sampler, request?.sampler),
       stgScale: pick("stg_scale", f("stg_scale"), preset?.stgScale, request?.stgScale),
       stgBlocks: pick("stg_blocks", str("stg_blocks"), preset?.stgBlocks, request?.stgBlocks),
+      stgHeadBoost: pick("stg_head_boost", f("stg_head_boost"), preset?.stgHeadBoost, request?.stgHeadBoost),
       faceAnchorStrength: pick("face_anchor_strength", f("face_anchor_strength"), preset?.faceAnchorStrength, request?.faceAnchorStrength),
       icControl: pick("ic_control", b("ic_control"), preset?.icControl, request?.icControl),
       icRefStrength: pick("ic_ref_strength", f("ic_ref_strength"), preset?.icRefStrength, request?.icRefStrength),
