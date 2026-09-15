@@ -162,7 +162,6 @@ ComfyBox -p "detailed landscape" --scheduler heun --sigma-schedule karras -s 20 
 
 - [mlx-swift](https://github.com/ml-explore/mlx-swift) — Apple's ML framework for Apple Silicon
 - [swift-transformers](https://github.com/huggingface/swift-transformers) — Tokenizer support
-- [swift-argument-parser](https://github.com/apple/swift-argument-parser) — CLI argument parsing
 
 ## License
 

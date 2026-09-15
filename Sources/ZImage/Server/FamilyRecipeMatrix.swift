@@ -300,7 +300,10 @@ public enum SamplingRecipeCatalog {
     if value == "krea2" || value.contains("krea-2") || value.contains("krea2") {
       return WarmModelFamily.krea2.rawValue
     }
-    if value == "flux2" || value.contains("flux-2") || value.contains("flux.2") {
+    // "flux2-klein-4b" / "…/flux2-klein-9b/…" are the repo-standard spellings;
+    // without the plain "flux2" substring they fell through to the generic
+    // "flux" branch and were classified flux1 (Codex review 2026-09-15 #3).
+    if value == "flux2" || value.contains("flux-2") || value.contains("flux.2") || value.contains("flux2") {
       return WarmModelFamily.flux2.rawValue
     }
     if value == "fibo" || value.contains("fibo") {
