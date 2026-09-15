@@ -3421,6 +3421,12 @@ struct ZImageCLI {
         height = intValue(for: arg, iterator: &iterator, minimum: 32, fallback: height)
       case "--steps":
         steps = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: steps)
+        // Mirror the server's LTX image cap (1...100): a typo like 800 would
+        // build a huge sigma schedule and denoise for an hour (Codex 2026-09-15 #12).
+        if steps > 100 {
+          warnArgumentParsing("Invalid value '\(steps)' for --steps; LTX image steps are capped at 100.")
+          steps = 100
+        }
       case "--guidance":
         guidance = floatValue(for: arg, iterator: &iterator, fallback: guidance)
       case "--stg-scale":

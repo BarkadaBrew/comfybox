@@ -206,6 +206,12 @@ final class FamilyRecipeMatrixTests: XCTestCase {
       SamplingRecipeCatalog.canonicalFamily("/models/krea2_raw_bf16.safetensors"),
       "krea2")
     XCTAssertEqual(SamplingRecipeCatalog.canonicalFamily("Tongyi-MAI/Z-Image-Turbo"), "flux1")
+    // Codex review 2026-09-15 #3: Flux2 model ids/paths must not fall through to flux1.
+    XCTAssertEqual(SamplingRecipeCatalog.canonicalFamily("flux2-klein-4b"), "flux2")
+    XCTAssertEqual(SamplingRecipeCatalog.canonicalFamily("flux2-klein-9b"), "flux2")
+    XCTAssertEqual(SamplingRecipeCatalog.canonicalFamily("/Users/todd/LocalModels/flux2-klein-4b/model.safetensors"), "flux2")
+    XCTAssertEqual(SamplingRecipeCatalog.canonicalFamily("FLUX.2-dev"), "flux2")
+    XCTAssertEqual(SamplingRecipeCatalog.canonicalFamily("flux1-dev"), "flux1")
 
     for family in WarmModelFamily.allCases {
       let capability = FamilyRecipeMatrix.capability(for: family)

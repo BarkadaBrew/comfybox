@@ -9,7 +9,7 @@ ComfyBox can run as a warm HTTP server that keeps the model loaded in GPU memory
 ```bash
 ComfyBox serve \
   -m Tongyi-MAI/Z-Image-Turbo \
-  --port 7862 \
+  --port 7870 \
   --host 0.0.0.0 \
   --allowed-output-directory ~/renders
 ```
@@ -19,7 +19,7 @@ ComfyBox serve \
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--model, -m` | Z-Image-Turbo | Model to load on startup |
-| `--port` | 7862 | HTTP port to bind |
+| `--port` | 7870 (7862 accepted as a legacy alias) | HTTP port to bind |
 | `--host` | 127.0.0.1 | Interface to bind (0.0.0.0 for network access) |
 | `--allowed-output-directory` | current dir | Sandboxed output path |
 | `--cache-limit` | unlimited | GPU memory cache limit in MB |
@@ -38,7 +38,7 @@ ComfyBox serve \
 ### Health Check
 
 ```bash
-curl http://localhost:7862/health
+curl http://localhost:7870/health
 ```
 
 Returns loaded model, VRAM usage, active LoRAs, render statistics, and queue depth.
@@ -69,7 +69,7 @@ set -euo pipefail
 COMFYBOX="$HOME/Projects/zimage.swift/.build/release/ComfyBox"
 MODEL="Tongyi-MAI/Z-Image-Turbo"
 ENCODER="$HOME/Models/z-image-turbo-bf16/text_encoder QWen Large"
-PORT=7862
+PORT=7870
 OUTPUT_DIR="$HOME/renders"
 
 CRASH_COUNT=0
@@ -153,8 +153,8 @@ launchd is macOS's native service manager, but ComfyBox's GPU initialization can
 Run the ComfyUI-compatible bridge alongside the WarmServer:
 
 ```bash
-# WarmServer on 7862, Bridge on 7870
-ComfyBox serve -m Tongyi-MAI/Z-Image-Turbo --port 7862 &
+# WarmServer + ComfyUI bridge both on 7870 (7862 is a legacy alias)
+ComfyBox serve -m Tongyi-MAI/Z-Image-Turbo --port 7870 &
 # Bridge connects to WarmServer and exposes ComfyUI protocol
 # (Bridge is built into the serve command on port 7870)
 ```
@@ -167,10 +167,10 @@ Run the MCP server alongside a WarmServer for AI assistant integration:
 
 ```bash
 # Start WarmServer first
-ComfyBox serve -m Tongyi-MAI/Z-Image-Turbo --port 7862
+ComfyBox serve -m Tongyi-MAI/Z-Image-Turbo --port 7870
 
 # Then run MCP server pointing to it
-ComfyBox mcp --port 7862
+ComfyBox mcp --port 7870
 ```
 
 The MCP server reads JSON-RPC from stdin and writes to stdout. It bridges to the WarmServer via HTTP. See [MCP Tool Reference](mcp-reference.md) for the 18 available tools.
@@ -183,7 +183,7 @@ For a daemon on a remote server that needs to control a Mac's GPU:
 # The daemon spawns this as a child process:
 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
   user@mac-host \
-  "cd /path/to/comfybox && .build/release/ComfyBox mcp --port 7862"
+  "cd /path/to/comfybox && .build/release/ComfyBox mcp --port 7870"
 ```
 
 **Daemon configuration** (`~/.bree/config.json`):
@@ -194,7 +194,7 @@ ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
       {
         "id": "comfybox",
         "name": "ComfyBox",
-        "command": "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 user@mac \"cd /path/to/comfybox && .build/release/ComfyBox mcp --port 7862\"",
+        "command": "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 user@mac \"cd /path/to/comfybox && .build/release/ComfyBox mcp --port 7870\"",
         "enabled": true,
         "toolTimeoutMs": 300000
       }
@@ -238,7 +238,7 @@ The daemon's MCP manager automatically reconnects when the SSH connection drops:
 │           │ HTTP                                     │
 │  ┌────────▼─────────┐    ┌─────────────────┐        │
 │  │ WarmServer       │    │ ComfyUI Bridge  │        │
-│  │ (:7862)          │    │ (:7870)         │        │
+│  │ (:7870)          │    │ (:7870)         │        │
 │  └────────┬─────────┘    └────────┬────────┘        │
 │           │                       │                  │
 │  ┌────────▼───────────────────────▼────────┐        │
@@ -256,7 +256,7 @@ The daemon's MCP manager automatically reconnects when the SSH connection drops:
 
 ```bash
 # Quick check
-curl -s http://mac:7862/health | python3 -m json.tool
+curl -s http://mac:7870/health | python3 -m json.tool
 
 # Via MCP (from daemon)
 # Tool: mcp_comfybox__server_health
@@ -279,7 +279,7 @@ curl -s http://mac:7862/health | python3 -m json.tool
 | SSH connection drops | Network instability | Auto-reconnect handles this; check `screen -ls` on Mac |
 | Model fails to load | Insufficient VRAM | Use quantized model or unload other models |
 | WarmServer crashes repeatedly | Circuit breaker trips | Check `screen -r warmserver` logs, fix root cause |
-| Port 7862 in use | Previous instance didn't clean up | `lsof -ti:7862 | xargs kill` |
+| Port 7870 in use | Previous instance didn't clean up | `lsof -ti:7870 | xargs kill` |
 | Metal library not found | Build artifact missing | Rebuild with xcodebuild, copy `mlx.metallib` next to binary |
 
 ## CI: Nightly Integration Runner

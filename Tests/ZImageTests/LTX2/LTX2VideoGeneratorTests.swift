@@ -78,6 +78,25 @@ final class LTX2VideoGeneratorTests: XCTestCase {
             LTX2VideoRequest(prompt: "x", width: 700, height: 448, framesPerChunk: 97, outputPath: "/tmp/o.mp4")))
     }
 
+    /// Codex review 2026-09-15 #4: one frame is the image path, not a loophole
+    /// in the video API — audio or extension on a one-frame request is rejected.
+    func testValidateRejectsVideoOnlyOptionsOnAOneFrameRequest() {
+        let gen = LTX2VideoGenerator(config: .init(weightsDir: "/nope", gemmaPath: "/nope"))
+        XCTAssertThrowsError(try gen.validate(
+            LTX2VideoRequest(prompt: "x", width: 704, height: 448, framesPerChunk: 1, outputPath: "/tmp/o.png", audio: true))) { error in
+            guard case LTX2VideoError.imageModeConflict = error else { return XCTFail("expected imageModeConflict, got \(error)") }
+        }
+        XCTAssertThrowsError(try gen.validate(
+            LTX2VideoRequest(prompt: "x", width: 704, height: 448, framesPerChunk: 1, extendToSeconds: 4, outputPath: "/tmp/o.png"))) { error in
+            guard case LTX2VideoError.imageModeConflict = error else { return XCTFail("expected imageModeConflict, got \(error)") }
+        }
+        // A plain one-frame request is still valid up to the weights check.
+        XCTAssertThrowsError(try gen.validate(
+            LTX2VideoRequest(prompt: "x", width: 704, height: 448, framesPerChunk: 1, outputPath: "/tmp/o.png"))) { error in
+            guard case LTX2VideoError.weightsMissing = error else { return XCTFail("expected weightsMissing, got \(error)") }
+        }
+    }
+
     func testValidateReportsMissingWeights() {
         let gen = LTX2VideoGenerator(config: .init(weightsDir: "/definitely/not/here", gemmaPath: "/nope"))
         XCTAssertThrowsError(try gen.validate(

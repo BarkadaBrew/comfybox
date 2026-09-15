@@ -38,3 +38,11 @@ docs/krea2-reference/
 qa/video/runs/
 qa/video/assets/
 qa/video/__pycache__/
+
+# Agent/session artifacts (Codex review 2026-09-15 #2): local worktrees, logs,
+# reviews and config backups — never repo content.
+/.claude/
+/.codex/
+/.superpowers/
+/reviews/
+*.bak-*

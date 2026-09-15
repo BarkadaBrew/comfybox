@@ -346,9 +346,13 @@ public enum LTX2VideoError: Error, LocalizedError {
     case audioUnsupported(String)
     case resumeContextMissing
     case recipeMismatch(accepted: String, executed: String)
+    /// A one-frame (native image) request combined with a video-only option.
+    case imageModeConflict(String)
 
     public var errorDescription: String? {
         switch self {
+        case .imageModeConflict(let why):
+            return "LTX-2 one-frame (image) request: \(why)."
         case .invalidFrameCount(let n):
             return "LTX-2 frames must be 1 (image) or 1 + 8k video frames (9, 17, 25, …, 97); got \(n)."
         case .invalidDimensions(let w, let h):
@@ -516,6 +520,17 @@ public final class LTX2VideoGenerator {
     public func validate(_ request: LTX2VideoRequest) throws {
         guard Self.isValidFrameCount(request.framesPerChunk) else {
             throw LTX2VideoError.invalidFrameCount(request.framesPerChunk)
+        }
+        // One frame is the native IMAGE path (51e329c). It must not weaken the
+        // video invariants: a one-frame request cannot carry an audio track or
+        // ask to be extended into a clip (Codex review 2026-09-15 #4).
+        if request.framesPerChunk == 1 {
+            if request.audio {
+                throw LTX2VideoError.imageModeConflict("audio requires a video (1 + 8k frames, ≥ 9)")
+            }
+            if request.extendToSeconds > 0 {
+                throw LTX2VideoError.imageModeConflict("extend_to_seconds requires a video (1 + 8k frames, ≥ 9)")
+            }
         }
         if request.audio {
             // Audio scope: single-chunk T2V and I2V. Silently downgrading (the
