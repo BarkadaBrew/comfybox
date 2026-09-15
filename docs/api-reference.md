@@ -76,6 +76,8 @@ or carry a reasoned exemption (§3.5 assertion 3).
 | GET | `/v1/presets/{id}` |  |  |
 | GET | `/v1/providers/status` |  |  |
 | GET | `/v1/queue` | generate_image, get_job |  |
+| GET | `/v1/queue/admission` | get_admission_mode |  |
+| POST | `/v1/queue/admission` | set_admission_mode |  |
 | POST | `/v1/queue/clear` |  | The clear_queue tool targets the ComfyUI-bridge queue path (POST /queue {"clear": true}, executeClearQueue) -- a pre-parity contract the old api-reference documented; the native /v1/queue/clear route currently has no agent caller. Declared reality (G1); re-point the tool in a behavior phase. |
 | POST | `/v1/queue/interrupt` | interrupt_render |  |
 | GET | `/v1/queue/lifecycle` |  |  |
@@ -179,6 +181,7 @@ document (config writes: RFC 7386 merge patch via `PATCH /v1/config`).
 | `provider.vision.model` | provider | string |  |  | PATCH `/v1/config` @ `/providers/vision/model` | patch_config |  |
 | `queue.clear` | queue | action |  |  | POST `/v1/queue/clear` |  |  |
 | `queue.interrupt` | queue | action |  |  | POST `/v1/queue/interrupt` | interrupt_render |  |
+| `queue.local_mode` | queue | action |  |  | POST `/v1/queue/admission` | set_admission_mode |  |
 | `queue.pause` | queue | action |  |  | POST `/v1/queue/pause` | pause_queue |  |
 | `queue.resume` | queue | action |  |  | POST `/v1/queue/resume` | resume_queue |  |
 | `render.defaults.chroma.guidance` | engine | double |  | 0 | PATCH `/v1/config` @ `/renderDefaults/byFamily/chroma/guidance` | patch_config |  |

@@ -46,7 +46,8 @@ final class ControlSurfaceParityTests: XCTestCase {
   /// thread. Same established two-tuples-per-actor-free-GET pattern as
   /// `/v1/models` and `/v1/model/family`; the ROUTE SET is unchanged, so
   /// `docs/api-reference.md` is byte-identical.
-  private static let expectedWarmServerTuples = 97
+  /// Local mode (2026-09-15) added GET + POST /v1/queue/admission: 97 → 99.
+  private static let expectedWarmServerTuples = 99
   private static let expectedBridgeTuples = 17
 
   private static let repoRoot: URL = {
@@ -295,7 +296,9 @@ final class ControlSurfaceParityTests: XCTestCase {
     let values = ControlRegistry.resolveValues(
       config: fullyPopulatedConfig(),
       contentModes: fullyPopulatedContentModes(),
-      queueDocument: ["is_paused": false])
+      // Every pointer the queue-scoped controls dereference must be present here
+      // (2026-09-15: `queue.local_mode` reads /admission_mode).
+      queueDocument: ["is_paused": false, "admission_mode": "open"])
     for descriptor in ControlRegistry.all {
       guard let read = descriptor.read, read.pointer != nil else { continue }
       XCTAssertNotNil(

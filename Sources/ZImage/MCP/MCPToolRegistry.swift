@@ -21,6 +21,8 @@ public enum MCPToolRegistry {
     clearQueue.annotated(.destructive),
     pauseQueue.annotated(.additive),
     resumeQueue.annotated(.additive),
+    setAdmissionMode.annotated(.additive),
+    getAdmissionMode.annotated(.readOnly),
     listLoras.annotated(.readOnly),
     shutdownServer.annotated(.destructive),
     systemStats.annotated(.readOnly),
@@ -339,6 +341,33 @@ public enum MCPToolRegistry {
       "properties": [:] as [String: Any],
     ] as [String: Any],
     routes: [RouteRef(method: "POST", path: "/v1/queue/pause")]
+  )
+
+  /// "Local mode" (Todd 2026-09-15): keep the engine for callers on its own
+  /// Mac; remote submits are deferred (503 deferred:true, admission_mode:
+  /// "local") rather than refused, so daemons wait instead of erroring.
+  static let setAdmissionMode = MCPToolDefinition(
+    name: "set_admission_mode",
+    description: "Set the engine admission mode. 'local' = Local mode: only callers on the engine's own Mac (or request sources matching allow_sources prefixes) may submit renders; every other submit is deferred with 503 {deferred:true, admission_mode:'local'} until the mode is 'open' again. In-memory: an engine restart comes back 'open'. Read it back with get_admission_mode, server_health (admission_mode) or queue_status.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "mode": ["type": "string", "enum": ["local", "open"], "description": "'local' to reserve the engine for this Mac, 'open' to admit everyone."] as [String: Any],
+        "allow_sources": ["type": "array", "items": ["type": "string"] as [String: Any], "description": "Optional request-source prefixes still admitted remotely while local (e.g. [\"ladder-\"])."] as [String: Any],
+      ] as [String: Any],
+      "required": ["mode"],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/queue/admission")]
+  )
+
+  static let getAdmissionMode = MCPToolDefinition(
+    name: "get_admission_mode",
+    description: "Read the engine admission mode ('open' or 'local'), the allow-listed sources, and when it last changed. Also on server_health as admission_mode.",
+    inputSchema: [
+      "type": "object",
+      "properties": [:] as [String: Any],
+    ] as [String: Any],
+    routes: [RouteRef(method: "GET", path: "/v1/queue/admission")]
   )
 
   static let resumeQueue = MCPToolDefinition(
