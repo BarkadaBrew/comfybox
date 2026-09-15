@@ -3,7 +3,7 @@
 **Repo:** `BarkadaBrew/comfybox` (`~/Projects/zimage-temporal`, Swift/MLX) + `BarkadaBrew/coffeeshop-server` (scheduler)
 **Component:** `Sources/ZImage/LTX2/LTX2Pipeline.swift` (denoise loop), `LTX2ConfigResolver.swift` (knobs), Kira content scheduler (clip policy)
 **Author:** Fable 5.1  **Date:** 2026-09-15
-**Status:** v1.1 — measured baseline, ceiling estimate, ranked levers, validation ladder proposed; **codex exec review applied (§10)**. Nothing changed in production yet.
+**Status:** v1.2 — ladder RUN and READ 2026-09-15 (§11); **production recipe changed to plain euler + the 10-step schedule** (82 → 33 min per 10 s clip). 12 fps latent + temporal ×2 rejected.
 **Directive (Todd, 2026-09-15):** "is there any way to accelerate ltx?" — after the same-seed burn/ghost investigation settled the production recipe (int8 DiT + heretic Gemma, 19-step author schedule, single pass, cfg++ euler, NAG 5, STG 0.3 flat, color anchor 1.0).
 
 ---
@@ -155,3 +155,21 @@ Findings and disposition (full text: `docs/FDD-ltx2-acceleration.codex-review.md
 6. **Nit — pass counts and knob names/ranges verified** against `LTX2Pipeline.swift:1779–1782, 1917–1960, 1972–1978, 2036–2058` and `LTX2ConfigResolver.swift:61–96`. No change.
 
 Codex verdict: "technically sound on the big performance story … the main fixes are in L3 and validation." Applied as above.
+
+---
+
+## 11. Ladder results (2026-09-15, Todd's reads, seed 771144, 576×896, 10 s unless noted)
+
+| Clip | Change from production | Wall clock | Read |
+|---|---|---|---:|
+| F4 (L0) | production (cfg++, 19 steps, STG 0.3 flat, anchor 1) | 82 min | good |
+| A1 | plain euler | 63 min* | "very nice. no lost limbs or drift" (extra finger = base constant; a tail-end hand) |
+| A2 | 10-step schedule | 51 min | "looks good" |
+| A3 | 12 fps latent + temporal ×2 | 38 min | "softer with some drift" — rejected |
+| A4 | A1 + A2 + A3 | 14 min | "drift and audio is not as good" — rejected (half the video tokens for the audio branch) |
+| **A6** | **A1 + A2 at native 24 fps** | **33 min** | **"i like it" — adopted** |
+| A5 | golden-hour spin clip (12 s, 19 steps), anchor 0 | 125 min | "still had some shift on spin" — anchor cleared; spins are the model ceiling → composer MOTION ENVELOPE rule (#1857) |
+
+\* contaminated by concurrent builds; the clean saving is closer to the predicted 33%.
+
+**Outcome.** L1 + L2 adopted: `sampler=euler`, `stage1_sigmas=1,0.9953,0.9836,0.949,0.848,0.675,0.452,0.243,0.1,0.028,0` in `~/.comfybox/config.json` (config-file tier), scheduler no longer sends a per-request sampler. **2.5× throughput** on the same GPU with no visible cost on the same seed. L3 (frame rate) is closed for good: the upscaler costs sharpness and coherence, and the audio branch degrades with half the video tokens. The anchor stays at 1.0. Kernel work remains off the table (§3).

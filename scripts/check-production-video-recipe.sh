@@ -61,8 +61,12 @@ expect LTX2_AUDIO_REFINE 0
 # the 2026-09-11 "veiled ghosts" were seen under the since-stripped 3-LoRA
 # motion stack — re-judge on the avocado soak). Two-stage is OUT: it drifts
 # composition and loses lip sync on the refine re-denoise.
-expect LTX2_SAMPLER euler_cfg_pp
-expect LTX2_STAGE1_SIGMAS 1.0,0.998,0.995,0.99,0.982,0.97,0.94,0.89,0.82,0.73,0.62,0.50,0.38,0.27,0.18,0.11,0.06,0.03,0.01,0.0
+# 2026-09-15 evening (acceleration ladder, same-seed reads A1/A2/A6): plain
+# euler (the CFG++ negative pass bought nothing visible at cfg 1) and the
+# 10-step distill schedule hold the burn fix and the hand; 82 → 33 min per
+# 10 s clip. 12 fps latent + temporal x2 rejected (softer, drift, worse audio).
+expect LTX2_SAMPLER euler
+expect LTX2_STAGE1_SIGMAS 1,0.9953,0.9836,0.949,0.848,0.675,0.452,0.243,0.1,0.028,0
 expect LTX2_REFINE_SIGMAS 0.85,0.7250,0.4219,0.0
 expect LTX2_NAG_SCALE 5
 expect LTX2_NAG_ALPHA 0.25
