@@ -46,6 +46,10 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeQueuePause(true)
       case "resume_queue":
         return try await executeQueuePause(false)
+      case "set_admission_mode":
+        return try await executeSetAdmissionMode(arguments)
+      case "get_admission_mode":
+        return try await executeGet("/v1/queue/admission")
       case "list_loras":
         return try await executeListLoras()
       case "shutdown_server":
@@ -434,6 +438,20 @@ public final class MCPToolExecutor: @unchecked Sendable {
 
   /// pause_queue / resume_queue -> POST /v1/queue/pause | /v1/queue/resume
   /// (the same persistent gate the desktop toolbar and HTTP API use).
+  /// set_admission_mode -> POST /v1/queue/admission {"mode", "allow_sources"}.
+  private func executeSetAdmissionMode(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let mode = params?.string("mode")?.lowercased(), mode == "local" || mode == "open" else {
+      return MCPToolResult(error: "Error: 'mode' is required and must be 'local' or 'open'")
+    }
+    var body: [String: Any] = ["mode": mode]
+    if let allow = params?.array("allow_sources") {
+      body["allow_sources"] = allow.compactMap { $0 as? String }
+    }
+    let data = try JSONSerialization.data(withJSONObject: body)
+    let (status, response) = try await client.post("/v1/queue/admission", body: data)
+    return Self.mapHTTPResponse(status: status, data: response)
+  }
+
   private func executeQueuePause(_ pause: Bool) async throws -> MCPToolResult {
     let (status, data) = try await client.post(pause ? "/v1/queue/pause" : "/v1/queue/resume", body: Data())
     return Self.mapHTTPResponse(status: status, data: data)

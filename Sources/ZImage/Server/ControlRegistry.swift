@@ -202,6 +202,13 @@ public enum ControlRegistry {
         write: ActionRef(method: "POST", path: "/v1/queue/resume"),
         mcpTool: "resume_queue", since: "phase0"),
       ControlDescriptor(
+        id: "queue.local_mode", title: "Local mode",
+        summary: "Reserve the engine for callers on this Mac: remote submits are deferred (503 deferred:true, admission_mode:'local') until the mode is 'open' again. In-memory; a restart comes back open. The menu-bar widget drives it.",
+        scope: .queue, type: .action,
+        read: ActionRef(method: "GET", path: "/v1/queue", pointer: "/admission_mode"),
+        write: ActionRef(method: "POST", path: "/v1/queue/admission"),
+        mcpTool: "set_admission_mode", since: "local-mode"),
+      ControlDescriptor(
         id: "queue.clear", title: "Clear queue",
         summary: "Drop all pending render jobs; the in-flight render is untouched."
           + " No MCP tool fronts this native route yet: the clear_queue tool posts the"
