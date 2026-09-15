@@ -141,12 +141,15 @@ struct ServerHealthResponse: Decodable {
     let memoryUsageMB: UInt64?
     let currentJobId: String?
     let progressPercent: Double?
+    /// "Local mode" (engine AdmissionGate): "open" | "local".
+    let admissionMode: String?
 
     enum CodingKeys: String, CodingKey {
         case status, model, loaded, loras
         case modelFamily = "model_family"
         case isRendering = "is_rendering"
         case isPaused = "is_paused"
+        case admissionMode = "admission_mode"
         case pendingCount = "pending_count"
         case renderCount = "render_count"
         case uptimeSeconds = "uptime_seconds"
@@ -329,6 +332,10 @@ public final class EngineService {
     /// poll — so a pause toggled from ANY surface (toolbar, HTTP API, MCP)
     /// shows truthfully here within one poll cycle.
     public var queuePaused: Bool = false
+    /// Engine "Local mode" (Todd 2026-09-15): remote submitters (the Kira/Bree
+    /// daemons, anything off this Mac) are deferred; callers on this Mac and
+    /// the Desktop keep working. Mirrored from /health `admission_mode`.
+    public var localMode: Bool = false
     /// Counter rather than a bool so a queued/background generate() running
     /// alongside the foreground one doesn't clear this out from under it —
     /// isGenerating stays true until the LAST concurrent call finishes.
@@ -1286,6 +1293,21 @@ public final class EngineService {
         queuePaused = paused   // optimistic; the next health poll confirms
     }
 
+    /// Engine "Local mode" on/off (`POST /v1/queue/admission`). In-memory on
+    /// the engine: a restart comes back open. The menu-bar item drives this.
+    public func setLocalMode(_ on: Bool) async throws {
+        guard let client = client, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+        let body = try JSONSerialization.data(withJSONObject: ["mode": on ? "local" : "open"])
+        let (status, responseData) = try await client.post("/v1/queue/admission", body: body)
+        guard (200...299).contains(status) else {
+            let errorMessage = parseErrorMessage(from: responseData) ?? "Server returned status \(status)"
+            throw EngineServiceError.serverError(status, errorMessage)
+        }
+        localMode = on   // optimistic; the next health poll confirms
+    }
+
     /// Purge the queue: drop every pending job AND interrupt the in-flight
     /// render. Interrupt-after-clear order matters — clearing first means the
     /// interrupted job cannot be followed by the next pending one.
@@ -1409,6 +1431,7 @@ public final class EngineService {
             currentModel = health.model
             currentModelFamily = health.modelFamily
             queuePaused = health.isPaused ?? false
+            localMode = (health.admissionMode ?? "open") == "local"
             let pending = health.pendingCount ?? 0
             let rendering = (health.isRendering ?? false) ? 1 : 0
             queueCount = pending + rendering

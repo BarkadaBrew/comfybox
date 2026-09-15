@@ -200,6 +200,8 @@ public final class WarmServer {
 
   private let configuration: WarmServerConfiguration
   private let host: String
+  /// "Local mode" (Todd 2026-09-15): runtime admission policy — see AdmissionGate.
+  let admission = AdmissionGate()
   private let logger: Logger
   private let coordinator: WarmServerCoordinator
   /// Submit/poll tracker for async image generation (GH: queue-submit —
@@ -734,6 +736,22 @@ public final class WarmServer {
   }
 
   fileprivate func respond(to request: HTTPRequest) async -> RoutedResponse {
+    // "Local mode" admission (AdmissionGate): a remote SUBMIT in local mode is
+    // deferred with 503 + {deferred:true, admission_mode:"local"} — the body the
+    // daemons already treat as "engine busy, wait". Read routes pass, so every
+    // caller can see the mode on /health and /v1/queue. Checked BEFORE the
+    // bridge so `POST /prompt` is covered.
+    if let why = admission.refusal(
+      method: request.method, path: request.path,
+      isLoopbackPeer: request.isLoopbackPeer,
+      source: AdmissionGate.submitSource(from: request.body)) {
+      logger.info("admission: deferred \(request.method) \(request.path) — \(why)")
+      let enc = JSONEncoder(); enc.keyEncodingStrategy = .convertToSnakeCase
+      if let data = try? enc.encode(AdmissionRefusal(admissionMode: AdmissionMode.local.rawValue, error: why)) {
+        return .json(.rawJSON(status: 503, data: data))
+      }
+      return .error(.error(status: 503, message: why))
+    }
     // Try ComfyUI bridge routes first.
     if let bridgeResponse = await comfyBridge.route(request) {
       return bridgeResponse
@@ -1870,6 +1888,30 @@ public final class WarmServer {
       await coordinator.setPaused(paused)
       auditLog.append(kind: "queue.pause", message: paused ? "Queue paused" : "Queue resumed")
       return .json(status: 200, payload: PauseResult(success: true, paused: paused))
+
+    case ("GET", "/v1/queue/admission"):
+      // "Local mode" readout — never gated, so any caller can learn the mode.
+      return admissionSnapshotResponse()
+
+    case ("POST", "/v1/queue/admission"):
+      // {"mode": "local" | "open", "allow_sources": ["ladder-", …]} — in-memory;
+      // a restart always comes back open.
+      struct Body: Decodable { let mode: String; let allowSources: [String]? }
+      let dec = JSONDecoder(); dec.keyDecodingStrategy = .convertFromSnakeCase
+      guard let body = try? dec.decode(Body.self, from: request.body) else {
+        return .error(.error(status: 400, message: "'mode' is required: \"local\" or \"open\" (optional allow_sources: [prefix, …])"))
+      }
+      guard let mode = AdmissionMode(rawValue: body.mode.lowercased()) else {
+        return .error(.error(status: 400, message: "unknown admission mode '\(body.mode)' — use \"local\" or \"open\""))
+      }
+      admission.set(mode: mode, allowSources: body.allowSources ?? [])
+      let snap = admission.snapshot()
+      auditLog.append(kind: "queue.admission",
+                      message: mode == .local
+                        ? "Local mode ON — remote submissions deferred\(snap.allowSources.isEmpty ? "" : " (allowed sources: \(snap.allowSources.joined(separator: ", ")))")"
+                        : "Local mode OFF — admission open")
+      logger.info("admission: mode=\(mode.rawValue) allow=\(snap.allowSources)")
+      return admissionSnapshotResponse()
 
     case ("POST", _) where request.path.hasPrefix("/v1/queue/") && request.path.hasSuffix("/move"):
       let mid = request.path.dropFirst("/v1/queue/".count).dropLast("/move".count)
@@ -4162,6 +4204,7 @@ public final class WarmServer {
     var payload: [String: Any] = [
       "is_rendering": snap.isRendering,
       "is_paused": snap.isPaused,
+      "admission_mode": admission.snapshot().mode.rawValue,
       "max_pending": snap.maxPending,
       "render_count": snap.renderCount,
       "failed_count": snap.failedRenderCount,
@@ -7055,7 +7098,8 @@ public final class WarmServer {
     _ health: HealthResponse,
     videoAvailable: Bool,
     activeVideoJobs: Int,
-    localVideoReadiness: LocalVideoReadiness = .unchecked
+    localVideoReadiness: LocalVideoReadiness = .unchecked,
+    admission: AdmissionSnapshot? = nil
   ) -> Data? {
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -7067,6 +7111,9 @@ public final class WarmServer {
     healthJSON["model_variant"] = (health.modelVariant as Any?) ?? NSNull()
     healthJSON["model_alias"] = (health.modelAlias as Any?) ?? NSNull()
     if healthJSON["last_recipe"] == nil { healthJSON["last_recipe"] = NSNull() }
+    // "Local mode" visibility for every caller (daemons, MCP server_health, Desktop).
+    healthJSON["admission_mode"] = admission?.mode.rawValue ?? AdmissionMode.open.rawValue
+    healthJSON["admission_allow_sources"] = admission?.allowSources ?? []
     healthJSON["video"] = [
       "available": videoAvailable,
       "backend": videoAvailable ? "replicate" : "none",
@@ -7094,13 +7141,21 @@ public final class WarmServer {
   /// the configuration — so there is nothing to await and no subset of the
   /// payload has to be split onto a separate route. Shared by the async dispatch
   /// arm and `serveControlPlaneSync`, so the two cannot emit different bytes.
+  /// `GET/POST /v1/queue/admission` body: {"mode", "allow_sources", "since"}.
+  private func admissionSnapshotResponse() -> RoutedResponse {
+    let enc = JSONEncoder(); enc.keyEncodingStrategy = .convertToSnakeCase
+    if let data = try? enc.encode(admission.snapshot()) { return .json(.rawJSON(status: 200, data: data)) }
+    return .error(.error(status: 500, message: "could not encode admission snapshot"))
+  }
+
   fileprivate func healthRouteResponse() -> HTTPResponse {
     let memoryBytes = Self.currentMemoryFootprintBytes()
     let health = liveHealthResponse(memoryBytes: memoryBytes)
     if let data = Self.healthJSON(
       health, videoAvailable: replicateVideoProxy != nil,
       activeVideoJobs: videoJobTracker.activeJobCount + (replicateVideoProxy?.activeJobCount ?? 0),
-      localVideoReadiness: localVideoReadinessMonitor.current()) {
+      localVideoReadiness: localVideoReadinessMonitor.current(),
+      admission: admission.snapshot()) {
       return .rawJSON(status: 200, data: data)
     }
     return .json(status: 200, payload: health)
@@ -12907,6 +12962,17 @@ private final class ConnectionHandler {
     self.server = server
   }
 
+  /// Is the remote end of this connection on this Mac? (AdmissionGate.)
+  private var peerIsLoopback: Bool {
+    guard case .hostPort(let host, _) = connection.endpoint else { return false }
+    switch host {
+    case .ipv4(let a): return a.isLoopback
+    case .ipv6(let a): return a.isLoopback || (a.asIPv4?.isLoopback ?? false)
+    case .name(let n, _): return n == "localhost" || n == "127.0.0.1" || n == "::1"
+    @unknown default: return false
+    }
+  }
+
   func start() {
     retainSelf = self
     connection.start(queue: queue)
@@ -13004,7 +13070,8 @@ private final class ConnectionHandler {
         path: path,
         queryString: queryString,
         headers: headers,
-        body: body
+        body: body,
+        isLoopbackPeer: peerIsLoopback
       )
     )
   }
@@ -13088,6 +13155,11 @@ struct HTTPRequest {
   let queryString: String?
   let headers: [String: String]
   let body: Data
+  /// True when the TCP peer is a loopback address (a caller on this Mac).
+  /// "Local mode" (AdmissionGate) admits submits only from such peers.
+  /// Defaults to true so synthetic requests (tests, control plane) behave as
+  /// today; the connection handler sets the real value.
+  var isLoopbackPeer: Bool = true
 
   /// Parse query parameters from the query string.
   ///
