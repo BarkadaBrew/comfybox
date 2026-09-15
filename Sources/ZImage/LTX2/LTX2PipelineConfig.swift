@@ -198,10 +198,12 @@ public struct LTX2PipelineConfig: Sendable {
 
   /// Per-step STG scale ramp. Vantage boosts the first two steps (2.0, 1.5) then
   /// holds `base`. Additive so base==1.0 reproduces the reference 2,1.5,1,1,... schedule.
-  public static func stgScaleForStep(_ i: Int, base: Float) -> Float {
+  /// `headBoost` scales the first-two-step boost: 1 = the reference ramp
+  /// (+1.0, +0.5), 0 = flat (`base` on every step). See `stg_head_boost`.
+  public static func stgScaleForStep(_ i: Int, base: Float, headBoost: Float = 1) -> Float {
     switch i {
-    case 0: return base + 1.0
-    case 1: return base + 0.5
+    case 0: return base + 1.0 * headBoost
+    case 1: return base + 0.5 * headBoost
     default: return base
     }
   }

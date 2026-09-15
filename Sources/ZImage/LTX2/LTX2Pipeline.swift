@@ -2042,7 +2042,7 @@ public final class LTX2Pipeline {
         // The boosted first-two-step ramp is a video motion recipe.
         let stgScale = f == 1
           ? stgBase
-          : LTX2PipelineConfig.stgScaleForStep(i, base: stgBase)
+          : LTX2PipelineConfig.stgScaleForStep(i, base: stgBase, headBoost: resolvedConfig.stgHeadBoost)
         let velocitySTG = transformer(
           latent: latentsFlat,
           timestep: timesteps,
