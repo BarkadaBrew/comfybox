@@ -312,7 +312,13 @@ struct ComfyBoxDesktopApp: App {
             SettingsView(engine: engine)
         }
 
-        MenuBarExtra("CoffeeShop", systemImage: menuBarSymbol) {
+        // Todd 2026-09-16: "menubar widget on mac top menu bar disappears
+        // when local is chosen". The `systemImage:` initializer re-creates
+        // the status item when the symbol name changes, and on macOS 26/27
+        // that re-creation can leave it zero-width. The label-closure form
+        // updates the image in place, so the item stays put while the glyph
+        // swaps between cup / lock / warning.
+        MenuBarExtra {
             Text("CoffeeShop Suite").font(.headline)
             Divider()
             Button(engine.connectionState.isConnected
@@ -351,6 +357,9 @@ struct ComfyBoxDesktopApp: App {
             }
             Divider()
             Button("Quit CoffeeShop Desktop") { NSApp.terminate(nil) }
+        } label: {
+            Image(systemName: menuBarSymbol)
+                .accessibilityLabel("CoffeeShop")
         }
         .menuBarExtraStyle(.menu)
     }
