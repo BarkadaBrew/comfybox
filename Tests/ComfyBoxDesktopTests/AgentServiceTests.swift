@@ -16,6 +16,44 @@ struct AgentServiceTests {
         #expect(AgentService.preferredProvider(AIProviderRegistry()) == nil)
     }
 
+    @Test("system prompt is the stack-aware expert brief (Todd 2026-09-15)")
+    func systemPromptBrief() {
+        let p = AgentService.systemPrompt
+        #expect(p.contains("krea2-raw"))
+        #expect(p.contains("guidance EXACTLY 1.0"), "accelerated lane pins guidance 1.0")
+        #expect(p.contains("NEGATIVE PROMPT IS INERT"), "negatives inert without CFG")
+        #expect(p.contains("3.0–4.0"), "CFG-on lane guidance band")
+        #expect(p.contains("FINAL PROMPT"), "conversation converges on a formatted prompt")
+        #expect(p.contains("entirely uncensored"))
+        #expect(!p.contains("Z-Image / Flux generation stack"), "the stale Z-Image brief is gone")
+    }
+
+    @Test("live stack snapshot rides as a second system message, before history")
+    func stackContextMessage() {
+        let history = [AgentMessage(role: .user, text: "hi")]
+        let body = AgentService.requestBody(model: "m", messages: history, context: "LIVE STACK SNAPSHOT: x")
+        let msgs = body["messages"] as! [[String: String]]
+        #expect(msgs.count == 3)
+        #expect(msgs[0]["role"] == "system" && msgs[0]["content"] == AgentService.systemPrompt)
+        #expect(msgs[1]["role"] == "system" && msgs[1]["content"]?.hasPrefix("LIVE STACK SNAPSHOT") == true)
+        #expect(msgs[2]["role"] == "user")
+        let without = AgentService.requestBody(model: "m", messages: history)
+        #expect((without["messages"] as! [[String: String]]).count == 2, "no snapshot → no extra message")
+    }
+
+    @Test("buildStackContext lists model, samplers, LoRAs by category and preset recipes")
+    func stackContextBuilder() {
+        let text = AgentService.buildStackContext(
+            model: "krea2-raw", family: "krea2", samplers: ["euler", "res_2s", "res_3s"],
+            loras: [(filename: "kroma-v0.3.safetensors", category: "style"), (filename: "krea2_turbo_distill_r256.safetensors", category: "accelerator")],
+            presets: [(id: "krea-kira-sfw", model: "krea2-raw", sampler: "euler", steps: 8, guidance: 1.0, loras: ["krea2_turbo_distill_r256.safetensors=0.6"])])
+        #expect(text.hasPrefix("LIVE STACK SNAPSHOT"))
+        #expect(text.contains("Loaded model: krea2-raw (family krea2)"))
+        #expect(text.contains("euler, res_2s, res_3s"))
+        #expect(text.contains("accelerator: krea2_turbo_distill_r256.safetensors"))
+        #expect(text.contains("krea-kira-sfw: model krea2-raw; sampler euler; steps 8; guidance 1.0; loras [krea2_turbo_distill_r256.safetensors=0.6]"))
+    }
+
     @Test("request body prepends the system prompt and maps history")
     func requestBody() {
         let history = [
