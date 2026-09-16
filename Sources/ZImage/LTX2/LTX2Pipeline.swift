@@ -1429,6 +1429,7 @@ public final class LTX2Pipeline {
     negativeInputIds: MLXArray? = nil,
     negativeAttentionMask: MLXArray? = nil,
     beatSchedule: [LTX2ResolvedBeat] = [],
+    audioSeconds: Float? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) throws -> LTX2PipelineOutput {
     try nonPreemptible("generateMultiKeyframe") {
@@ -1438,11 +1439,15 @@ public final class LTX2Pipeline {
         seed: seed, guidance: guidance,
         negativeInputIds: negativeInputIds, negativeAttentionMask: negativeAttentionMask,
         beatSchedule: beatSchedule,
+        audioSeconds: audioSeconds,
         progressCallback: progressCallback)
     }
   }
 
   /// #1479: `generateMultiKeyframe` with preemption/resume plumbing.
+  /// WP2a: `audioSeconds` enables the joint audio stream exactly as
+  /// `generateI2VResumable` does (same keyed noise, same AV state through
+  /// denoise / checkpoints / refine); nil keeps the path video-only.
   func generateMultiKeyframeResumable(
     inputIds: MLXArray,
     attentionMask: MLXArray,
@@ -1456,6 +1461,7 @@ public final class LTX2Pipeline {
     negativeInputIds: MLXArray? = nil,
     negativeAttentionMask: MLXArray? = nil,
     beatSchedule: [LTX2ResolvedBeat] = [],
+    audioSeconds: Float? = nil,
     preemption: PreemptionSignal? = nil,
     telemetry: LTX2PhaseTelemetry? = nil,
     resume: LTX2ResumeState? = nil,
@@ -1473,17 +1479,20 @@ public final class LTX2Pipeline {
     // Step 1: Encode prompt
     logger.info("Encoding prompt...")
     telemetry?.begin(.textEncode)
+    let wantAudio = audioSeconds != nil && transformer.hasAudio
     let textOutput = textEncoder.encode(
-      inputIds: inputIds, attentionMask: attentionMask, returnAudioEmbeddings: false
+      inputIds: inputIds, attentionMask: attentionMask, returnAudioEmbeddings: wantAudio
     )
     eval(textOutput.videoEmbeddings)
 
     var negativeEmbeddings: MLXArray? = nil
+    var negativeAudioEmbeddings: MLXArray? = nil
     if cfgScale > 1.0 || resolvedConfig.samplerIsCfgPP, let negIds = negativeInputIds, let negMask = negativeAttentionMask {
       let negOutput = textEncoder.encode(
-        inputIds: negIds, attentionMask: negMask, returnAudioEmbeddings: false
+        inputIds: negIds, attentionMask: negMask, returnAudioEmbeddings: wantAudio
       )
       negativeEmbeddings = negOutput.videoEmbeddings
+      if wantAudio { negativeAudioEmbeddings = negOutput.audioEmbeddings }
       eval(negativeEmbeddings!)
     }
 
@@ -1560,6 +1569,28 @@ public final class LTX2Pipeline {
     )
     eval(precomputedPE.cos, precomputedPE.sin)
 
+    // Step 5b: Audio stream (WP2a) — the same setup as generateI2VResumable.
+    // The per-token av_ca video conditioning inside callAV handles the
+    // keyframe denoise mask (conditioned tokens at ~0), so mid-sequence
+    // keyframes need nothing audio-specific here.
+    var avState: LTX2AVDenoiseState? = nil
+    if let seconds = audioSeconds, wantAudio {
+      let ta = max(1, Int((seconds * 25).rounded(.up)))
+      let audioKey = seed.map { MLXRandom.key($0 &+ 0xA0D10) }
+      let audioNoise = MLXRandom.normal([1, 8, ta, 16], key: audioKey).asType(.float32)
+      let audioInit = audioNoise * MLXArray(sigmas[0])
+      let (_, audioCoords) = LTX2AudioPatchifier.patchify(audioInit)
+      let avPE = transformer.precomputeAVPositionalEmbeddings(
+        positions: positions, audioCoords: audioCoords)
+      avState = LTX2AVDenoiseState(
+        audioLatents: audioInit,
+        audioContext: textOutput.audioEmbeddings,
+        pe: avPE,
+        negativeAudioContext: negativeAudioEmbeddings,
+        audioNoiseKey: seed.map { MLXRandom.key($0 &+ 0xA0D12) })
+      logger.info("Audio stream enabled (multi-keyframe): \(ta) latent frames (\(seconds)s, negatives \(negativeAudioEmbeddings != nil ? "on" : "off")).")
+    }
+
     // #1479 resume dispatch — see generateI2VResumable.
     let baseFingerprint = denoiseConfigFingerprint(
       width: latW * spatialCompression, height: latH * spatialCompression,
@@ -1569,6 +1600,7 @@ public final class LTX2Pipeline {
     var resumedLatents: MLXArray? = nil
     if let r = resume {
       try validateResumeUnlessRefineOwned(r, fingerprint: baseFingerprint, sigmas: sigmas)
+      restoreAudio(r, into: avState)
       if r.phase == .baseDenoise {
         if r.stepIndex > 0 {
           resumedLatents = r.videoLatents
@@ -1597,6 +1629,7 @@ public final class LTX2Pipeline {
         cfgScale: cfgScale,
         state: state,
         nagEmbeddings: nagEmbeddings, nag: nagConfig,
+        avState: avState,
         startStep: baseStartStep,
         seed: seed,
         preemption: preemption,
@@ -1617,7 +1650,7 @@ public final class LTX2Pipeline {
        LTX2UnwindGuard.mayCheckpoint(at: .refineDenoise, whileResuming: resume?.phase) {
       return .yielded(boundaryCheckpoint(
         phase: .refineDenoise, latents: latents, sigmas: sigmas,
-        fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: nil))
+        fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: avState))
     }
 
     // Step 6b: Two-stage refine — SAME treatment as generateI2V. Continuation
@@ -1634,6 +1667,7 @@ public final class LTX2Pipeline {
         nagEmbeddings: nagEmbeddings, nag: nagConfig,
         cfgScale: cfgScale, seed: seed,
         refineAnchorImage: nil,
+        avState: avState,
         beatSchedule: beatSchedule,
         beatUnbiasedFrameIndices: conditionedBeatFrames,
         preemption: preemption, telemetry: telemetry,
@@ -1649,7 +1683,7 @@ public final class LTX2Pipeline {
        LTX2UnwindGuard.mayCheckpoint(at: .vaeDecode, whileResuming: resume?.phase) {
       return .yielded(boundaryCheckpoint(
         phase: .vaeDecode, latents: refinedLatents, sigmas: sigmas,
-        fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: nil))
+        fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: avState))
     }
 
     // Step 7: Decode
@@ -1666,13 +1700,17 @@ public final class LTX2Pipeline {
     let elapsed = CFAbsoluteTimeGetCurrent() - startTime
     logger.info("Multi-keyframe generation complete in \(String(format: "%.1f", elapsed))s")
 
-    return .completed(LTX2PipelineOutput(
+    var output = LTX2PipelineOutput(
       decoded: clamped,
       numFrames: clamped.dim(2),
       width: width,
       height: height,
       elapsedSeconds: elapsed
-    ))
+    )
+    // Refined audio is written back into `avState` by applyTwoStageRefine on a
+    // genuine completion (same as the i2v path), so this is the final track.
+    output.audioLatents = avState?.audioLatents
+    return .completed(output)
   }
 
   // MARK: - Internal: Denoising Loop

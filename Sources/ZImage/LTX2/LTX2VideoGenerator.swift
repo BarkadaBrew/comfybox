@@ -28,6 +28,24 @@ public struct LTX2LoRAReference: Sendable, Equatable {
     }
 }
 
+/// One EXTRA keyframe condition for a single-pass render (WP2a,
+/// docs/FDD-ltx-director-tab.md): an image spliced into the latent grid at
+/// `frame` (video frames; latent index = frame / 8, floor) at `strength`
+/// (denoise mask = 1 - strength over that latent frame). Frame 0 is never an
+/// extra — it stays `LTX2VideoRequest.initImagePath`/`strength` so a lone
+/// frame-0 keyframe keeps the i2v arm (face/refine anchors + audio).
+public struct LTX2KeyframeRef: Codable, Sendable, Equatable {
+    public var imagePath: String
+    public var frame: Int
+    public var strength: Float
+
+    public init(imagePath: String, frame: Int, strength: Float = 1.0) {
+        self.imagePath = imagePath
+        self.frame = frame
+        self.strength = strength
+    }
+}
+
 /// Parameters for one local LTX-2 video generation.
 public struct LTX2VideoRequest: Sendable {
     public var prompt: String
@@ -117,6 +135,15 @@ public struct LTX2VideoRequest: Sendable {
     /// refine while retaining the caller's original intent for provenance.
     public var twoStageRequested: Bool?
     public var refineSkippedReasonHint: String?
+    /// WP2a: extra keyframe conditions with `frame > 0` (frame 0 is
+    /// `initImagePath`/`strength`). Non-empty routes the chunk through
+    /// `LTX2Pipeline.generateMultiKeyframe`; `validate()` enforces the grid
+    /// (frame % 8 == 0), range (0 < frame < framesPerChunk), unique latent
+    /// buckets, single-pass (`extendToSeconds == 0`) and no identity anchor.
+    /// Every image is loaded through the same crop/resize/compression path as
+    /// the init image. Deterministic from the request, so a preemption resume
+    /// re-derives it (nothing new rides `LTX2RenderContext`).
+    public var keyframes: [LTX2KeyframeRef]
 
     /// `loras`, with the deprecated single `loraPath`/`loraStrength` (if set)
     /// prepended — the single field always applied first, matching the old
@@ -160,8 +187,10 @@ public struct LTX2VideoRequest: Sendable {
         contentMode: String? = nil,
         dimensionReason: String? = nil,
         twoStageRequested: Bool? = nil,
-        refineSkippedReasonHint: String? = nil
+        refineSkippedReasonHint: String? = nil,
+        keyframes: [LTX2KeyframeRef] = []
     ) {
+        self.keyframes = keyframes
         self.audio = audio
         self.beatSchedule = beatSchedule
         self.source = source
@@ -348,9 +377,15 @@ public enum LTX2VideoError: Error, LocalizedError {
     case recipeMismatch(accepted: String, executed: String)
     /// A one-frame (native image) request combined with a video-only option.
     case imageModeConflict(String)
+    /// WP2a: a `keyframes[]` entry (or the wire shape around it) violates the
+    /// grid/range/uniqueness/single-pass rules, or conflicts with the legacy
+    /// init-image fields (`keyframe_conflict: …`).
+    case invalidKeyframe(String)
 
     public var errorDescription: String? {
         switch self {
+        case .invalidKeyframe(let why):
+            return "LTX-2 invalid_keyframe: \(why)"
         case .imageModeConflict(let why):
             return "LTX-2 one-frame (image) request: \(why)."
         case .invalidFrameCount(let n):
@@ -530,6 +565,43 @@ public final class LTX2VideoGenerator {
             }
             if request.extendToSeconds > 0 {
                 throw LTX2VideoError.imageModeConflict("extend_to_seconds requires a video (1 + 8k frames, ≥ 9)")
+            }
+        }
+        if !request.keyframes.isEmpty {
+            // WP2a keyframe rules. Frame 0 is the init image's slot; every extra
+            // lands strictly inside the pass on the 8-frame latent grid (the
+            // pipeline floors frame/8 — off-grid frames would land one latent
+            // frame earlier than the caller's ruler shows), in its own latent
+            // bucket (applyConditioning is last-writer-wins), on a SINGLE pass
+            // (frames are chunk-local; continuation chunks re-seed frame 0
+            // from the previous tail), and never alongside the identity anchor
+            // (its last-frame splice would collide with a user end keyframe).
+            var buckets = Set<Int>()
+            for kf in request.keyframes {
+                guard kf.frame > 0, kf.frame < request.framesPerChunk else {
+                    throw LTX2VideoError.invalidKeyframe(
+                        "frame \(kf.frame) is outside 0 < frame < \(request.framesPerChunk) (frame 0 is image_path/strength)")
+                }
+                guard kf.frame % 8 == 0 else {
+                    throw LTX2VideoError.invalidKeyframe(
+                        "frame \(kf.frame) is off the 8-frame latent grid (frame % 8 must be 0)")
+                }
+                guard kf.strength > 0, kf.strength <= 1 else {
+                    throw LTX2VideoError.invalidKeyframe(
+                        "strength \(kf.strength) at frame \(kf.frame) must be in (0, 1]")
+                }
+                guard buckets.insert(kf.frame / 8).inserted else {
+                    throw LTX2VideoError.invalidKeyframe(
+                        "frame \(kf.frame) shares latent frame \(kf.frame / 8) with another keyframe")
+                }
+            }
+            guard request.extendToSeconds == 0 else {
+                throw LTX2VideoError.invalidKeyframe(
+                    "keyframes require a single-pass render (extend_to_seconds/duration beyond one chunk is not supported)")
+            }
+            guard request.identityAnchorStrength == 0 else {
+                throw LTX2VideoError.invalidKeyframe(
+                    "keyframes require identity_anchor_strength 0 (the anchor's last-frame splice would collide with a keyframe)")
             }
         }
         if request.audio {
@@ -1147,6 +1219,85 @@ public final class LTX2VideoGenerator {
         #endif
     }
 
+    #if canImport(CoreGraphics) && canImport(ImageIO)
+    /// Load one conditioning still for the render: center-crop + resize to
+    /// the request's render size FIRST, then the LTX conditioning preprocess
+    /// (H.264 round-trip at `compression`, JPEG fallback), then normalize for
+    /// the VAE encoder. Shared by the init image and every WP2a keyframe.
+    private func loadConditioningImage(
+        path: String, request: LTX2VideoRequest, compression: Int
+    ) throws -> MLXArray {
+        let url = URL(fileURLWithPath: path)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let rawImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw LTX2VideoError.imageLoadFailed(path)
+        }
+        // Workflow order (nodes 7 -> 8): center-crop + scale to the render
+        // size FIRST, then compression-preprocess at that size. Compressing
+        // at native resolution and downscaling after (the old order)
+        // changes the artifact character and stretches on aspect mismatch.
+        var cgImage = try QwenImageIO.resizedCGImage(
+            from: centerCropped(rawImage, targetW: request.width, targetH: request.height),
+            width: request.width, height: request.height)
+        // LTX conditioning preprocess (ComfyUI LTXVPreprocess, img_compression
+        // = libx264 CRF): round-trip the still through lossy compression so
+        // it carries codec-like artifacts. LTX is trained on VIDEO frames — a
+        // pristine still is out-of-distribution and the model freezes it
+        // (mannequin i2v, no locomotion). Measured on the same source/prompt/
+        // seed: ComfyUI (with preprocess) motion 2.24 vs ours (raw PNG) 1.07.
+        // LTX2_I2V_COMPRESSION=0 disables.
+        if compression > 0 {
+            // Prefer a REAL H.264 round-trip (matches ComfyUI's libx264
+            // preprocess artifact character); fall back to JPEG if the
+            // encode fails for any reason.
+            if let rt = try? LTX2PostProcess.h264RoundTrip(cgImage, compression: compression) {
+                cgImage = rt
+                logger.info("LTX-2 I2V: conditioning preprocess — H.264 round-trip (compression \(compression)).")
+            } else {
+                let quality = max(0.05, 1.0 - Double(compression) / 100.0 * 1.4)
+                let jpeg = NSMutableData()
+                if let dest = CGImageDestinationCreateWithData(
+                    jpeg as CFMutableData, "public.jpeg" as CFString, 1, nil) {
+                    CGImageDestinationAddImage(dest, cgImage, [
+                        kCGImageDestinationLossyCompressionQuality: quality
+                    ] as CFDictionary)
+                    if CGImageDestinationFinalize(dest),
+                       let rtSource = CGImageSourceCreateWithData(jpeg as CFData, nil),
+                       let rtImage = CGImageSourceCreateImageAtIndex(rtSource, 0, nil) {
+                        cgImage = rtImage
+                        logger.info("LTX-2 I2V: conditioning preprocess — JPEG fallback q=\(String(format: "%.2f", quality)) (compression \(compression)).")
+                    }
+                }
+            }
+        }
+        let pixels = try QwenImageIO.array(
+            from: cgImage, addBatchDimension: true, dtype: .float32)
+        return QwenImageIO.normalizeForEncoder(pixels)
+    }
+
+    /// Center-crop a CGImage to the target aspect ratio, matching ComfyUI's
+    /// ImageScale crop="center" (workflow nodes 7 and 19). Our plain resize
+    /// STRETCHES on aspect mismatch — seed stills are often 9:16 (0.5625)
+    /// against 384x640 (0.6), a ~7% vertical squash that distorts the
+    /// conditioning content vs the workflow's crop.
+    private func centerCropped(_ cg: CGImage, targetW: Int, targetH: Int) -> CGImage {
+        let srcW = Double(cg.width), srcH = Double(cg.height)
+        let targetAspect = Double(targetW) / Double(targetH)
+        let srcAspect = srcW / srcH
+        var cropW = srcW, cropH = srcH
+        if srcAspect > targetAspect {
+            cropW = srcH * targetAspect
+        } else {
+            cropH = srcW / targetAspect
+        }
+        let rect = CGRect(
+            x: ((srcW - cropW) / 2).rounded(.down),
+            y: ((srcH - cropH) / 2).rounded(.down),
+            width: cropW.rounded(), height: cropH.rounded())
+        return cg.cropping(to: rect) ?? cg
+    }
+    #endif
+
     private func render(
         _ request: LTX2VideoRequest,
         progress: ((Int, Int, Int, Int) -> Void)?,   // (chunk, totalChunks, step, totalSteps)
@@ -1401,28 +1552,6 @@ public final class LTX2VideoGenerator {
         var allFrames: [CGImage] = ctx.frames
         var audioLatents: MLXArray? = ctx.audioLatents
 
-        // Center-crop a CGImage to the target aspect ratio, matching ComfyUI's
-        // ImageScale crop="center" (workflow nodes 7 and 19). Our plain resize
-        // STRETCHES on aspect mismatch — seed stills are often 9:16 (0.5625)
-        // against 384x640 (0.6), a ~7% vertical squash that distorts the
-        // conditioning content vs the workflow's crop.
-        func centerCropped(_ cg: CGImage, targetW: Int, targetH: Int) -> CGImage {
-            let srcW = Double(cg.width), srcH = Double(cg.height)
-            let targetAspect = Double(targetW) / Double(targetH)
-            let srcAspect = srcW / srcH
-            var cropW = srcW, cropH = srcH
-            if srcAspect > targetAspect {
-                cropW = srcH * targetAspect
-            } else {
-                cropH = srcW / targetAspect
-            }
-            let rect = CGRect(
-                x: ((srcW - cropW) / 2).rounded(.down),
-                y: ((srcH - cropH) / 2).rounded(.down),
-                width: cropW.rounded(), height: cropH.rounded())
-            return cg.cropping(to: rect) ?? cg
-        }
-
         // Conditioning compression (libx264 CRF), function-scoped so BOTH the
         // initial seed AND the chained continuation-chunk seeds get it. Chained
         // seeds that skip it condition on a PRISTINE generated frame = the
@@ -1434,53 +1563,17 @@ public final class LTX2VideoGenerator {
 
         // Seed image: the init image for I2V, else nil (T2V first chunk).
         var currentImage: MLXArray? = try request.initImagePath.map { path in
-            let url = URL(fileURLWithPath: path)
-            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                  let rawImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-                throw LTX2VideoError.imageLoadFailed(path)
-            }
-            // Workflow order (nodes 7 -> 8): center-crop + scale to the render
-            // size FIRST, then compression-preprocess at that size. Compressing
-            // at native resolution and downscaling after (the old order)
-            // changes the artifact character and stretches on aspect mismatch.
-            var cgImage = try QwenImageIO.resizedCGImage(
-                from: centerCropped(rawImage, targetW: request.width, targetH: request.height),
-                width: request.width, height: request.height)
-            // LTX conditioning preprocess (ComfyUI LTXVPreprocess, img_compression
-            // = libx264 CRF): round-trip the still through lossy compression so
-            // it carries codec-like artifacts. LTX is trained on VIDEO frames — a
-            // pristine still is out-of-distribution and the model freezes it
-            // (mannequin i2v, no locomotion). Measured on the same source/prompt/
-            // seed: ComfyUI (with preprocess) motion 2.24 vs ours (raw PNG) 1.07.
-            // LTX2_I2V_COMPRESSION=0 disables.
-            let compression = conditioningCompression
-            if compression > 0 {
-                // Prefer a REAL H.264 round-trip (matches ComfyUI's libx264
-                // preprocess artifact character); fall back to JPEG if the
-                // encode fails for any reason.
-                if let rt = try? LTX2PostProcess.h264RoundTrip(cgImage, compression: compression) {
-                    cgImage = rt
-                    logger.info("LTX-2 I2V: conditioning preprocess — H.264 round-trip (compression \(compression)).")
-                } else {
-                    let quality = max(0.05, 1.0 - Double(compression) / 100.0 * 1.4)
-                    let jpeg = NSMutableData()
-                    if let dest = CGImageDestinationCreateWithData(
-                        jpeg as CFMutableData, "public.jpeg" as CFString, 1, nil) {
-                        CGImageDestinationAddImage(dest, cgImage, [
-                            kCGImageDestinationLossyCompressionQuality: quality
-                        ] as CFDictionary)
-                        if CGImageDestinationFinalize(dest),
-                           let rtSource = CGImageSourceCreateWithData(jpeg as CFData, nil),
-                           let rtImage = CGImageSourceCreateImageAtIndex(rtSource, 0, nil) {
-                            cgImage = rtImage
-                            logger.info("LTX-2 I2V: conditioning preprocess — JPEG fallback q=\(String(format: "%.2f", quality)) (compression \(compression)).")
-                        }
-                    }
-                }
-            }
-            let pixels = try QwenImageIO.array(
-                from: cgImage, addBatchDimension: true, dtype: .float32)
-            return QwenImageIO.normalizeForEncoder(pixels)
+            try loadConditioningImage(path: path, request: request, compression: conditioningCompression)
+        }
+
+        // WP2a: extra keyframe conditions (frame > 0), through the SAME loader
+        // as the init image (center-crop + resize to the render size + H.264
+        // round-trip) so `applyConditioning` never sees a shape mismatch.
+        // Deterministic from the request, so a preemption resume rebuilds it.
+        let extraKeyframes: [LTX2Pipeline.Keyframe] = try request.keyframes.map { kf in
+            LTX2Pipeline.Keyframe(
+                image: try loadConditioningImage(path: kf.imagePath, request: request, compression: conditioningCompression),
+                videoFrameIndex: kf.frame, strength: kf.strength)
         }
 
         // The ORIGINAL init image, kept for identity re-anchoring of
@@ -1610,7 +1703,31 @@ public final class LTX2VideoGenerator {
 
             let chunkSeed = request.seed + UInt64(chunk)
             let outcome: LTX2PipelineOutcome
-            if let image = currentImage {
+            if !extraKeyframes.isEmpty {
+                // WP2a: caller-placed keyframes (frame > 0). validate() pinned
+                // this to a single pass with no identity anchor, so the only
+                // other condition is the frame-0 init image (when present) at
+                // request.strength. The multi-keyframe path carries audio on
+                // chunk 0 like the i2v/t2v arms; it has no face/refine anchor
+                // (those stay exclusive to the frame-0-only i2v arm below).
+                let keyframes: [LTX2Pipeline.Keyframe] =
+                    (currentImage.map { [LTX2Pipeline.Keyframe(image: $0, videoFrameIndex: 0, strength: request.strength)] } ?? [])
+                    + extraKeyframes
+                outcome = try pipeline.generateMultiKeyframeResumable(
+                    inputIds: batch.inputIds, attentionMask: batch.attentionMask,
+                    keyframes: keyframes,
+                    width: request.width, height: request.height,
+                    numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                    guidance: request.guidance,
+                    negativeInputIds: negBatch?.inputIds,
+                    negativeAttentionMask: negBatch?.attentionMask,
+                    beatSchedule: resolvedBeats,
+                    audioSeconds: wantAudio && chunk == 0
+                        ? Float(request.framesPerChunk) / Float(request.fps) : nil,
+                    preemption: preemption, telemetry: telemetry,
+                    resume: chunkResume, chunkIndex: chunk,
+                    progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
+            } else if let image = currentImage {
                 if chunk > 0, request.identityAnchorStrength > 0, let anchor = sourceImage {
                     // Continuation chunks drift chunk-by-chunk (each only sees
                     // the previous tail). Splice the original source in at the

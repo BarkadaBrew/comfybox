@@ -2264,12 +2264,32 @@ public final class WarmServer {
     let diagnostic: Bool?
   }
 
+  /// One entry of the generic `keyframes[]` wire field (WP2a,
+  /// docs/FDD-ltx-director-tab.md): `{image_path, frame, strength?}`.
+  struct LocalVideoKeyframe: Decodable {
+    let imagePath: String
+    let frame: Int
+    /// nil → 1.0 (resolved in `resolveKeyframes`).
+    let strength: Float?
+  }
+
   struct LocalVideoRequest: Decodable {
     let prompt: String
     let negativePrompt: String?
     let imagePath: String?
     /// I2V init image sent as base64 (image_base64) for remote clients.
     let imageBase64: String?
+    /// WP2a: caller-placed keyframe conditions. MUTUALLY EXCLUSIVE with
+    /// `image_path`, `image_base64` and top-level `strength`: when this key
+    /// is present and any of those is set the request is rejected with 400
+    /// `keyframe_conflict` (no silent precedence). At most one entry may sit
+    /// at frame 0 — it becomes the init image (+ its strength) so a lone
+    /// frame-0 keyframe still takes the untouched i2v arm; every other entry
+    /// must be on the 8-frame grid strictly inside the resolved frame count
+    /// (`LTX2VideoGenerator.validate` enforces that against the folded
+    /// frames per chunk, plus single-pass and identity_anchor_strength 0).
+    /// `audio: true` is allowed alongside keyframes.
+    let keyframes: [LocalVideoKeyframe]?
     let width: Int?
     let height: Int?
     let frames: Int?
@@ -2994,6 +3014,38 @@ public final class WarmServer {
   ///
   /// All other parameters are already-resolved values `prepareLocalVideo`
   /// computes before this call — nothing here re-derives anything else.
+  /// WP2a: split the wire `keyframes[]` into the legacy init-image slot
+  /// (frame 0 → `initImagePath` + `strength`) and the engine extras
+  /// (frame > 0 → `LTX2VideoRequest.keyframes`). Pure and order-preserving.
+  /// Absent/empty `keyframes` passes `image_path`/`strength` through
+  /// unchanged (`image_base64` is materialized by the caller in that case).
+  static func resolveKeyframes(
+    _ req: LocalVideoRequest
+  ) throws -> (initImagePath: String?, strength: Float?, extras: [LTX2KeyframeRef]) {
+    guard let keyframes = req.keyframes, !keyframes.isEmpty else {
+      return (req.imagePath, req.strength, [])
+    }
+    if req.imagePath != nil || req.imageBase64 != nil || req.strength != nil {
+      throw LTX2VideoError.invalidKeyframe(
+        "keyframe_conflict: keyframes replaces image_path/image_base64/strength")
+    }
+    var initImagePath: String? = nil
+    var initStrength: Float? = nil
+    var extras: [LTX2KeyframeRef] = []
+    for kf in keyframes {
+      if kf.frame == 0 {
+        guard initImagePath == nil else {
+          throw LTX2VideoError.invalidKeyframe("more than one keyframe at frame 0 (only one init image)")
+        }
+        initImagePath = kf.imagePath
+        initStrength = kf.strength ?? 1.0
+      } else {
+        extras.append(LTX2KeyframeRef(imagePath: kf.imagePath, frame: kf.frame, strength: kf.strength ?? 1.0))
+      }
+    }
+    return (initImagePath, initStrength, extras)
+  }
+
   static func buildLocalVideoRequest(
     req: LocalVideoRequest, videoPreset: ImagePreset?,
     effectivePrompt: String, effectiveInitImage: String?,
@@ -3005,7 +3057,9 @@ public final class WarmServer {
     dimensionReason: String? = nil,
     forceSingleStage: Bool = false,
     twoStageRequested: Bool? = nil,
-    refineSkippedReasonHint: String? = nil
+    refineSkippedReasonHint: String? = nil,
+    initStrength: Float? = nil,
+    keyframes: [LTX2KeyframeRef] = []
   ) -> LTX2VideoRequest {
     var resolvedTuning = Self.effectiveVideoTuning(for: req)
     if forceSingleStage {
@@ -3022,7 +3076,10 @@ public final class WarmServer {
       framesPerChunk: foldedFramesPerChunk,
       steps: req.steps ?? videoPreset?.steps ?? 8,
       seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
-      strength: req.strength ?? 1.0,
+      // WP2a: a frame-0 keyframe's strength arrives as `initStrength`
+      // (`req.strength` is nil by the mutual-exclusion rule); legacy bodies
+      // keep `req.strength`.
+      strength: initStrength ?? req.strength ?? 1.0,
       imgCompression: req.imgCompression,
       // comfybox#401 (review round 3, ruling 1): preset fallback, same
       // pattern `steps`/`seed` above already use — previously ONLY the
@@ -3077,7 +3134,8 @@ public final class WarmServer {
       // `"explicit"` when the caller did, `"default"` for the fall-through.
       dimensionReason: dimensionReason,
       twoStageRequested: twoStageRequested,
-      refineSkippedReasonHint: refineSkippedReasonHint
+      refineSkippedReasonHint: refineSkippedReasonHint,
+      keyframes: keyframes
     )
   }
 
@@ -3153,8 +3211,14 @@ public final class WarmServer {
     generator.setTelemetry(ltx2Telemetry)
     generator.setPreemptionSignal(ltx2PreemptionSignal)
 
+    // WP2a: `keyframes[]` splits into the init-image slot + engine extras;
+    // conflicts with image_path/image_base64/strength throw LTX2VideoError
+    // (→ 400 keyframe_conflict). Legacy bodies pass through unchanged.
+    let resolvedKeyframes = try Self.resolveKeyframes(req)
     // Accept an init image as bytes (image_base64) when no server path is given.
-    let effectiveInitImage = req.imagePath ?? Self.writeTempImage(base64: req.imageBase64)
+    // (With keyframes present `imageBase64` is nil by construction, so the
+    // temp write is a no-op on that path.)
+    let effectiveInitImage = resolvedKeyframes.initImagePath ?? Self.writeTempImage(base64: req.imageBase64)
 
     var loraEntries: [LoRAEntry] = req.loras ?? []
     if loraEntries.isEmpty, req.loraPath == nil, let preset = videoPreset, !preset.loras.isEmpty {
@@ -3519,7 +3583,9 @@ public final class WarmServer {
       dimensionReason: renderDimensions.reason.rawValue,
       forceSingleStage: twoStageRequested && !resolvedTwoStage,
       twoStageRequested: twoStageRequested,
-      refineSkippedReasonHint: refineSkippedReasonHint)
+      refineSkippedReasonHint: refineSkippedReasonHint,
+      initStrength: resolvedKeyframes.strength,
+      keyframes: resolvedKeyframes.extras)
     let recipe = try ResolvedVideoRecipe.build(
       request: videoRequest, transformerFile: generator.config.transformerFile,
       weightsDir: generator.config.weightsDir, gemmaPath: generator.config.gemmaPath,

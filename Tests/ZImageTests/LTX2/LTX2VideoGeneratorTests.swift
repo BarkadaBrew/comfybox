@@ -107,6 +107,116 @@ final class LTX2VideoGeneratorTests: XCTestCase {
         }
     }
 
+    // MARK: - WP2a: generic keyframes[] (docs/FDD-ltx-director-tab.md)
+
+    private func keyframeGen() -> LTX2VideoGenerator {
+        LTX2VideoGenerator(config: .init(weightsDir: "/definitely/not/here", gemmaPath: "/nope"))
+    }
+
+    private func keyframeRequest(
+        frames: Int = 289, keyframes: [LTX2KeyframeRef], extendToSeconds: Float = 0,
+        identityAnchorStrength: Float = 0, audio: Bool = false
+    ) -> LTX2VideoRequest {
+        LTX2VideoRequest(
+            prompt: "x", initImagePath: "/tmp/init.png", width: 576, height: 896,
+            framesPerChunk: frames, identityAnchorStrength: identityAnchorStrength,
+            extendToSeconds: extendToSeconds, outputPath: "/tmp/o.mp4", audio: audio,
+            keyframes: keyframes)
+    }
+
+    private func assertInvalidKeyframe(_ request: LTX2VideoRequest, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertThrowsError(try keyframeGen().validate(request), file: file, line: line) { error in
+            guard case LTX2VideoError.invalidKeyframe = error else {
+                return XCTFail("expected invalidKeyframe, got \(error)", file: file, line: line)
+            }
+        }
+    }
+
+    /// Passing validate() up to the weights-file check — the same "valid until
+    /// weightsMissing" shape testValidateRejectsVideoOnlyOptionsOnAOneFrameRequest uses.
+    private func assertValidUpToWeights(_ request: LTX2VideoRequest, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertThrowsError(try keyframeGen().validate(request), file: file, line: line) { error in
+            guard case LTX2VideoError.weightsMissing = error else {
+                return XCTFail("expected weightsMissing (request otherwise valid), got \(error)", file: file, line: line)
+            }
+        }
+    }
+
+    func testRequestInitDefaultsKeyframesEmpty() {
+        let request = LTX2VideoRequest(prompt: "x", width: 704, height: 448, framesPerChunk: 97, outputPath: "/tmp/o.mp4")
+        XCTAssertEqual(request.keyframes, [])
+        XCTAssertEqual(LTX2KeyframeRef(imagePath: "/a.png", frame: 8).strength, 1.0)
+    }
+
+    func testValidateAcceptsGridKeyframes() {
+        assertValidUpToWeights(keyframeRequest(keyframes: [
+            LTX2KeyframeRef(imagePath: "/a.png", frame: 96),
+            LTX2KeyframeRef(imagePath: "/b.png", frame: 288, strength: 0.8),
+        ]))
+    }
+
+    func testValidateRejectsOffGridKeyframe() {
+        assertInvalidKeyframe(keyframeRequest(keyframes: [LTX2KeyframeRef(imagePath: "/a.png", frame: 100)]))
+    }
+
+    func testValidateRejectsKeyframeAtZeroOrBeyondEnd() {
+        // Frame 0 is the init image's slot (initImagePath/strength), never an extra.
+        assertInvalidKeyframe(keyframeRequest(keyframes: [LTX2KeyframeRef(imagePath: "/a.png", frame: 0)]))
+        // 289 is one past the last frame (288) of a 289f render.
+        assertInvalidKeyframe(keyframeRequest(keyframes: [LTX2KeyframeRef(imagePath: "/a.png", frame: 289)]))
+        assertInvalidKeyframe(keyframeRequest(keyframes: [LTX2KeyframeRef(imagePath: "/a.png", frame: -8)]))
+    }
+
+    func testValidateRejectsCollidingKeyframes() {
+        // 8 and 12 floor to the same latent bucket (applyConditioning is last-writer-wins).
+        assertInvalidKeyframe(keyframeRequest(keyframes: [
+            LTX2KeyframeRef(imagePath: "/a.png", frame: 8),
+            LTX2KeyframeRef(imagePath: "/b.png", frame: 12),
+        ]))
+        assertInvalidKeyframe(keyframeRequest(keyframes: [
+            LTX2KeyframeRef(imagePath: "/a.png", frame: 96),
+            LTX2KeyframeRef(imagePath: "/b.png", frame: 96),
+        ]))
+    }
+
+    func testValidateRejectsKeyframesWithExtend() {
+        assertInvalidKeyframe(keyframeRequest(
+            keyframes: [LTX2KeyframeRef(imagePath: "/a.png", frame: 96)], extendToSeconds: 20))
+    }
+
+    func testValidateRejectsKeyframesWithIdentityAnchor() {
+        assertInvalidKeyframe(keyframeRequest(
+            keyframes: [LTX2KeyframeRef(imagePath: "/a.png", frame: 96)], identityAnchorStrength: 0.5))
+    }
+
+    func testValidateRejectsInvalidKeyframeStrength() {
+        assertInvalidKeyframe(keyframeRequest(keyframes: [LTX2KeyframeRef(imagePath: "/a.png", frame: 96, strength: 0)]))
+        assertInvalidKeyframe(keyframeRequest(keyframes: [LTX2KeyframeRef(imagePath: "/a.png", frame: 96, strength: 1.5)]))
+    }
+
+    func testValidateAllowsAudioWithKeyframes() {
+        // The multi-keyframe arm now generates audio on chunk 0 — audio + extras
+        // on a single-pass render is accepted (no keyframes+audio refusal).
+        assertValidUpToWeights(keyframeRequest(
+            keyframes: [LTX2KeyframeRef(imagePath: "/end.png", frame: 288)], audio: true))
+    }
+
+    func testValidateStillRefusesAudioForMultiChunkAndMidPassReAnchor() {
+        let gen = keyframeGen()
+        // Multi-chunk (97f chunks, 20 s target) + audio.
+        XCTAssertThrowsError(try gen.validate(LTX2VideoRequest(
+            prompt: "x", initImagePath: "/tmp/init.png", width: 704, height: 448, framesPerChunk: 97,
+            extendToSeconds: 20, outputPath: "/tmp/o.mp4", audio: true))) { error in
+            guard case LTX2VideoError.audioUnsupported = error else { return XCTFail("expected audioUnsupported, got \(error)") }
+        }
+        // Mid-pass re-anchor shape (interval 24 < 97 - 1) + audio.
+        XCTAssertThrowsError(try gen.validate(LTX2VideoRequest(
+            prompt: "x", initImagePath: "/tmp/init.png", width: 704, height: 448, framesPerChunk: 97,
+            identityAnchorStrength: 0.4, identityReAnchorInterval: 24, outputPath: "/tmp/o.mp4", audio: true))) { error in
+            guard case LTX2VideoError.audioUnsupported = error else { return XCTFail("expected audioUnsupported, got \(error)") }
+        }
+    }
+
     func testAudioPromptGuardMovesTrailingAudioSectionAheadOfLongVisualPrompt() throws {
         let visual = Array(repeating: "neutral-detail", count: 132).joined(separator: " ")
         let audio = #"audio: quiet room tone, an adult speaker says "the kettle is ready"."#
