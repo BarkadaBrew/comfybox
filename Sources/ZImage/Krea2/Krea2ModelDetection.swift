@@ -24,6 +24,16 @@ public enum Krea2ModelDetection {
     // checkpoint. The dir holds the Kroma transformer as turbo.safetensors
     // with text_encoder/vae/tokenizer symlinked from the Krea-2 snapshot.
     "kroma-v0.2-turbo": "~/LocalModels/kroma-v0.2",
+    // Kroma v0.3 BASE (lodestones, 2026-08-19) — the UNDISTILLED fine-tune,
+    // i.e. Kroma at full strength as the resident base instead of Raw plus
+    // our lossy rank-384 extraction (Todd 2026-09-15: "just support it").
+    // Physically a `raw` variant (CFG-on lane works; the turbo/distill
+    // LoRAs are Raw-relative and stack on it). The dir holds the fp32
+    // upstream file cast to Raw's per-key dtype layout, named by
+    // `model_index.json` (`transformer_file: kroma-v0.3-base.safetensors`,
+    // `krea2_variant: raw`), with text_encoder/vae/tokenizer symlinked from
+    // the Krea-2 snapshot exactly like krea2-raw.
+    "kroma-v0.3-base": "~/LocalModels/kroma-v0.3-base",
   ]
 
   private static let tableLock = NSLock()

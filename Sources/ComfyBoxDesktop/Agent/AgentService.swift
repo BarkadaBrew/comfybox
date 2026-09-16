@@ -140,10 +140,14 @@ public final class AgentService {
       "ultra-detailed" filler; it does nothing on this model.
 
     THE STACK — THIS IS THE WHOLE IMAGE PIPELINE, KNOW IT COLD
-    - The image model is krea2-raw (Krea 2 Raw, bf16). It is the ONLY production image model; \
-      Z-Image, Flux 2 and FIBO exist on the box but are not used. Do not set "model" unless the \
-      user asks for a different one.
-    - krea2-raw runs in exactly two lanes, and the accelerator LoRA decides which:
+    - The image base is Krea 2 in one of two resident checkpoints: krea2-raw (Krea 2 Raw, bf16, \
+      the stock undistilled base) or kroma-v0.3-base (lodestones' Kroma v0.3 fine-tune of Raw, \
+      undistilled, Kroma's film-realism look baked in at full strength). Z-Image, Flux 2 and FIBO \
+      exist on the box but are not used. The live snapshot says which base is loaded; do not set \
+      "model" unless the user asks to switch, and when they do use exactly one of those two ids.
+    - On kroma-v0.3-base NEVER add the kroma LoRA (it is already the base — stacking it doubles \
+      the look and smears); everything else below applies to both bases identically.
+    - Either base runs in exactly two lanes, and the accelerator LoRA decides which:
       1. DISTILL-ACCELERATED (the default, fast): raw + a distill/turbo LoRA \
          (krea2_turbo_distill_r256 or krea2_turbo_lora_rank_64_bf16 at 0.6–1.0). Then steps 8–9, \
          guidance EXACTLY 1.0, sampler euler or res_2s. At guidance 1.0 there is no classifier-free \
@@ -157,8 +161,8 @@ public final class AgentService {
       no accelerator with 1.0.
     - Samplers Krea 2 accepts are listed in the live snapshot below (euler, res_2s, res_3s, \
       ralston_3s and the rest). Sigma schedules: flow (default), karras, exponential, beta.
-    - Kroma (kroma-v0.3-base-lora-rank-384) is the house film-realism look, 0.4–0.6 on Kira \
-      work. Filipina_Pinay_Women at ~0.6 carries Kira's identity. KreaAmateur_V2, Krea2-realism-V2, \
+    - On krea2-raw, Kroma (kroma-v0.3-base-lora-rank-384) is the house film-realism look, 0.4–0.6 \
+      on Kira work; on kroma-v0.3-base it is already in the weights. Filipina_Pinay_Women at ~0.6 carries Kira's identity. KreaAmateur_V2, Krea2-realism-V2, \
       canon_krea2, lenovo_krea2, galaxyace_krea2 are camera/phone looks. Girly_Tiana and the snofs \
       files are style. Krea2_NSFW_V43, krea2_innie_vagina, LARP, DR34ML4Y and deepthroat are explicit \
       content adapters. krea2_filter_bypass_* and Krea2_TextFusion_Refusal_Reduction relax the base \
@@ -211,7 +215,7 @@ public final class AgentService {
         presets: [(id: String, model: String?, sampler: String?, steps: Int?, guidance: Double?, loras: [String])]
     ) -> String {
         var out: [String] = ["LIVE STACK SNAPSHOT (authoritative — only these exist on this machine):"]
-        out.append("Loaded model: \(model ?? "unknown") (family \(family ?? "unknown")). Production image model is krea2-raw.")
+        out.append("Loaded model: \(model ?? "unknown") (family \(family ?? "unknown")). Production image bases: krea2-raw (stock) and kroma-v0.3-base (Kroma baked in — never stack the kroma LoRA on it).")
         if !samplers.isEmpty { out.append("Samplers accepted by this family: " + samplers.joined(separator: ", ")) }
         let byCategory = Dictionary(grouping: loras, by: { $0.category.isEmpty ? "uncategorized" : $0.category })
         if !byCategory.isEmpty {

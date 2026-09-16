@@ -429,6 +429,20 @@ public enum ComfyBoxModelRegistry {
     ),
 
     ComfyBoxModel(
+      id: "kroma-v0.3-base",
+      family: .krea2, variant: .base, quantization: .q8,
+      huggingFaceId: "lodestones/Kroma",
+      parametersBillions: 13.5, latentChannels: 16,
+      defaultSteps: Krea2Variant.raw.defaultSteps, defaultGuidance: Krea2Variant.raw.defaultGuidance,
+      supportsGuidance: true, supportsLoRA: true,
+      supportsControlNet: false, supportsImg2Img: false,
+      defaultWidth: 1024, defaultHeight: 1024,
+      estimatedVRAM_GB: 22.0,
+      displayName: "Kroma v0.3 Base",
+      description: "lodestones' Kroma v0.3 as an UNDISTILLED base — the full fine-tune at strength 1.0 in place of Raw + the rank-384 kroma extraction. Same two lanes as Raw: stack a turbo/distill LoRA at guidance 1.0, or run it bare at guidance 3–4 with live negatives. Do not stack the kroma LoRA on it. MIT. Resolved from the declared krea2Models table (~/LocalModels/kroma-v0.3-base)."
+    ),
+
+    ComfyBoxModel(
       id: "krea2-raw",
       family: .krea2, variant: .base, quantization: .q8,
       huggingFaceId: "krea/Krea-2-Raw",

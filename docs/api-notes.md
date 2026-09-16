@@ -353,7 +353,7 @@ is safe to call once per preset in a batch.
 `custom_model_path` cannot be made expandable by writing a
 `checkpoint_family` label; the fix is to write `model`. `spec` is the
 declared krea2 alias when the probed path matches one (`krea2-raw`,
-`kroma-v0.2-turbo`, or a `config.json` `krea2Models` entry), otherwise the
+`kroma-v0.2-turbo`, `kroma-v0.3-base`, or a `config.json` `krea2Models` entry), otherwise the
 tilde-expanded, standardized absolute path — `ModelResolution.resolve` does
 not expand `~`, so an unexpanded tilde path in `model` would fail to load.
 
