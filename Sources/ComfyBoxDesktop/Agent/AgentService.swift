@@ -130,9 +130,12 @@ public final class AgentService {
       she is, the moment or act, setting, light, mood, framing, how explicit) — a few pointed \
       questions, not a checklist. Offer concrete options and your own opinion.
     - Converge in a few turns. When you have enough, deliver the result under the heading \
-      FINAL PROMPT: the prompt as ONE flowing prose paragraph, then the JSON control block last. \
+      FINAL PROMPT: the prompt as ONE flowing prose paragraph, then the JSON control block last \
+      (images) or a VIDEO RECIPE line (video — see the LTX section; the JSON block is image-only). \
       Until then, prose suggestions go on a line prefixed exactly with "PROMPT:" so the user can \
       push a draft into Generate at any point.
+    - You cover BOTH halves of the studio: still images on Krea 2 and video clips on LTX-2.3. \
+      Ask which one the user wants if it is not obvious; the two have different prompt shapes.
     - Write prompts as PROSE, not tag soup. Krea 2's text encoder is a language model: describe \
       what the eye sees — the light, the skin, the pose, the fabric, the space — and the visual \
       EFFECT you want (gentle tonal roll-off, shallow focus with soft blur, warm window light \
@@ -182,6 +185,57 @@ public final class AgentService {
       It is authoritative for what exists on this machine right now; never invent a LoRA, preset \
       or model that is not in it.
 
+    LTX-2.3 VIDEO — THE OTHER HALF OF THE STUDIO, KNOW IT AS WELL
+    - The video engine is LTX-2.3 running the PinkCherry v1.8 distill06 int8 DiT with the \
+      Gemma-3-12B-heretic text encoder (uncensored, prose-parsing). It renders video AND its \
+      sound in one pass: speech, breath, ambient, contact sounds. It is a DISTILLED model: \
+      guidance is 1.0 (CFG OFF — never set 3.5, that over-guides the audio into dragged slow \
+      motion and saturates the picture). The NEGATIVE IS LIVE ANYWAY, because NAG (normalized \
+      attention guidance, scale 5 / alpha 0.25 / tau 2.5) applies it inside attention, not via \
+      CFG. So the video negative matters and the image lane-1 rule ("negative inert at 1.0") \
+      does NOT apply to video.
+    - Validated production recipe (Todd 2026-09-15, A6 of the acceleration ladder): plain euler \
+      sampler, 10-step sigma schedule 1, 0.9953, 0.9836, 0.949, 0.848, 0.675, 0.452, 0.243, \
+      0.1, 0.028, 0; STG (spatiotemporal guidance) scale 0.3 with head boost 0 (the boost on \
+      steps 0–1 burned faces); color anchor 1 (frame-0 renormalize, stops color float); single \
+      pass, no refine, 24 fps, 704×448 base (portrait for phone-shot clips), clips of 8–12 s, \
+      audio on. About 33 minutes per 10 s clip. PinkCherry needs NO action LoRAs — the video \
+      presets carry none; multi-character scenes work. i2v (from a still) uses the same recipe.
+    - Video presets are kira-video-{neutral, apple, banana, avocado, cowgirl, doggy, oral}; all \
+      seven carry the same 40-term parity negative (anatomy: extra limbs/fingers, fused bodies, \
+      malformed; motion: frozen, still image, slow motion; media: subtitles, captions, on-screen \
+      text, watermark; audio: distorted or saturated sound, voice over, narration) and no LoRAs. \
+      Recommend a preset by content mode rather than hand-tuning sampler knobs.
+    - HOW TO WRITE AN LTX PROMPT (this is a different craft from a still):
+      1. ONE flowing narrative paragraph, third person, present tense, written as a TIMELINE of \
+         the clip's seconds: a beginning, a build, a finish. Never a frozen pose. For 10 s or \
+         more the action must develop through at least TWO distinct beats (a change of pace, \
+         depth, angle or position). Budget roughly 14 words per second plus 24, so 90–220 words.
+      2. OPEN ON A MEDIUM OR WIDE ESTABLISHING SHOT with every body placed in the frame — never \
+         open on a face. Carry identity through body, skin, hair and movement in context; the \
+         character's physical description comes from her character block, never a name.
+      3. MOTION ENVELOPE: no full spins, twirls, pirouettes, whip pans or fast pivots — a turn \
+         is a slow half-turn at most and her face keeps the lens through it. Big moves are \
+         shoulders, hips, hands, a step, a lean, a hair toss, never a 360. Energy comes from \
+         rhythm and expression, not rotation. This is the model's ceiling, not a taste note.
+      4. WEAVE THE SOUND INTO THE ACTION as it happens, each sound with its material and spatial \
+         character (wet skin, a creaking mattress, close breath in a warm room) — never a \
+         separate sound list. Her voice and breath are close and present; ambient stays faint.
+      5. SPEECH: exactly ONE short quoted line she says, under 20 words, placed where it happens. \
+         Apple (SFW phone reels and selfie messages): solo Kira, vertical phone framing, ~26 mm \
+         look, one natural line to the camera; a message to Todd starts "Todd, …". Avocado: the \
+         line is vivid dirty talk that fits the act. No narration, no voice-over, no captions.
+      6. Explicit clips name the act in the FIRST sentence as part of the establishing frame, \
+         describe a partner as a body (build, skin, hands, mouth; his cock in avocado), and name \
+         the CONTACT POINTS explicitly — what is inside, on, or against what. After the \
+         establishing frame, move in: middle and finish favor close-ups of the action.
+      7. Camera and lens as EFFECT again: handheld phone with slight sway, or a locked medium \
+         shot; describe light and space, not gear. No on-screen text ever.
+    - Delivery for video: after FINAL PROMPT give a VIDEO RECIPE line — preset id, seconds \
+      (8–12), orientation (portrait 448×704 for phone clips, landscape 704×448 otherwise), and \
+      any negative additions. The user pastes the prompt into the Video tab; the JSON control \
+      block below is for images only and must not be emitted for a video request.
+
     SETTING THE CONTROLS
     When the user asks you to configure, apply, or generate, include ONE fenced json block \
     containing only the keys you want to change, from: prompt, negative_prompt, steps (int), \
@@ -212,7 +266,8 @@ public final class AgentService {
     nonisolated static func buildStackContext(
         model: String?, family: String?, samplers: [String],
         loras: [(filename: String, category: String)],
-        presets: [(id: String, model: String?, sampler: String?, steps: Int?, guidance: Double?, loras: [String])]
+        presets: [(id: String, model: String?, sampler: String?, steps: Int?, guidance: Double?, loras: [String])],
+        videoPresets: [(id: String, negativeTerms: Int, loras: Int)] = []
     ) -> String {
         var out: [String] = ["LIVE STACK SNAPSHOT (authoritative — only these exist on this machine):"]
         out.append("Loaded model: \(model ?? "unknown") (family \(family ?? "unknown")). Production image bases: krea2-raw (stock) and kroma-v0.3-base (Kroma baked in — never stack the kroma LoRA on it).")
@@ -237,6 +292,12 @@ public final class AgentService {
                 out.append("  \(p.id): " + (bits.isEmpty ? "(no recipe fields)" : bits.joined(separator: "; ")))
             }
         }
+        if !videoPresets.isEmpty {
+            out.append("LTX-2.3 video presets (id → negative terms / LoRAs):")
+            for v in videoPresets {
+                out.append("  \(v.id): \(v.negativeTerms)-term negative, \(v.loras) LoRAs")
+            }
+        }
         return out.joined(separator: "\n")
     }
 
@@ -245,14 +306,21 @@ public final class AgentService {
     public func refreshStackContext() async {
         await engine.refreshLoras()
         let loras = engine.availableLoras.filter { !$0.quarantined }.map { (filename: $0.filename, category: $0.category) }
-        let presets = await engine.fetchPresets()
+        let allPresets = await engine.fetchPresets()
+        let presets = allPresets
             .filter { ($0.mediaKind ?? "image") != "video" }
             .map { p in (id: p.id, model: p.model, sampler: p.sampler, steps: p.steps, guidance: p.guidance,
                          loras: p.loras.map { "\($0.filename)=\($0.scale)" }) }
+        let videoPresets = allPresets
+            .filter { ($0.mediaKind ?? "image") == "video" }
+            .map { p in (id: p.id,
+                         negativeTerms: (p.negativePrompt ?? "").split(separator: ",").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count,
+                         loras: p.loras.count) }
         let family = engine.currentModelFamily
         let samplers = SamplingRecipeCatalog.samplerNames(forModelFamily: family)
         stackContext = Self.buildStackContext(
-            model: engine.currentModel, family: family, samplers: samplers, loras: loras, presets: presets)
+            model: engine.currentModel, family: family, samplers: samplers, loras: loras, presets: presets,
+            videoPresets: videoPresets)
     }
 
     public func reset() {

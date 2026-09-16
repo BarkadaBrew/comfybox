@@ -7,6 +7,30 @@ import ZImage
 
 @Suite("AgentService")
 struct AgentServiceTests {
+    @Test("brief covers LTX-2.3 video: distilled cfg 1.0, NAG-live negative, motion envelope, one quoted line")
+    func briefCoversLTX() {
+        let p = AgentService.systemPrompt
+        #expect(p.contains("LTX-2.3 VIDEO"))
+        #expect(p.contains("PinkCherry"))
+        #expect(p.contains("guidance is 1.0"))
+        #expect(p.contains("NEGATIVE IS LIVE ANYWAY"))
+        #expect(p.contains("MOTION ENVELOPE"))
+        #expect(p.contains("exactly ONE short quoted line"))
+        #expect(p.contains("VIDEO RECIPE"))
+        #expect(p.contains("0.9953"), "the validated 10-step schedule is in the brief")
+    }
+
+    @Test("snapshot lists LTX video presets separately from image presets")
+    func snapshotListsVideoPresets() {
+        let s = AgentService.buildStackContext(
+            model: "krea2-raw", family: "krea2", samplers: ["euler"], loras: [],
+            presets: [(id: "krea-kira", model: "krea2-raw", sampler: "res_2s", steps: 12, guidance: 1.0, loras: [])],
+            videoPresets: [(id: "kira-video-apple", negativeTerms: 40, loras: 0)])
+        #expect(s.contains("Image presets"))
+        #expect(s.contains("LTX-2.3 video presets"))
+        #expect(s.contains("kira-video-apple: 40-term negative, 0 LoRAs"))
+    }
+
     @Test("preferredProvider: the assistant slot wins, prompt optimization is the fallback")
     func preferredProvider() {
         let opt = AIProviderEndpoint(baseUrl: "http://127.0.0.1:11434/v1", model: "dolphin")
