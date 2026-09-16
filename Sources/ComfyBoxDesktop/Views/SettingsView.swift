@@ -92,13 +92,21 @@ struct DesktopSettings: Codable {
     /// Directories scanned for .cbarchive bundles. nil = [~/.comfybox/archives].
     var archiveRoots: [String]?
 
+    /// The local Glimmer host (Todd 2026-09-16: "dashboard is monitoring
+    /// lmstudio. we are no longer using and want to monitor mlx serve
+    /// instead"). mlx-serve on :11234 serves the assistant, vision and the
+    /// server-side authors; `/health` answers {"status":"ok"}.
+    static let mlxServeWatchedService = WatchedService(
+        name: "mlx-serve (Glimmer)", urlString: "http://127.0.0.1:11234/health",
+        control: ServiceControl(launchdLabel: "com.barkadabrew.mlx-serve"))
+
     /// Starter set for the health board when nothing is configured yet:
     /// the coffeeshop stack (Bree's server web UI, the legacy image service)
-    /// plus the local LM Studio prompt-enhancement endpoint.
+    /// plus the local mlx-serve Glimmer endpoint.
     static let defaultWatchedServices: [WatchedService] = [
         WatchedService(name: "ComfyBox Server", urlString: "http://127.0.0.1:7870/health",
                        control: ServiceControl(launchdLabel: "com.barkadabrew.comfybox")),
-        WatchedService(name: "LM Studio", urlString: "http://127.0.0.1:1234/v1/models"),
+        mlxServeWatchedService,
         WatchedService(name: "Image Service", urlString: "http://127.0.0.1:7861/health"),
         WatchedService(name: "Bree Server", urlString: "http://10.0.100.232:3000/health"),
     ]
@@ -152,6 +160,21 @@ struct DesktopSettings: Codable {
     }
 
     /// Load settings from disk, returning defaults on any failure.
+    /// One-time migration of a saved health board: LM Studio (retired) becomes
+    /// mlx-serve, keeping the row's id so the board does not jump. Pure —
+    /// returns the list unchanged (same instance semantics) when nothing
+    /// matched. Matches on the retired port or the old name, not on a fixed
+    /// string, so a user-edited URL still migrates.
+    static func migratingRetiredServices(_ services: [WatchedService]) -> [WatchedService] {
+        services.map { s in
+            let retired = s.name == "LM Studio" || s.urlString.contains("127.0.0.1:1234/") || s.urlString.contains("localhost:1234/")
+            guard retired else { return s }
+            return WatchedService(id: s.id, name: mlxServeWatchedService.name,
+                                  urlString: mlxServeWatchedService.urlString,
+                                  control: mlxServeWatchedService.control)
+        }
+    }
+
     static func load() -> DesktopSettings {
         let path = configPath
         guard FileManager.default.fileExists(atPath: path),
