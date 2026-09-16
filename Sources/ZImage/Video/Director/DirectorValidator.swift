@@ -31,10 +31,23 @@ public struct DirectorValidation: Sendable, Equatable {
 
 public enum DirectorValidator {
 
+  /// The production audio probe: AVURLAsset metadata only (duration + audio
+  /// track presence + rate/channels), never a sample decode — so /validate
+  /// stays cheap. Injectable per call for tests; nil (no probe) on platforms
+  /// without AVFoundation, where the probe-driven codes are simply not
+  /// emitted.
+  public static func defaultAudioProbe(_ path: String) -> AudioProbe? {
+    #if canImport(AVFoundation) && canImport(CoreGraphics)
+    return DirectorAudioIngest.probe(path: path)
+    #else
+    return nil
+    #endif
+  }
+
   public static func validate(
     _ timeline: DirectorTimeline,
     fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
-    audioProbe: (String) -> AudioProbe? = { _ in nil }
+    audioProbe: (String) -> AudioProbe? = DirectorValidator.defaultAudioProbe
   ) -> DirectorValidation {
     var issues: [DirectorIssue] = []
     var snapped = timeline

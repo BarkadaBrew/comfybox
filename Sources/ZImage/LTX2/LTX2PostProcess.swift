@@ -212,7 +212,9 @@ public enum LTX2PostProcess {
   /// - Throws: If video writing fails.
   /// Chunk interleaved PCM into 0.5 s CMSampleBuffers (built eagerly — the
   /// whole clip is small; appending happens in the writer's ready callback).
-  private static func makeAudioSampleBuffers(_ audio: AudioTrack) throws -> [CMSampleBuffer] {
+  /// Internal (not private) so DirectorStitcher can mux a mixed PCM track
+  /// through the identical buffer path (WP2d); behaviour unchanged.
+  static func makeAudioSampleBuffers(_ audio: AudioTrack) throws -> [CMSampleBuffer] {
     let channels = audio.samples.dim(0)
     let n = audio.samples.dim(1)
     // Interleave [C, N] -> frame-major [n0c0, n0c1, n1c0, ...] Float32.
