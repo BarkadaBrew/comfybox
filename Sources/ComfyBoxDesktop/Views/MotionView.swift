@@ -32,6 +32,9 @@ struct MotionView: View {
     /// Independent of the 24fps playback basis. 0 = auto (engine picks, which
     /// is the previous behaviour). The engine floors a set value at 6.
     @State private var condFps: Double = 0
+    /// LTX-2 audio branch (speech + ambient in the same pass). On by default —
+    /// the engine treats an omitted flag as silent.
+    @State private var audio: Bool = true
     @State private var steps: Double = 8
     @State private var didApplyDefaults = false
     /// F5 (comfybox#324, adversarial review of Phase 3 config): set the
@@ -225,6 +228,9 @@ struct MotionView: View {
                 // the same action over a lower cond_fps yields more movement.
                 NumericSliderField(label: "Motion FPS (0 = auto)", value: $condFps, range: 0...30, step: 1)
                     .help("Temporal conditioning rate (cond_fps). Lower = more motion for the same action; higher = stiller. 0 leaves it to the engine (previous behaviour). Values below 6 are floored by the engine.")
+
+                Toggle("Audio", isOn: $audio)
+                    .help("Render sound with the clip: speech, breath and ambient in the same LTX-2 pass. Off = silent video (the engine's default when the flag is omitted).")
 
                 NumericSliderField(label: "Steps", value: $steps, range: 1...30, step: 1)
                 if referencePath != nil {
@@ -513,7 +519,8 @@ struct MotionView: View {
             loras: selectedLoras,
             outputPath: outputPath,
             tuning: tuning.isEmpty ? nil : tuning,
-            optimizationAttemptId: optimizationAttemptId
+            optimizationAttemptId: optimizationAttemptId,
+            audio: audio
         )
 
         Task {
