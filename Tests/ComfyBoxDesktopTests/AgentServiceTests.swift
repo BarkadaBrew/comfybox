@@ -3,9 +3,19 @@
 import Testing
 import Foundation
 @testable import ComfyBoxDesktop
+import ZImage
 
 @Suite("AgentService")
 struct AgentServiceTests {
+    @Test("preferredProvider: the assistant slot wins, prompt optimization is the fallback")
+    func preferredProvider() {
+        let opt = AIProviderEndpoint(baseUrl: "http://127.0.0.1:11434/v1", model: "dolphin")
+        let glimmer = AIProviderEndpoint(baseUrl: "http://127.0.0.1:11234/v1", model: "Muse-Glimmer-30B-heretic-MLX-Q6")
+        #expect(AgentService.preferredProvider(AIProviderRegistry(promptOptimization: opt, assistant: glimmer)) == glimmer)
+        #expect(AgentService.preferredProvider(AIProviderRegistry(promptOptimization: opt)) == opt)
+        #expect(AgentService.preferredProvider(AIProviderRegistry()) == nil)
+    }
+
     @Test("request body prepends the system prompt and maps history")
     func requestBody() {
         let history = [

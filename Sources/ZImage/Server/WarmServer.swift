@@ -1061,6 +1061,7 @@ public final class WarmServer {
         "prompt_optimization": status(config.providers.promptOptimization),
         "vision": status(config.providers.vision),
         "captioning": status(config.providers.captioning),
+        "assistant": status(config.providers.assistant),
         "replicate": ["configured": !(config.replicate?.apiKey ?? "").isEmpty],
       ]
       if let data = try? JSONSerialization.data(withJSONObject: payload) {

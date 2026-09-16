@@ -291,3 +291,24 @@ final class ComfyBoxServerConfigTests: XCTestCase {
     XCTAssertEqual(store.current().config.port, ComfyBoxServerConfig.canonicalPort)
   }
 }
+
+
+final class AIProviderAssistantSlotTests: XCTestCase {
+  /// Todd 2026-09-15: "Image assistant should be Glimmer" — a fourth provider
+  /// slot the Desktop assistant prefers; absent → falls back to prompt optimization.
+  func testAssistantSlotRoundTripsAndIsOptional() throws {
+    let json = #"""
+    {"providers":{"promptOptimization":{"baseUrl":"http://127.0.0.1:11434/v1","model":"dolphin"},
+                  "assistant":{"baseUrl":"http://127.0.0.1:11234/v1","model":"Muse-Glimmer-30B-heretic-MLX-Q6"}}}
+    """#
+    let dec = JSONDecoder()
+    let config = try dec.decode(ComfyBoxServerConfig.self, from: Data(json.utf8))
+    XCTAssertEqual(config.providers.assistant?.model, "Muse-Glimmer-30B-heretic-MLX-Q6")
+    XCTAssertEqual(config.providers.promptOptimization?.model, "dolphin")
+    let enc = JSONEncoder()
+    let round = try dec.decode(ComfyBoxServerConfig.self, from: enc.encode(config))
+    XCTAssertEqual(round.providers.assistant, config.providers.assistant, "the slot survives an engine save")
+    let without = try dec.decode(ComfyBoxServerConfig.self, from: Data(#"{"providers":{"promptOptimization":{"baseUrl":"http://x/v1","model":"m"}}}"#.utf8))
+    XCTAssertNil(without.providers.assistant)
+  }
+}

@@ -25,15 +25,22 @@ public struct AIProviderRegistry: Codable, Equatable, Sendable {
   public var promptOptimization: AIProviderEndpoint?
   public var vision: AIProviderEndpoint?
   public var captioning: AIProviderEndpoint?
+  /// The Desktop Image Assistant's chat model (Todd 2026-09-15: "Image
+  /// assistant should be Glimmer"). Optional: absent → the assistant falls
+  /// back to `promptOptimization`, so Enhance can stay on the CPU model while
+  /// the assistant talks to Glimmer.
+  public var assistant: AIProviderEndpoint?
 
   public init(
     promptOptimization: AIProviderEndpoint? = nil,
     vision: AIProviderEndpoint? = nil,
-    captioning: AIProviderEndpoint? = nil
+    captioning: AIProviderEndpoint? = nil,
+    assistant: AIProviderEndpoint? = nil
   ) {
     self.promptOptimization = promptOptimization
     self.vision = vision
     self.captioning = captioning
+    self.assistant = assistant
   }
 
   /// Default prompt-optimization endpoint: LM Studio serving Todd's Dan's Personality Engine model.
@@ -47,6 +54,7 @@ public struct AIProviderRegistry: Codable, Equatable, Sendable {
     promptOptimization = try c.decodeIfPresent(AIProviderEndpoint.self, forKey: .promptOptimization)
     vision = try c.decodeIfPresent(AIProviderEndpoint.self, forKey: .vision)
     captioning = try c.decodeIfPresent(AIProviderEndpoint.self, forKey: .captioning)
+    assistant = try c.decodeIfPresent(AIProviderEndpoint.self, forKey: .assistant)
   }
 }
 

@@ -1,12 +1,14 @@
-// AgentService.swift — Chat assistant for image creation (Dan's v1.3 via LM Studio)
+// AgentService.swift — Chat assistant for image creation
 //
-// A conversational helper backed by the configured prompt-optimization
-// provider (Dan's dans-pe-v1.3.0 heresy model on LM Studio). It holds the
+// A conversational helper backed by the configured `assistant` provider
+// (Todd 2026-09-15: Glimmer on mlx-serve), falling back to the
+// prompt-optimization provider when no assistant slot is set. It holds the
 // conversation, calls the OpenAI-compatible /chat/completions endpoint, and
 // lets the user push a suggested prompt into Generate. Request assembly and
 // response parsing are pure so they're testable without a network.
 
 import Foundation
+import ZImage
 
 /// A structured generation-parameter change the assistant can emit (as a
 /// fenced ```json block) so it can drive the Generate view's fields directly.
@@ -260,9 +262,15 @@ public final class AgentService {
         let apiKey: String?
     }
 
+    /// The assistant's provider: the dedicated `assistant` slot when set,
+    /// else the prompt-optimization slot (pure — tested).
+    nonisolated static func preferredProvider(_ providers: AIProviderRegistry) -> AIProviderEndpoint? {
+        providers.assistant ?? providers.promptOptimization
+    }
+
     private func resolveEndpoint() async throws -> ResolvedEndpoint {
         let config = try await engine.fetchServerConfig()
-        guard let provider = config.providers.promptOptimization else {
+        guard let provider = Self.preferredProvider(config.providers) else {
             throw AgentError.noProvider
         }
         // The stored baseUrl is an OpenAI-style root that usually ends in /v1.
