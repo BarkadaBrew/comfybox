@@ -37,19 +37,22 @@ struct ProviderFormBundle {
     var prompt = EndpointForm()
     var vision = EndpointForm()
     var captioning = EndpointForm()
+    var assistant = EndpointForm()
 
     init() {}
     init(_ registry: AIProviderRegistry) {
         prompt = EndpointForm(registry.promptOptimization)
         vision = EndpointForm(registry.vision)
         captioning = EndpointForm(registry.captioning)
+        assistant = EndpointForm(registry.assistant)
     }
 
     func toRegistry() -> AIProviderRegistry {
         AIProviderRegistry(
             promptOptimization: prompt.toEndpoint(),
             vision: vision.toEndpoint(),
-            captioning: captioning.toEndpoint()
+            captioning: captioning.toEndpoint(),
+            assistant: assistant.toEndpoint()
         )
     }
 }
@@ -588,6 +591,7 @@ struct SettingsView: View {
             endpointSection("Prompt Optimization", form: $providerForm.prompt)
             endpointSection("Vision (optional)", form: $providerForm.vision)
             endpointSection("Captioning (optional)", form: $providerForm.captioning)
+            endpointSection("Image Assistant (optional — falls back to Prompt Optimization)", form: $providerForm.assistant)
 
             Section("Cloud Image Providers") {
                 SecureField("Replicate API token (r8_…)", text: Binding(
