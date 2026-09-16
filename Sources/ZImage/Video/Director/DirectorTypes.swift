@@ -552,3 +552,67 @@ public enum DirectorJSON {
     return d
   }
 }
+
+// MARK: - Compilation (WP2b)
+
+/// One rendered chunk as the compiler emits it: a JSON-ready
+/// /v1/video/generate body (single pass, no carry-over) plus the names the
+/// orchestrator uses for its intermediates.
+///
+/// `body` holds JSON scalars, strings, arrays and dictionaries only (it is
+/// built for `JSONSerialization` and never mutated after construction), which
+/// is why the struct is `@unchecked Sendable`: `[String: Any]` cannot state
+/// that itself.
+public struct CompiledChunk: @unchecked Sendable {
+  public let index: Int
+  public let span: DirectorMath.ChunkSpan
+  /// The compiled request body WITHOUT the carry-over keyframe — chunk k > 0
+  /// gets it from `bodyWithCarryOver(imagePath:)` once the orchestrator has
+  /// extracted chunk k-1's last frame.
+  public let body: [String: Any]
+  /// k-1 for every chunk after the first (the orchestrator supplies the
+  /// rendered last frame of that chunk as this chunk's frame-0 condition).
+  public let carryOverFromChunk: Int?
+  /// "director-<session>-chunk<k>.mp4"
+  public let outputName: String
+  /// "director-<session>-chunk<k>-lastframe.png"
+  public let lastFrameName: String
+  /// Whether the body asks the engine for generated audio.
+  public let wantsAudio: Bool
+
+  public init(
+    index: Int, span: DirectorMath.ChunkSpan, body: [String: Any], carryOverFromChunk: Int?,
+    outputName: String, lastFrameName: String, wantsAudio: Bool
+  ) {
+    self.index = index
+    self.span = span
+    self.body = body
+    self.carryOverFromChunk = carryOverFromChunk
+    self.outputName = outputName
+    self.lastFrameName = lastFrameName
+    self.wantsAudio = wantsAudio
+  }
+
+  /// The body with `{image_path, frame: 0, strength: 1.0}` prepended to
+  /// `keyframes` (creating the array when absent). Pure: the receiver is
+  /// unchanged. WP2a's mutual exclusion means the carry-over never goes
+  /// through `image_path`/`strength`.
+  public func bodyWithCarryOver(imagePath: String) -> [String: Any] {
+    var out = body
+    var keyframes = out["keyframes"] as? [[String: Any]] ?? []
+    keyframes.insert(["image_path": imagePath, "frame": 0, "strength": 1.0], at: 0)
+    out["keyframes"] = keyframes
+    return out
+  }
+}
+
+/// The compiler's output: the plan every client sees plus one body per chunk.
+public struct DirectorCompilation: Sendable {
+  public let plan: DirectorPlan
+  public let chunks: [CompiledChunk]
+
+  public init(plan: DirectorPlan, chunks: [CompiledChunk]) {
+    self.plan = plan
+    self.chunks = chunks
+  }
+}

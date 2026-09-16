@@ -16,8 +16,9 @@ public struct DirectorValidation: Sendable, Equatable {
   public let issues: [DirectorIssue]
   /// false iff any issue has severity error.
   public let ok: Bool
-  /// nil when !ok. WP1 fills the chunk skeleton + ticks; WP2b's compiler
-  /// fills per-chunk keyframes/prompt segments/beats.
+  /// nil when !ok; otherwise the compiler's full plan (`DirectorCompiler.plan`):
+  /// chunk spans + seeds + per-chunk keyframes/prompt segments/beats, ticks,
+  /// boundary frames and the warnings.
   public let plan: DirectorPlan?
 
   public init(snapped: DirectorTimeline, issues: [DirectorIssue], ok: Bool, plan: DirectorPlan?) {
@@ -224,29 +225,7 @@ public enum DirectorValidator {
     }
 
     let ok = !issues.contains { $0.severity == .error }
-    let plan = ok ? skeletonPlan(for: snapped, layout: layout, issues: issues) : nil
+    let plan = ok ? DirectorCompiler.plan(for: snapped, warnings: issues.filter { $0.severity == .warning }) : nil
     return DirectorValidation(snapped: snapped, issues: issues, ok: ok, plan: plan)
-  }
-
-  /// The chunk skeleton: spans, seeds, carry-over, audio flag, keyframe ticks
-  /// and boundary frames. WP2b's compiler fills the per-chunk conditioning.
-  static func skeletonPlan(
-    for snapped: DirectorTimeline, layout: [DirectorMath.ChunkSpan], issues: [DirectorIssue]
-  ) -> DirectorPlan {
-    let generated = snapped.audio.mode == .generated
-    let chunks = layout.map { span in
-      DirectorPlan.Chunk(
-        index: span.index, startFrame: span.startFrame, endFrame: span.endFrame,
-        frames: span.frames, seed: snapped.settings.seed &+ UInt64(span.index),
-        carryOver: span.index > 0, audio: generated ? "generated" : "none")
-    }
-    return DirectorPlan(
-      lengthFrames: snapped.settings.lengthFrames, fps: snapped.settings.fps,
-      width: snapped.settings.width, height: snapped.settings.height,
-      audioMode: snapped.audio.mode.rawValue,
-      chunks: chunks,
-      keyframeTicks: snapped.keyframes.map { .init(id: $0.id, frame: $0.frame) },
-      boundaryFrames: layout.dropFirst().map(\.startFrame),
-      warnings: issues.filter { $0.severity == .warning })
   }
 }
