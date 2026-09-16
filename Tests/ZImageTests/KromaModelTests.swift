@@ -21,6 +21,39 @@ final class KromaModelTests: XCTestCase {
     XCTAssertTrue(model.supportsLoRA)
   }
 
+  /// Kroma v0.3 BASE (Todd 2026-09-15 "just support it"): the undistilled
+  /// fine-tune as a resident base — declared alias, registry entry, and a
+  /// `model_index.json`-named transformer that detects as the `raw` variant.
+  func testKromaV03BaseIsADeclaredRawVariantBase() throws {
+    let spec = WarmServer.parseModelSpec(from: "kroma-v0.3-base")
+    XCTAssertTrue(spec.hasSuffix("/LocalModels/kroma-v0.3-base"), spec)
+    XCTAssertTrue(spec.hasPrefix("/"), "tilde must be expanded: \(spec)")
+    XCTAssertTrue(Krea2ModelDetection.isKnownKrea2Model("kroma-v0.3-base"))
+    XCTAssertEqual(Krea2ModelDetection.alias(forSpec: "~/LocalModels/kroma-v0.3-base"), "kroma-v0.3-base")
+
+    let model = try XCTUnwrap(ComfyBoxModelRegistry.models["kroma-v0.3-base"])
+    XCTAssertEqual(model.family, .krea2)
+    XCTAssertEqual(model.huggingFaceId, "lodestones/Kroma")
+    XCTAssertTrue(model.supportsGuidance, "an undistilled base honours CFG like Raw")
+    XCTAssertTrue(model.supportsLoRA)
+
+    // Layout contract, on a scratch dir so the test needs no 26GB file: the
+    // transformer keeps its real filename and model_index.json declares it.
+    let scratch = FileManager.default.temporaryDirectory.appending(path: "kroma-v03-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: scratch.appending(path: "text_encoder"), withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: scratch.appending(path: "vae"), withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: scratch) }
+    FileManager.default.createFile(atPath: scratch.appending(path: "text_encoder/model.safetensors").path, contents: Data())
+    FileManager.default.createFile(atPath: scratch.appending(path: "vae/diffusion_pytorch_model.safetensors").path, contents: Data())
+    FileManager.default.createFile(atPath: scratch.appending(path: "kroma-v0.3-base.safetensors").path, contents: Data())
+    try Data(#"{"krea2_variant":"raw","transformer_file":"kroma-v0.3-base.safetensors"}"#.utf8)
+      .write(to: scratch.appending(path: "model_index.json"))
+    let paths = try Krea2ModelDetection.detect(at: scratch)
+    XCTAssertEqual(paths.variant, .raw, "Kroma v0.3 base is undistilled — a raw variant, never turbo")
+    XCTAssertEqual(paths.transformerFile.lastPathComponent, "kroma-v0.3-base.safetensors")
+    XCTAssertEqual(Krea2ModelDetection.detectVariant(spec: "kv03", specDirectories: ["kv03": scratch.path]), .raw)
+  }
+
   func testKromaRootDetectsAsKrea2WhenAssembled() throws {
     // Layout contract: an explicit dir with turbo.safetensors + TE/VAE files
     // is a Krea-2 model root. Skip when the checkpoint isn't downloaded yet.

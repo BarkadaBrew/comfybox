@@ -43,8 +43,9 @@ final class MCPVideoToolTests: XCTestCase {
     // + get_config/patch_config/update_config (headless-parity Phase 3,
     //   comfybox#300, FDD §3.3/§4.4, 2026-08-30) = 55;
     // + get_job (one job model, comfybox#289, 2026-09-04) = 56;
-    // + nearline_anchor (#273, 2026-09-04) = 57.
-    XCTAssertEqual(MCPToolRegistry.tools.count, 57, "Expected 57 registered MCP tools")
+    // + nearline_anchor (#273, 2026-09-04) = 57;
+    // + set_admission_mode/get_admission_mode (Local mode, #447, 2026-09-15) = 59.
+    XCTAssertEqual(MCPToolRegistry.tools.count, 59, "Expected 59 registered MCP tools")
   }
 
   // MARK: - generate_video Schema (Story A1)

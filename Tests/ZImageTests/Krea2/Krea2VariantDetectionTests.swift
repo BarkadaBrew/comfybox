@@ -287,6 +287,8 @@ final class Krea2VariantDetectionTests: XCTestCase {
     XCTAssertTrue(raw?.path.hasSuffix("/LocalModels/krea2-raw") ?? false, "\(String(describing: raw))")
     let kroma = Krea2ModelDetection.specDirectory("kroma-v0.2-turbo")
     XCTAssertTrue(kroma?.path.hasSuffix("/LocalModels/kroma-v0.2") ?? false, "\(String(describing: kroma))")
+    let kromaBase = Krea2ModelDetection.specDirectory("kroma-v0.3-base")
+    XCTAssertTrue(kromaBase?.path.hasSuffix("/LocalModels/kroma-v0.3-base") ?? false, "\(String(describing: kromaBase))")
     XCTAssertNil(Krea2ModelDetection.specDirectory("krea-2-ultra"))
   }
 

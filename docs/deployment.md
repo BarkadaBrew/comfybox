@@ -48,7 +48,7 @@ Provenance fields (WP-E10, `docs/FDD-krea2-raw-recipe.md` §3.10):
 | key | meaning |
 |---|---|
 | `build_sha` | git short sha stamped into the binary at build time (`-dirty` when the worktree had uncommitted changes); `"unknown"` for a build that did not run `scripts/gen-build-info.sh`. The deploy smoke (`scripts/deploy-serve.sh`, step e) fails unless it matches the sha being deployed — a clobbered or wrong-branch binary is detectable from outside. |
-| `model_alias` | the declared alias of the active Krea 2 model (`krea2-raw`, `kroma-v0.2-turbo`) beside the resolved directory in `model`; null for other families |
+| `model_alias` | the declared alias of the active Krea 2 model (`krea2-raw`, `kroma-v0.2-turbo`, `kroma-v0.3-base`) beside the resolved directory in `model`; null for other families |
 | `model_variant` | `raw` / `turbo` for the Krea 2 family — the physical variant read off the loaded checkpoint |
 | `last_recipe` | the `applied` record of the last successful Krea 2 render (same value the `/v1/generate` response, the async job status and the PNG's EXIF `UserComment` carry); null until one has run |
 

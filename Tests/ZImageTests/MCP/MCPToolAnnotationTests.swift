@@ -17,6 +17,7 @@ final class MCPToolAnnotationTests: XCTestCase {
     "model_pool",
     "nearline_list",
     "queue_list",
+    "get_admission_mode",
     "queue_status",
     "server_health",
     "system_stats",
