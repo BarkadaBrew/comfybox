@@ -1855,6 +1855,11 @@ public final class EngineService {
         public var tuning: [String: Any]?
         /// Lineage reference from /v1/enhance (task #19).
         public var optimizationAttemptId: String?
+        /// LTX-2 renders sound (speech, breath, ambient) in the same pass when
+        /// asked. The engine treats an omitted flag as OFF, which is why every
+        /// desktop clip was silent until 2026-09-16 (Todd: "build and deploy").
+        /// Default ON to match the scheduler's clips.
+        public var audio: Bool
 
         public init(
             prompt: String, initImagePath: String? = nil,
@@ -1862,7 +1867,8 @@ public final class EngineService {
             steps: Int = 8, seed: UInt64 = 42, strength: Float = 1.0,
             extendToSeconds: Float = 0, loraPath: String? = nil,
             loraStrength: Float = 1.0, loras: [LoRASelection] = [], outputPath: String,
-            tuning: [String: Any]? = nil, optimizationAttemptId: String? = nil
+            tuning: [String: Any]? = nil, optimizationAttemptId: String? = nil,
+            audio: Bool = true
         ) {
             self.prompt = prompt; self.initImagePath = initImagePath
             self.width = width; self.height = height; self.frames = frames
@@ -1873,6 +1879,7 @@ public final class EngineService {
             self.outputPath = outputPath
             self.tuning = tuning
             self.optimizationAttemptId = optimizationAttemptId
+            self.audio = audio
         }
     }
 
@@ -1900,7 +1907,8 @@ public final class EngineService {
 
     /// Build the JSON body shared by the sync and async video paths.
     /// `forceLocal` pins the render to on-device LTX-2 (never paid cloud).
-    private func videoRequestBody(_ request: VideoRequest, forceLocal: Bool) -> [String: Any] {
+    /// Pure (static) so the wire contract is testable without an engine.
+    nonisolated static func videoRequestBody(_ request: VideoRequest, forceLocal: Bool) -> [String: Any] {
         var body: [String: Any] = [
             "prompt": request.prompt,
             "width": request.width,
@@ -1912,6 +1920,7 @@ public final class EngineService {
             "extend_to_seconds": request.extendToSeconds,
             "output_path": request.outputPath,
             "source": "desktop",
+            "audio": request.audio,
         ]
         if forceLocal { body["backend"] = "local" }
         if let initImagePath = request.initImagePath, !initImagePath.isEmpty {
@@ -1962,7 +1971,7 @@ public final class EngineService {
     /// HTTP request returns in milliseconds, so nothing times out mid-render.
     public func submitVideoJob(_ request: VideoRequest) async throws -> String {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
-        let bodyData = try JSONSerialization.data(withJSONObject: videoRequestBody(request, forceLocal: true))
+        let bodyData = try JSONSerialization.data(withJSONObject: Self.videoRequestBody(request, forceLocal: true))
         let (status, data) = try await client.post("/v1/video/generate/async", body: bodyData)
         guard status == 202, let job = parseVideoJobStatus(data) else {
             throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Video job submit failed (is the server started with --ltx2-weights?)")
@@ -2011,7 +2020,7 @@ public final class EngineService {
     /// UI or hit a request timeout.
     public func generateVideo(_ request: VideoRequest) async throws -> VideoResult {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
-        let bodyData = try JSONSerialization.data(withJSONObject: videoRequestBody(request, forceLocal: false))
+        let bodyData = try JSONSerialization.data(withJSONObject: Self.videoRequestBody(request, forceLocal: false))
         let (status, data) = try await client.post("/v1/video/generate", body: bodyData)
         guard status == 200,
               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
