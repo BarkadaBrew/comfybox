@@ -838,3 +838,23 @@ extension PresetStoreTests {
     }
   }
 }
+
+final class PresetStoreRaw4StepFamilyTests: XCTestCase {
+  /// 2026-09-16 cutover (Todd: "use the 4 step accel on all tiers"): the
+  /// daemon's TDM tier label must be storable on an engine preset — it refuses
+  /// a TDM accelerator under `raw-accel`, so `raw-4step` has to round-trip here.
+  func testRaw4StepIsAnAcceptedKrea2FamilyLabel() throws {
+    XCTAssertTrue(PresetStore.krea2CheckpointFamilies.contains("raw-4step"))
+    var preset = ImagePreset(id: "kira-tdm", name: "Kira TDM")
+    preset.model = "kroma-v0.3-base"
+    preset.checkpointFamily = "raw-4step"
+    preset.loras = [LoraReference(filename: "kroma-v0.3-tdm-4steps-artifact.safetensors", scale: 1.0, role: "accel")]
+    preset.steps = 4
+    preset.guidance = 1
+    preset.sampler = "euler"
+    XCTAssertNoThrow(try PresetStore.validateKromaPolicy(preset))
+    var bad = preset
+    bad.checkpointFamily = "raw-5step"
+    XCTAssertThrowsError(try PresetStore.validateKromaPolicy(bad))
+  }
+}

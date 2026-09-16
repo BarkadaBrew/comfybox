@@ -1176,7 +1176,13 @@ public final class PresetStore: @unchecked Sendable {
 
   /// The five client policy labels (D7). `turbo`/`raw-accel`/`raw-stock` are
   /// the krea2 families; `zimage-*` keep today's path and need no kroma.
-  public static let krea2CheckpointFamilies: Set<String> = ["turbo", "raw-accel", "raw-stock"]
+  /// `raw-4step` (2026-09-16): the daemon's TDM tier — a raw-variant base
+  /// (krea2-raw or kroma-v0.3-base) + lodestones' 4-step TDM distill @1.0,
+  /// euler, guidance 1.0. The engine treats every family as a client policy
+  /// label (D7); the daemon refuses a TDM accelerator under `raw-accel`, so
+  /// the label must be storable here for the cutover (Todd: "use the 4 step
+  /// accel on all tiers").
+  public static let krea2CheckpointFamilies: Set<String> = ["turbo", "raw-accel", "raw-stock", "raw-4step"]
   public static let zimageCheckpointFamilies: Set<String> = ["zimage-turbo", "zimage-base"]
   public static var checkpointFamilies: [String] {
     (krea2CheckpointFamilies.sorted() + zimageCheckpointFamilies.sorted())
