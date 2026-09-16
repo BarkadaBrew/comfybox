@@ -1,6 +1,6 @@
 # FDD: "Director" — a timeline editor tab for LTX-2.3 in CoffeeShop Desktop
 
-Status: DRAFT for review (2026-09-16). Requested by Todd: "clone this product as a tab for
+Status: v1.1 (2026-09-16) — codex-reviewed; §3/§4/§5 corrected per `docs/FDD-ltx-director-tab.codex-review.md`. Requested by Todd: "clone this product as a tab for
 desktop app and make an FDD for the initiative" — the product being
 [WhatDreamsCost-ComfyUI](https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI), whose
 flagship node **LTX Director 2.0** is "A Complete Timeline Editor For LTX 2.3".
@@ -89,9 +89,26 @@ Engine (`Sources/ZImage/LTX2`, `Sources/ZImage/Server`):
   (`docs/ltx2-multi-keyframe-fdd.md`): any number of `Keyframe(image, videoFrameIndex,
   strength)` spliced into the latent by `LTX2Conditioning.applyConditioning`. Not yet on the
   wire. Audio is refused together with mid-pass identity re-anchoring.
-- i2v with `extendToSeconds` chunk continuation (`ChunkPlan`, last-frame carry-over), the
-  289-frame single-pass window, 24 fps, production recipe via `LTX2ConfigResolver`
-  (euler, 10-step schedule, NAG 5/0.25/2.5, STG 0.3 flat, color anchor 1, audio on).
+- i2v with `extendToSeconds` chunk continuation (`ChunkPlan`, last-frame carry-over,
+  `LTX2VideoGenerator.swift:487-516`, chunk loop `:1593`), the 289-frame single-pass window
+  (`WarmServer.swift:3217-3239`), 24 fps default. Recipe resolution is request > preset >
+  `~/.comfybox/config.json` `video` block > env > builtin (`LTX2ConfigResolver`); the
+  production recipe (euler, 10-step schedule, NAG 5/0.25/2.5, STG 0.3 flat, color anchor 1)
+  lives in the config tier, not in resolver builtins. Audio is a per-request flag
+  (engine default off; the desktop and the scheduler send it on).
+- **Temporal prompt scheduling already exists**: `beat_schedule` on `/v1/video/generate`
+  (`BeatSegment`, `LTX2BeatSchedule.swift`) compiles per-beat token ranges into an additive
+  temporal text-attention bias (`buildVideoBias`, `(1,1,videoTokens,textLen)`) that the
+  denoise loop threads as `beatBias`. This IS prompt relay within a chunk; the scheduler's
+  authored beats use it today.
+- **A per-latent-frame denoise mask already exists** (`LTX2LatentState`,
+  `LTX2Conditioning.swift:27-29`), restored every step (`LTX2Pipeline.swift:1869-1902`,
+  `:2079-2085`, `:2178-2183`). Retake needs an API and a compiler on top of it, not a new
+  primitive.
+- **The audio VAE has an encoder** (`LTX2AudioVAE.encode(mel)`, `LTX2AudioVAE.swift:304-339`,
+  weights remapped `:371-389`). What is missing is the ingest path: imported waveform →
+  mel → latent, and an audio-side noise mask; generation today starts audio from noise
+  (`LTX2Pipeline.swift:487-504`).
 - `POST /v1/video/extend` and `/v1/video/rerender` (winner actions), `/v1/video/generate/async`
   job model, `/v1/video/status/{id}`, traces with rating/promote.
 - Storyboard engine (`Sources/ZImage/Video/StoryboardTypes.swift`, `POST /v1/storyboard/render`):
@@ -109,8 +126,11 @@ Desktop (`Sources/ComfyBoxDesktop`):
 - `EngineService.VideoRequest` (single `initImagePath`, `extendToSeconds`, `audio`, `tuning`).
 - Tabs are an `AppTab` enum in `ComfyBoxDesktopApp.swift` (Motion sits in the Create section).
 
-Not present anywhere: per-segment prompt conditioning, imported-audio conditioning, temporal
-(time-range) masks, reference-video guides, IC-LoRA weights, a timeline document.
+Not present: a timeline document, keyframes on the wire, a retake (base-video time-range)
+API, imported-audio ingest (decode/resample/mix, mel encode, audio noise mask),
+reference-video guides, IC-LoRA weights. Also: local video jobs are non-durable —
+`QueuePersistence` recovers only `generate` and `lora_swap` (`QueuePersistence.swift:9-27`)
+and recovery explicitly refuses local video (`WarmServer.swift:3717-3728`).
 
 ## 4. Design
 
@@ -156,28 +176,33 @@ trace and returned to the client for the timeline scrubber. Rules:
    when more than one, else the existing i2v path. `is_end_frame` places the image at the
    chunk's last frame. A keyframe exactly on a chunk boundary belongs to both chunks (last
    frame of one, first of the next), which is what continuation already does.
-2. **Prompts, Phase 1 = per-chunk scheduling.** Each chunk's text = global prompt + the
-   prompt segments overlapping that chunk, weighted by overlap, joined in time order. This is
-   an honest subset of prompt relay that needs no model patch: LTX-2.3 reads one text
-   conditioning per denoise pass, and our chunks are already separate passes.
-   **Phase 2 = true prompt relay:** per-segment token ranges with a temporal attention mask
-   in `LTX2Transformer` cross-attention (text tokens visible only to latent frames in their
-   segment, global prompt visible everywhere). Requires a mask hook in the attention kernel
-   and a validation ladder of its own.
-3. **Audio.** `generated`: as today. `imported`: mux the combined 44.1 kHz timeline over the
-   video and drop generated audio (Phase 1, pure post-processing — `LTX2PostProcess` already
-   muxes). `inpaint` (Phase 2): encode imported spans with the audio VAE encoder into the
-   audio latent and denoise only the gaps under a per-latent-frame audio noise mask — the
-   audio-side twin of the retake mask.
+2. **Prompts = the existing beat schedule.** Per chunk: the text conditioning is the global
+   prompt followed by the prompt segments that overlap the chunk, in time order (one text
+   embedding per denoise pass — confirmed `LTX2Pipeline.swift:395-404`, `:1068-1077`); and the
+   segments become a `beat_schedule` for that chunk (`BeatSegment` start/end fractions and
+   token ranges), so within the chunk each latent span attends to its own segment's tokens
+   through the existing temporal bias. This is prompt relay, built on what ships. A segment
+   that spans a chunk boundary is split at the boundary with the same text on both sides.
+   **Phase 2** is the residue: authoring-time preview of the bias, bias strength as a dial,
+   and a ladder that measures how sharply an action change lands inside a chunk.
+3. **Audio.** `generated`: as today. `imported` (Phase 1): a new ingest step decodes the
+   clips with `AVAssetReader`, resamples and mixes them onto a 44.1 kHz stereo timeline
+   (trim, gain, pad/trim to the clip length), suppresses generated audio for the chunk, and
+   hands the PCM to `LTX2PostProcess.writeMP4`, which already muxes an in-memory
+   `AudioTrack` (`LTX2PostProcess.swift:271-306`) but takes no file paths itself.
+   `inpaint` (Phase 2): the same ingest feeds waveform → mel → `LTX2AudioVAE.encode` with
+   the pipeline's normalization/patchify parity, into the audio latent under an audio-side
+   per-latent-frame noise mask so only the gaps are generated.
 4. **Reference clips (Phase 2).** Decode the video with AVFoundation, resample to timeline
    fps, encode frames through the video VAE, append as conditions at their frame indices with
    `strength`; a mid-timeline guide gets the two-frame noise ramp. IC-LoRA attention entries
    and the Ingredients LoRA weights are Phase 2b, gated on obtaining the weights and on a
    ladder showing the guide-only path is not enough.
-5. **Retake (Phase 2).** New pipeline entry: base video decoded and VAE-encoded into the
-   initial latent; a temporal noise mask (0 outside the range, 1 inside, `strength` scaling)
-   applied at every step so frozen frames are restored after each update; if the range covers
-   the clip, plain generate. `retake.prompt` overrides the global prompt for the pass.
+5. **Retake (Phase 2).** New pipeline entry on top of the existing per-frame denoise mask:
+   the base video is decoded, VAE-encoded, and written into the clean latent for the frozen
+   spans; the time range compiles to a mask (0 frozen, 1 regenerate, `strength` scaling) that
+   the loop already restores every step; if the range covers the clip, plain generate.
+   `retake.prompt` overrides the global prompt for the pass. Seam validation is the work.
 
 Everything the compiler emits goes through the same `LTX2ConfigResolver` (request > preset
 > config > env > builtin), so Director renders at the production recipe by default and
@@ -194,8 +219,9 @@ honours the preset's negative and tuning like every other clip.
   one latent frame; audio clip past the end) without rendering.
 - `GET/PUT /v1/director/timelines/{id}` — server-side store beside presets so a timeline can
   be opened from any client; the file is the same JSON as `.cbdirector`.
-- Persisted-queue treatment: director jobs are `kind: video_director` and recovered after a
-  crash like `generate` (the gap the multi-keyframe FDD flagged).
+- Durability: local video jobs are non-persisted today and recovery refuses them. Phase 1
+  Director jobs inherit that (documented, same as Motion and the scheduler's clips); a
+  serializable, recoverable video/director job state is its own Phase 2 package (WP9).
 - MCP: `generate_director_video(timeline)` + `validate_director_timeline`; CLI
   `ComfyBox director-render <file.cbdirector>`; `docs/api-notes.md` section.
 
@@ -241,16 +267,21 @@ The Motion tab stays as the quick single-shot path; Director is the editor.
 | WP | Scope | Depends on | Size |
 |---|---|---|---|
 | WP1 | `DirectorTypes` + `Math` + Codable + tests; `.cbdirector` read/write; upstream import shim | — | S |
-| WP2 | `LTX2VideoRequest.keyframes[]` + `LocalVideoRequest` wire + `generateMultiKeyframe` dispatch; `DirectorCompiler` (chunks, per-chunk prompts, keyframes, generated/imported audio); `/v1/video/director` + `/validate`; queue kind + recovery; trace plan | WP1 | L |
+| WP2a | `LTX2VideoRequest.keyframes[]` + `LocalVideoRequest` wire + `generateMultiKeyframe` dispatch (audio allowed when no mid-pass re-anchoring) | — | M |
+| WP2b | `DirectorCompiler`: chunk plan, per-chunk text + `beat_schedule` from prompt segments, keyframe placement (incl. boundary keyframes), audio plan; `DirectorPlan` record | WP1, WP2a | M |
+| WP2c | `POST /v1/video/director` + `/validate`, job orchestration over the existing async video job model (one job per chunk, continuation), status stages, trace plan | WP2b | M |
+| WP2d | Imported-audio ingest + mux: AVAssetReader decode/resample/mix/trim/gain → PCM `AudioTrack`, generated-audio suppression | WP1 | M |
 | WP3 | Desktop Director tab, Phase 1 tracks (keyframes, prompts, audio), sidebar, save/load, generate + progress + plan overlay | WP1 (types), WP2 (route) | L |
 | WP4 | MCP tools, CLI command, api-notes, timelines store route | WP2 | S |
 | WP5 | Validation ladder at the production recipe (see §6) | WP2, WP3 | M |
-| WP6 (Phase 2) | Retake temporal mask; audio latent inpainting (needs audio VAE encoder path); reference-video guides + noise ramp | WP2 | L |
-| WP7 (Phase 2) | True prompt relay (temporal cross-attention mask in the DiT) | WP2 | L |
+| WP6 (Phase 2) | Retake: base-video decode → VAE encode → clean latent for frozen spans, time-range mask compiler, seam ladder; audio latent inpainting (mel encode parity + audio noise mask); reference-video guides + noise ramp | WP2c, WP2d | L |
+| WP7 (Phase 2) | Prompt relay residue: bias-strength dial, authoring preview, intra-chunk action-change ladder | WP2b | S |
 | WP8 (Phase 2b) | IC-LoRA weights + attention entries | WP6 | M |
+| WP9 (Phase 2) | Durable video/director jobs: serializable job state + crash recovery (today local video is non-persisted) | WP2c | M |
 
-Phase 1 = WP1–WP5. It ships a usable Director: FFLF and middle keyframes, per-chunk prompts,
-long timelines, imported audio, project files, on the production recipe.
+Phase 1 = WP1, WP2a–d, WP3, WP4, WP5. It ships a usable Director: FFLF and middle keyframes,
+prompt relay via the beat schedule, long timelines, imported audio, project files, at
+whatever recipe the resolver stack yields (the production config today).
 
 ## 6. Validation ladder (each rung a real render, Todd's read, same seed where possible)
 
@@ -271,22 +302,39 @@ long timelines, imported audio, project files, on the production recipe.
 
 - **Model ceiling.** The spike found jump cuts when keyframes sit too close; the motion
   envelope rule (no full turns) still applies. Validate warns, it does not forbid.
-- **Prompt relay Phase 1 is coarse.** Segment changes land on chunk boundaries (≤ 12 s
-  granularity at 24 fps). Phase 2 is the real thing and is transformer work.
+- **Prompt relay rides the beat bias.** It is an additive attention bias, not a hard mask;
+  how sharply an action change lands inside a chunk is an empirical question (WP7 ladder).
 - **Memory.** Encoding a reference clip through the video VAE on top of the DiT is
   40 GB-class territory; the guide must be encoded first and the pipeline released, like the
   image-pool vacate before video today.
-- **Audio inpainting needs an encoder** we have not shipped (we decode; we do not encode
-  audio into latents). Confirm the audio VAE has an encoder before WP6 is scheduled.
+- **Audio ingest parity.** The encoder exists; the risk is matching the pipeline's mel
+  normalization and patchify so an encoded clip lands where a generated one would. WP2d's
+  mux path does not depend on it; WP6's inpaint path does.
+- **Non-durable jobs in Phase 1.** A daemon or engine restart mid-render loses the Director
+  job like it loses a Motion job today. WP9 closes it.
 - **SwiftUI timeline UI is the largest desktop view yet.** Keep the model pure and tested;
   keep the canvas a thin renderer.
 - **IC-LoRA weights and licence.** Obtain and check before WP8.
 - **GPL-3.0 upstream.** Behaviour only; no code, no assets.
 
-## 8. Codex review
+## 8. Codex review (2026-09-16, `codex exec`, read-only against the engine source)
 
-(§8 is filled from `codex exec` against this document and the engine source; see
-`docs/FDD-ltx-director-tab.codex-review.md`.)
+Full text: `docs/FDD-ltx-director-tab.codex-review.md`. Every §3 claim was checked with
+file:line evidence. Five Majors and three Minors, all folded into v1.1 above:
+
+1. Per-segment prompt conditioning already exists as `beat_schedule` (temporal attention
+   bias) — WP7 is a residue, not a new attention hook; Phase 1 compiles segments to beats.
+2. Local video jobs are non-durable; recovery refuses them — durability is its own package
+   (WP9), Phase 1 documents the gap.
+3. The audio VAE encoder exists; the missing piece is the ingest path — WP2d (mux) now,
+   inpaint parity in WP6.
+4. The per-frame denoise mask exists; retake's work is base-video encode + time-range
+   compile + seam validation.
+5. The production recipe lives in the config tier, not resolver builtins; audio is a request
+   flag — §3 corrected.
+6. `writeMP4` muxes PCM, not files — imported audio needs decode/mix/resample (WP2d).
+7. WP2 split into WP2a–d.
+8. "Temporal masks absent" reworded to "no retake API".
 
 ## 9. Decisions requested
 
