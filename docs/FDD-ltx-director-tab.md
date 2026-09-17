@@ -859,8 +859,10 @@ disposition.
 **Acceptance (WP23).**
 - A `tonight` job submitted at 14:00 does not start before 23:00 with the GPU idle all
   afternoon. The ledger shows `held` until 23:00.
-- During a running batch chunk, an image request starts within one denoise step, about 30 s
-  at the production recipe, not after the chunk. The batch render resumes and produces
+- During a running batch chunk, an image request starts within one denoise step, not after the
+  chunk. Measured 2026-09-17 on engine df4fb24: a slot requested mid-render was granted 52 s
+  later, at the next step boundary (576×896, 10 steps), and the video resumed immediately on
+  release. The batch render resumes and produces
   output identical to an uninterrupted run within the #1479 tolerance.
 - A Glimmer slot request during an interactive image parks nothing that is not a video, and
   queues ahead of the next job.
