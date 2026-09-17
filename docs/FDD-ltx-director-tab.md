@@ -1,6 +1,6 @@
 # FDD: "Director" — a timeline editor tab for LTX-2.3 in CoffeeShop Desktop
 
-Status: v1.3 (2026-09-17) — codex-reviewed (v1.1); v1.2 adds Phase 2 regional prompting (§4.6, WP10) adapted from ComfyUI-LTX-BBox-Animator; v1.3 adds audio-driven chunks for long dialogue (§4.7, WP11) animated GIF export (§4.8, WP12), and Sequences with presets and AI-assisted drafting (§4.9, WP13–15). Requested by Todd: "clone this product as a tab for
+Status: v1.3 (2026-09-17) — codex-reviewed (v1.1); v1.2 adds Phase 2 regional prompting (§4.6, WP10) adapted from ComfyUI-LTX-BBox-Animator; v1.3 adds audio-driven chunks for long dialogue (§4.7, WP11) animated GIF export (§4.8, WP12), and Sequences with presets and AI-assisted drafting (§4.9, WP13–15), and agent access through API, MCP and a skill (§4.9.5, WP16). Requested by Todd: "clone this product as a tab for
 desktop app and make an FDD for the initiative" — the product being
 [WhatDreamsCost-ComfyUI](https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI), whose
 flagship node **LTX Director 2.0** is "A Complete Timeline Editor For LTX 2.3".
@@ -503,7 +503,7 @@ tests pin each one.
   flow, and a length slider that shows seconds and snapped frames. Director's toolbar gets a
   preset picker that applies a preset to the open timeline's settings. Applying it never
   deletes placed clips. It warns when a clip falls past the new end.
-- **MCP.** `list_sequence_presets`, `upsert_sequence_preset`, `delete_sequence_preset`.
+- **MCP.** The preset CRUD tools in §4.9.5.
 
 #### 4.9.4 AI-assisted drafting (WP15)
 
@@ -544,6 +544,58 @@ every-4 s preset), with no rendering.
   written.
 - **Then:** two of those drafts render at the production recipe.
 
+#### 4.9.5 Agent access: API, MCP and a skill (WP16)
+
+Kira, Bree and Claude can all create Sequences. Access has three layers with one source of
+truth, so no layer carries logic another layer lacks.
+
+1. **API: the only place work happens.** The `/v1/sequences/*`, `/v1/video/director/*`,
+   `/v1/presets` (`mediaKind: "sequence"`) and `/v1/video/export/gif` routes do all drafting,
+   validation, rendering and export.
+   - **Kira's scheduler is code, not an LLM tool loop.** It calls the API through a typed
+     client in coffeeshop-server (`src/video/director-client.ts`), with the same
+     queue-admission and GPU-lease rules as its other video renders.
+   - **Contract.** Every route is documented in `docs/api-notes.md` → "Sequences". The
+     wire schema is the Sequence document (§4.9.2), versioned by `schema` and `version`.
+2. **MCP: the API for LLM agents.** The MCP tools are thin wrappers with no logic of their own.
+   A tool's result is the route's JSON.
+
+   | Tool | Route |
+   |---|---|
+   | `list_sequence_presets`, `upsert_sequence_preset`, `delete_sequence_preset` | `/v1/presets` (sequence kind) |
+   | `draft_sequence(preset_id, brief, assets?)` | `POST /v1/sequences/draft` |
+   | `validate_sequence(sequence)` | `POST /v1/video/director/validate` |
+   | `render_sequence(sequence_id, reseed?)` | `POST /v1/sequences/render` (returns a job id) |
+   | `sequence_status(job_id)` | `GET /v1/video/status/{id}` |
+   | `get_sequence(id)`, `list_sequences(query?)` | `/v1/sequences` |
+   | `export_gif(video_path, …)` | `POST /v1/video/export/gif` |
+
+   - **Where the tools live.** They join ComfyBox's MCP server (`Sources/ZImage/MCP/MCPToolRegistry.swift`),
+     beside the existing video tools. Bree reaches them through her `mcp_comfybox__*` proxy
+     with no daemon change. Claude reaches them through the same MCP server.
+   - **Render is always explicit.** `draft_sequence` never renders. An agent must call
+     `render_sequence`, which makes the GPU cost a deliberate step.
+3. **Skill: judgment, not execution.** A `comfybox-director` skill in the repo
+   (`skills/comfybox-director/SKILL.md`) teaches an agent to use the tools well.
+   - **Workflow:** pick or create a preset, draft, read the validation issues, fix or accept,
+     render, poll, then check `av_sync` and `recipe_drift` in the result.
+   - **Cost:** about 25 min of GPU per chunk at the production recipe. Before rendering,
+     state the chunk count to the user or the owning persona. Never render during a
+     declared soak or while admission is `local` for someone else's work.
+   - **Prompt practice:** generated from the drafter's `director-author/1` template at build
+     time (`scripts/gen-director-skill.sh`), so the skill and the drafter cannot drift apart.
+     A test fails when the skill's embedded template version differs from the engine's.
+   - **Consumers:** Claude loads it as a skill. Bree reads it with `read_skill` (her skill
+     loader). Kira's chat side gets it through the same loader. Kira's scheduler does not
+     need it, because code follows the API contract.
+
+**Acceptance (WP16).**
+- Each MCP tool round-trips against a stubbed route, and the tool result equals the route JSON.
+- A Claude session with only the skill and MCP drafts, validates and renders a 10 s Sequence
+  from a one-line brief, and reports the chunk count and GPU estimate before rendering.
+- Bree lists and drafts through the proxy with no daemon code change.
+- The skill-template version test is green.
+
 ### 4.5 What this deliberately does not do
 
 - Run or vendor any upstream Python (repo rule: ComfyBox is self-standing Swift/MLX).
@@ -576,7 +628,8 @@ every-4 s preset), with no rendering.
 | WP12 (Phase 2) | Animated GIF export (§4.8): ImageIO encoder with frame-exact decimation + size-cap step-down, `POST /v1/video/export/gif` (sync ≤ 20 s, job beyond), desktop Export GIF sheet in result view + render strip, `export_gif` MCP tool | WP2d (decode path) | S (engine) + S (desktop) |
 | WP13 (Phase 2) | Sequence document (§4.9.2): schema + `.sequence.json` sidecar, mp4 metadata embed, open-from-mp4, `/v1/sequences` store + replay with `recipe_drift`, catalog `kind: sequence`; project render records adopt it | WP2c | M |
 | WP14 (Phase 2) | Sequence presets (§4.9.3): `mediaKind: "sequence"` in `PresetStore` (+ the three image/video switch sites), validation, PresetView section, Director preset picker, MCP CRUD | WP13 | M |
-| WP15 (Phase 2) | AI-assisted drafting (§4.9.4): `director-author/1` template, structured timeline output, validate-and-repair-once, keyframe still generation via image preset, `/v1/sequences/draft`, desktop "Draft from brief" + `director_draft` AgentAction, MCP `draft_sequence`; 20-draft ladder FIRST | WP13, WP14 | M (engine) + M (desktop) |
+| WP15 (Phase 2) | AI-assisted drafting (§4.9.4): `director-author/1` template, structured timeline output, validate-and-repair-once, keyframe still generation via image preset, `/v1/sequences/draft`, desktop "Draft from brief" + `director_draft` AgentAction; 20-draft ladder FIRST | WP13, WP14 | M (engine) + M (desktop) |
+| WP16 (Phase 2) | Agent access (§4.9.5): api-notes "Sequences" contract, coffeeshop-server `director-client.ts`, full MCP tool set as thin wrappers, `comfybox-director` skill generated from `director-author/1` with a version-lock test | WP13–WP15 | S (engine MCP) + S (client) + S (skill) |
 
 Phase 1 = WP1, WP2a–d, WP3, WP4, WP5. It ships a usable Director: FFLF and middle keyframes,
 prompt relay via the beat schedule, long timelines, imported audio, project files, at
