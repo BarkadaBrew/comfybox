@@ -80,6 +80,10 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeComposeMontage(arguments)
       case "render_storyboard":
         return try await executeRenderStoryboard(arguments)
+      case "generate_director_video":
+        return try await executeGenerateDirectorVideo(arguments)
+      case "validate_director_timeline":
+        return try await executeValidateDirectorTimeline(arguments)
       case "rerender_video":
         return try await executeWinnerAction(arguments, route: "/v1/video/rerender")
       case "extend_video":
@@ -881,6 +885,28 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let jsonData = try JSONEncoder().encode(params.raw)
     // #339 review r1, item 4: storyboards are gated the same as local video.
     return try await postWithQueueRecoveryRetry("/v1/storyboard/render", body: jsonData)
+  }
+
+  /// generate_director_video -> POST /v1/video/director (WP2c). The params
+  /// (timeline, output_path?, source?) are forwarded verbatim; gated like
+  /// local video, so a queue-recovery 503 is retried.
+  private func executeGenerateDirectorVideo(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let params, params.raw["timeline"] != nil else {
+      return MCPToolResult(error: "Error: 'timeline' is required")
+    }
+    let jsonData = try JSONEncoder().encode(params.raw)
+    return try await postWithQueueRecoveryRetry("/v1/video/director", body: jsonData)
+  }
+
+  /// validate_director_timeline -> POST /v1/video/director/validate (WP2c).
+  /// Pure on the engine side (no weights, no recovery gate).
+  private func executeValidateDirectorTimeline(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let params, params.raw["timeline"] != nil else {
+      return MCPToolResult(error: "Error: 'timeline' is required")
+    }
+    let jsonData = try JSONEncoder().encode(params.raw)
+    let (status, data) = try await client.post("/v1/video/director/validate", body: jsonData)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// import_workflow -> POST /v1/workflows/import

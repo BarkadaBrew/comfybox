@@ -1535,7 +1535,7 @@ public final class WarmServer {
         let spec = try storyboardSpec(from: payload)
         try spec.validate()
         let source = payload.source ?? "api"
-        let status = videoJobTracker.submitOrchestrated(source: source, mode: .storyboard) { [weak self] report in
+        let status = videoJobTracker.submitOrchestrated(source: source, mode: .storyboard) { [weak self] _, report in
           guard let self else {
             throw StoryboardError.shotFailed(shot: 0, stage: "server", message: "server shutting down")
           }
@@ -1548,6 +1548,23 @@ public final class WarmServer {
       } catch {
         return .error(response(for: error))
       }
+
+    // Director timeline (WP2c, docs/FDD-ltx-director-tab.md): a
+    // DirectorTimeline compiled into single-pass chunks, rendered in sequence
+    // on the previous chunk's rendered last frame and stitched frame-accurately.
+    // /validate is pure (no weights, no LTX-2 guard, no recovery gate);
+    // /director is the 202 job model — poll GET /v1/video/status/{id} like
+    // any local video job (`stage_index`/`stage_count` name the chunk).
+    case ("POST", "/v1/video/director/validate"):
+      do {
+        let payload = try decode(DirectorPayload.self, from: request.body)
+        return .json(.rawJSON(status: 200, data: try Self.directorValidateBody(payload)))
+      } catch {
+        return .error(response(for: error))
+      }
+
+    case ("POST", "/v1/video/director"):
+      return await directorSubmitResponse(request: request)
 
     case ("POST", "/v1/video/config/effective"):
       // Finding #16: a HYPOTHETICAL resolution — request-shaped context in,
@@ -2025,6 +2042,7 @@ public final class WarmServer {
           "/v1/model/load", "/v1/model/activate", "/v1/model/pool", "/v1/model/unload",
           "/v1/model/family",
           "/v1/loras", "/v1/loras/scan", "/v1/video/generate", "/v1/video/generate/async", "/v1/upscale",
+          "/v1/video/director", "/v1/video/director/validate",
           "/v1/characters", "/v1/presets", "/v1/presets/resolve",
           "/v1/content-modes", "/v1/stats", "/v1/memory", "/v1/audit-log", "/v1/config",
           "/v1/controls"
@@ -6108,6 +6126,548 @@ public final class WarmServer {
       generationRecord: storyboardRecord)
   }
 
+  // MARK: - Director (WP2c, docs/FDD-ltx-director-tab.md)
+
+  /// Wire payload for POST /v1/video/director and /v1/video/director/validate
+  /// (snake_case). The timeline's explicit `init(from:)` runs under the route
+  /// decoder's `.convertFromSnakeCase`, so every schema default applies and
+  /// `version > 1` surfaces as `DirectorError.unsupportedVersion` (400).
+  struct DirectorPayload: Decodable {
+    let timeline: DirectorTimeline
+    /// Output .mp4 name or absolute path; resolved under
+    /// `allowedOutputDirectory` at SUBMIT (a bad path is a 400, never a
+    /// failure after a 30-minute render). Default `director-<session>.mp4`.
+    let outputPath: String?
+    /// Queue attribution; default "api".
+    let source: String?
+  }
+
+  /// 200 body of /validate. `plan` is encoded as an explicit `null` when the
+  /// timeline is invalid (the contract says `plan | null`, and a synthesized
+  /// `encodeIfPresent` would drop the key).
+  struct DirectorValidateResponse: Encodable {
+    let ok: Bool
+    let snappedLengthFrames: Int
+    let plan: DirectorPlan?
+    let issues: [DirectorIssue]
+
+    enum CodingKeys: String, CodingKey {
+      case ok, snappedLengthFrames, plan, issues
+    }
+
+    func encode(to encoder: Encoder) throws {
+      var c = encoder.container(keyedBy: CodingKeys.self)
+      try c.encode(ok, forKey: .ok)
+      try c.encode(snappedLengthFrames, forKey: .snappedLengthFrames)
+      try c.encode(plan, forKey: .plan)
+      try c.encode(issues, forKey: .issues)
+    }
+  }
+
+  /// 400 body for an invalid timeline: the existing `{"error": …}` envelope
+  /// plus the issues list — `{"error": "timeline invalid", "issues": [...]}`.
+  struct DirectorInvalidResponse: Encodable {
+    let error: String
+    let issues: [DirectorIssue]
+  }
+
+  private static func directorJSONEncoder() -> JSONEncoder {
+    let encoder = JSONEncoder()
+    encoder.keyEncodingStrategy = .convertToSnakeCase
+    encoder.outputFormatting = [.sortedKeys]
+    return encoder
+  }
+
+  /// The /validate response: pure — validator + encoder, no weights, no
+  /// LTX-2 guard, no recovery gate, no full audio decode (the default probe
+  /// reads container metadata only). Injectable closures keep it testable.
+  static func directorValidateBody(
+    _ payload: DirectorPayload,
+    fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
+    audioProbe: (String) -> AudioProbe? = DirectorValidator.defaultAudioProbe
+  ) throws -> Data {
+    let v = DirectorValidator.validate(payload.timeline, fileExists: fileExists, audioProbe: audioProbe)
+    let body = DirectorValidateResponse(
+      ok: v.ok, snappedLengthFrames: v.snapped.settings.lengthFrames,
+      plan: v.ok ? v.plan : nil, issues: v.issues)
+    return try directorJSONEncoder().encode(body)
+  }
+
+  static func directorInvalidBody(_ issues: [DirectorIssue]) throws -> Data {
+    try directorJSONEncoder().encode(DirectorInvalidResponse(error: "timeline invalid", issues: issues))
+  }
+
+  /// Submit-time dry-run gate, applied to EVERY compiled chunk body after it
+  /// went through `prepareLocalVideo` (presets, dims, config snapshot, LoRAs,
+  /// `generator.validate`) exactly as a render would. Pure decision:
+  /// - `temporal_upscale_unsupported`: the resolved config enables the ltx-2.3
+  ///   temporal upscaler, which muxes at 2x fps — Phase 1 stitches at
+  ///   `settings.fps`, so the chunk's frame rate would not match the plan.
+  /// - `chunk_not_single_pass`: the chunk resolved to a continuation render
+  ///   (>1 chunk) or its beat schedule was dropped for one — a preset/config
+  ///   supplied extend/duration the compiled body did not ask for.
+  /// nil = the chunk renders as planned.
+  static func directorDryRunError(
+    temporalUpscale: Int,
+    beatScheduleIgnoredReason: String?,
+    framesPerChunk: Int,
+    extendToSeconds: Float,
+    fps: Int
+  ) -> String? {
+    if temporalUpscale > 1 {
+      return "temporal_upscale_unsupported: the resolved config enables the temporal upscaler (x\(temporalUpscale)); "
+        + "Phase 1 director chunks stitch at settings.fps — set tuning.temporal_upscale to 1 or pick a preset without it"
+    }
+    let plan = LTX2VideoGenerator.chunkPlan(
+      framesPerChunk: framesPerChunk, extendToSeconds: extendToSeconds, fps: fps)
+    if plan.totalChunks > 1 {
+      return "chunk_not_single_pass: the prepared chunk resolves to \(plan.totalChunks) continuation chunks "
+        + "(\(framesPerChunk)f + extend \(extendToSeconds)s); every director chunk must be a single pass"
+    }
+    if let reason = beatScheduleIgnoredReason {
+      return "chunk_not_single_pass: the chunk's beat schedule was dropped (\(reason)); every director chunk must be a single pass"
+    }
+    return nil
+  }
+
+  /// `expectedFrames`/`expectedFps` (the compiled span): a prepared chunk
+  /// whose frame count or rate was changed by the server (a preset, the
+  /// production floor) would not stitch against the plan —
+  /// `chunk_frames_mismatch`.
+  static func directorDryRunError(
+    request: LTX2VideoRequest, beatScheduleIgnoredReason: String?,
+    expectedFrames: Int? = nil, expectedFps: Int? = nil
+  ) -> String? {
+    if let error = directorDryRunError(
+      temporalUpscale: request.resolvedConfigSnapshot?.temporalUpscale ?? 1,
+      beatScheduleIgnoredReason: beatScheduleIgnoredReason,
+      framesPerChunk: request.framesPerChunk,
+      extendToSeconds: request.extendToSeconds,
+      fps: request.fps) {
+      return error
+    }
+    if let expectedFrames, request.framesPerChunk != expectedFrames {
+      return "chunk_frames_mismatch: the prepared chunk renders \(request.framesPerChunk) frames, the plan expects \(expectedFrames)"
+    }
+    if let expectedFps, request.fps != expectedFps {
+      return "chunk_frames_mismatch: the prepared chunk renders at \(request.fps) fps, the timeline is \(expectedFps) fps"
+    }
+    return nil
+  }
+
+  static func directorDryRunError(
+    prep: PreparedLocalVideo, expectedFrames: Int? = nil, expectedFps: Int? = nil
+  ) -> String? {
+    directorDryRunError(
+      request: prep.request, beatScheduleIgnoredReason: prep.beatScheduleIgnoredReason,
+      expectedFrames: expectedFrames, expectedFps: expectedFps)
+  }
+
+  /// Write every `image_base64` keyframe to
+  /// `<directory>/director-<session>-asset-<id>.png`, rewrite its
+  /// `image_path` and drop the payload, so the compiler (which never guesses
+  /// a path) and the engine's image loader see files. Returns the written
+  /// paths (deleted with the other intermediates, or on a refused submit).
+  /// Keyframe ids are unique by validation; any character outside
+  /// [A-Za-z0-9-_] becomes `_` in the filename.
+  static func directorMaterializeAssets(
+    _ timeline: inout DirectorTimeline, session: String, directory: String
+  ) throws -> [String] {
+    var written: [String] = []
+    for i in timeline.keyframes.indices {
+      guard let b64 = timeline.keyframes[i].imageBase64, !b64.isEmpty else { continue }
+      guard let bytes = Data(base64Encoded: b64), !bytes.isEmpty else {
+        throw WarmServerError.invalidRequest(
+          message: "keyframe \(timeline.keyframes[i].id): image_base64 is not valid base64")
+      }
+      let safeId = String(timeline.keyframes[i].id.map { c -> Character in
+        (c.isLetter || c.isNumber || c == "-" || c == "_") && c.isASCII ? c : "_"
+      })
+      let path = (directory as NSString).appendingPathComponent("director-\(session)-asset-\(safeId).png")
+      try bytes.write(to: URL(fileURLWithPath: path), options: .atomic)
+      written.append(path)
+      timeline.keyframes[i].imagePath = path
+      timeline.keyframes[i].imageBase64 = nil
+    }
+    return written
+  }
+
+  /// Delete every `director-<session>-*` intermediate (chunk mp4s + their
+  /// sidecars, last-frame PNGs, materialized assets). The FINAL output is
+  /// `director-<session>.mp4` (no trailing dash) or the caller's path, so the
+  /// prefix never matches it. A crash mid-stitch leaves director-* files,
+  /// which the daemon's orphan reconciler ignores by the same non-`ltx2-`
+  /// prefix convention the storyboard relies on (assumption inherited from
+  /// `runStoryboard`, not re-verified against coffeeshop-server).
+  static func directorRemoveIntermediates(session: String, directory: String, extra: [String]) {
+    let fm = FileManager.default
+    let prefix = "director-\(session)-"
+    if let names = try? fm.contentsOfDirectory(atPath: directory) {
+      for name in names where name.hasPrefix(prefix) {
+        try? fm.removeItem(atPath: (directory as NSString).appendingPathComponent(name))
+      }
+    }
+    for path in extra {
+      try? fm.removeItem(atPath: path)
+    }
+  }
+
+  /// POST /v1/video/director: guards (LTX-2 configured, recovery gate) →
+  /// decode → validate (400 + issues) → materialize base64 assets → compile →
+  /// DRY RUN every chunk body through `prepareLocalVideo` (400 on any
+  /// LTX2VideoError, `temporal_upscale_unsupported`, `chunk_not_single_pass`)
+  /// → resolve the output path → submit the orchestration → 202 with the
+  /// chunk-0 snapshot (`resolved_config`, `recipe_hash`), the plan and
+  /// `stage_count`. Nothing renders before the 202.
+  private func directorSubmitResponse(request: HTTPRequest) async -> RoutedResponse {
+    guard configuration.ltx2WeightsPath != nil, configuration.ltx2GemmaPath != nil else {
+      return .error(.error(status: 503, message: "Director rendering needs local LTX-2 (--ltx2-weights/--ltx2-gemma)"))
+    }
+    // Same reasoning as the storyboard (#339): a director job is a chain of
+    // unpersisted local-video renders under one tracker id — refuse up front
+    // rather than accept an orchestration a restart would lose mid-chunk.
+    let recovery = queueRecoveryState.snapshot()
+    if QueueRecoveryGate.shouldReject(kind: .video, recoveryInProgress: recovery.inProgress) {
+      logger.warning("Director: refused render — persisted-queue replay in flight (#339)")
+      return .error(.queueRecovering(remainingKinds: recovery.remainingKinds))
+    }
+
+    let session = String(UUID().uuidString.prefix(8))
+    let dir = configuration.allowedOutputDirectory
+    var materialized: [String] = []
+    func discardAssets() {
+      for path in materialized { try? FileManager.default.removeItem(atPath: path) }
+    }
+
+    do {
+      let payload = try decode(DirectorPayload.self, from: request.body)
+      let source = payload.source ?? "api"
+      let validation = DirectorValidator.validate(payload.timeline)
+      guard validation.ok else {
+        return .error(.rawJSON(status: 400, data: try Self.directorInvalidBody(validation.issues)))
+      }
+
+      // Output path containment at submit, like every video route.
+      let requestedName = payload.outputPath ?? "director-\(session).mp4"
+      let requested = requestedName.hasPrefix("/") || requestedName.hasPrefix("~")
+        ? requestedName
+        : (dir as NSString).appendingPathComponent(requestedName)
+      let resolvedOutput = try WarmServerOutputPathValidator.resolveOutputPath(
+        requested, allowedOutputDirectory: dir).path
+
+      var snapped = validation.snapped
+      materialized = try Self.directorMaterializeAssets(&snapped, session: session, directory: dir)
+      let timeline = snapped
+      let compilation = try DirectorCompiler.compile(
+        DirectorValidation(snapped: timeline, issues: validation.issues, ok: true, plan: validation.plan),
+        session: session, source: source)
+
+      // DRY RUN: every chunk body (carry-over omitted for k > 0 — that
+      // keyframe only exists once chunk k-1 has rendered) through the same
+      // preparation the render will use, so preset-induced multi-chunk,
+      // temporal upscale, keyframe conflicts and dimension errors are 400s
+      // now, not failures after a long render.
+      var chunkZero: PreparedLocalVideo? = nil
+      for chunk in compilation.chunks {
+        let bodyData = try JSONSerialization.data(withJSONObject: chunk.body)
+        guard let prep = try await prepareLocalVideo(body: bodyData) else {
+          discardAssets()
+          return .error(.error(status: 503, message: "Director rendering needs local LTX-2 (--ltx2-weights/--ltx2-gemma)"))
+        }
+        if let why = Self.directorDryRunError(
+          prep: prep, expectedFrames: chunk.span.frames, expectedFps: timeline.settings.fps) {
+          discardAssets()
+          return .error(.error(status: 400, message: "chunk \(chunk.index + 1)/\(compilation.chunks.count): \(why)"))
+        }
+        if chunk.index == 0 { chunkZero = prep }
+      }
+      guard let first = chunkZero else {
+        discardAssets()
+        return .error(.error(status: 400, message: "timeline compiled to no chunks"))
+      }
+
+      let n = compilation.chunks.count
+      let planJSON = String(decoding: try DirectorJSON.encoder(pretty: false).encode(compilation.plan), as: UTF8.self)
+      let assets = materialized
+      logger.info("Director[\(session)]: accepted \(n) chunk(s), \(timeline.settings.lengthFrames)f @ \(timeline.settings.fps) fps, audio \(timeline.audio.mode.rawValue) -> \(resolvedOutput)")
+      let status = videoJobTracker.submitOrchestrated(
+        source: source, mode: .director,
+        resolvedConfig: first.request.resolvedConfigSnapshot?.params,
+        recipeHash: first.recipeHash,
+        tracePayload: ["director_plan": planJSON, "director_chunks": String(n)],
+        plan: compilation.plan, stageCount: n
+      ) { [weak self] jobId, report in
+        guard let self else {
+          throw DirectorError.chunkFailed(chunk: 0, stage: "server", message: "server shutting down")
+        }
+        return try await self.runDirector(
+          compilation: compilation, timeline: timeline, session: session, source: source,
+          resolvedOutput: resolvedOutput, materializedAssets: assets, jobId: jobId, report: report)
+      }
+      let encoder = JSONEncoder()
+      encoder.keyEncodingStrategy = .convertToSnakeCase
+      return .json(.rawJSON(status: 202, data: try encoder.encode(status)))
+    } catch let error as DirectorError {
+      discardAssets()
+      if case .invalid(let issues) = error, let data = try? Self.directorInvalidBody(issues) {
+        return .error(.rawJSON(status: 400, data: data))
+      }
+      return .error(response(for: error))
+    } catch let error as LTX2VideoError {
+      // Same mapping the async video route applies (keyframe_conflict,
+      // invalid_keyframe, dims, frames…): the caller's request, 400.
+      discardAssets()
+      return .error(.error(status: 400, message: error.localizedDescription))
+    } catch {
+      discardAssets()
+      return .error(response(for: error))
+    }
+  }
+
+  /// Execute a director timeline: one single-pass render per compiled chunk,
+  /// each chained on the previous chunk's extracted last frame (the
+  /// carry-over keyframe at frame 0), then audio per mode and a frame-accurate
+  /// stitch. Runs OUTSIDE the GPU queue (`submitOrchestrated`) and takes a
+  /// normal queue turn per chunk, so other jobs interleave between chunks.
+  /// Progress: chunks share 0-96 evenly, the stitch is 96-100.
+  ///
+  /// Every intermediate (`director-<session>-chunk<k>.mp4` + sidecar,
+  /// `-lastframe.png`, `-asset-*.png`) is deleted in `defer` on success AND
+  /// failure.
+  ///
+  /// CHUNK-0 ASYMMETRY (first suspect for a chunk-to-chunk quality step in
+  /// ladder rung 2): from the generator's point of view EVERY director chunk
+  /// is chunk 0 of its own single-pass request. So the i2v arm's face/refine
+  /// anchors and `audioSeconds` fire on the CARRY-OVER frame of every
+  /// continuation chunk (it is that chunk's only frame-0 keyframe), while a
+  /// continuation chunk that also carries an end keyframe takes the
+  /// multi-keyframe arm (WP2a) and gets NO face/refine anchoring. The
+  /// carry-over itself is double-lossy: chunk k-1's H.264 mp4 → PNG
+  /// (`LastFrameExtractor`) → the engine's H.264 conditioning round-trip,
+  /// versus the in-generator continuation which conditions on the
+  /// VAE-decoded frame directly.
+  private func runDirector(
+    compilation: DirectorCompilation,
+    timeline: DirectorTimeline,
+    session: String,
+    source: String,
+    resolvedOutput: String,
+    materializedAssets: [String],
+    jobId: String,
+    report: @escaping @Sendable (Int) -> Void
+  ) async throws -> LTX2VideoResult {
+    let started = Date()
+    let dir = configuration.allowedOutputDirectory
+    let settings = timeline.settings
+    let n = compilation.chunks.count
+    let chunkWeight = 96.0 / Double(max(n, 1))
+    defer {
+      Self.directorRemoveIntermediates(session: session, directory: dir, extra: materializedAssets)
+    }
+
+    func chunkFailed(_ k: Int, _ stage: String, _ message: String) -> DirectorError {
+      .chunkFailed(chunk: k, stage: stage, message: message)
+    }
+
+    var previousLastFrame: String? = nil
+    var chunkPaths: [String] = []
+    var chunkResults: [LTX2VideoResult] = []
+
+    for chunk in compilation.chunks {
+      let k = chunk.index
+      try Task.checkCancellation()
+      videoJobTracker.setStage(jobId, index: k, count: n)
+
+      let body: [String: Any]
+      if chunk.carryOverFromChunk != nil {
+        guard let carry = previousLastFrame else {
+          throw chunkFailed(k, "lastframe", "no carry-over frame from chunk \(k)")
+        }
+        body = chunk.bodyWithCarryOver(imagePath: carry)
+      } else {
+        body = chunk.body
+      }
+      logger.info("Director[\(session)] chunk \(k + 1)/\(n): \(chunk.span.frames)f from timeline frame \(chunk.span.startFrame)\(chunk.carryOverFromChunk != nil ? " (carry-over)" : "")")
+
+      let result: LTX2VideoResult
+      do {
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        guard let prep = try await prepareLocalVideo(body: bodyData) else {
+          throw chunkFailed(k, "render", "local LTX-2 not configured")
+        }
+        let base = Double(k) * chunkWeight
+        // #1479: like storyboard shots, director chunks stay on the legacy,
+        // non-preemptible `generate` entry — a multi-chunk orchestration
+        // issues its own per-chunk coordinator enqueues (see
+        // `submitOrchestrated`'s doc comment), which the preemption episode
+        // does not model. `.generate` never yields, so this is always
+        // `.completed`. Unlike the storyboard, `videoJobId` IS passed: /health
+        // and interrupt-by-id then resolve this job — harmless for a
+        // non-preemptible render (the coordinator only marks pause/resume
+        // for a render that yields).
+        result = try await coordinator.enqueueLocalVideo(wantsAudio: chunk.wantsAudio, videoJobId: jobId) { coordReport in
+          .completed(try prep.generator.generate(prep.request) { c, totalChunks, step, totalSteps in
+            let pct = Self.localVideoProgressPercent(
+              chunk: c, totalChunks: totalChunks, step: step, totalSteps: totalSteps)
+            coordReport(pct)
+            report(Int(base + Double(pct) * chunkWeight / 100.0))
+          })
+        }
+      } catch let error as DirectorError {
+        throw error
+      } catch {
+        // comfybox#322: never launder an interrupt into a chunk failure —
+        // `chunkFailed` keeps only a message string, and the trackers
+        // classify on the `CancellationError` itself.
+        if ltx2IsCancellation(error) { throw error }
+        throw chunkFailed(k, "render", error.localizedDescription)
+      }
+
+      // The stitch assumes every chunk is at settings.fps (the dry run
+      // refused temporal upscale; this is the belt to that suspender).
+      let outputFps = result.generationRecord?.outputFps ?? result.generationRecord?.fps ?? settings.fps
+      guard outputFps == settings.fps else {
+        throw chunkFailed(k, "fps", "chunk rendered at \(outputFps) fps, the timeline is \(settings.fps) fps")
+      }
+      guard result.frameCount == chunk.span.frames else {
+        throw chunkFailed(k, "render", "chunk wrote \(result.frameCount) frames, the plan expected \(chunk.span.frames)")
+      }
+      chunkPaths.append(result.outputPath)
+      chunkResults.append(result)
+
+      // Chain: this chunk's last frame is the next chunk's frame-0 keyframe.
+      if k < n - 1 {
+        let framePath = (dir as NSString).appendingPathComponent(chunk.lastFrameName)
+        do {
+          previousLastFrame = try LastFrameExtractor.extractLastFrame(from: result.outputPath, to: framePath)
+        } catch {
+          if ltx2IsCancellation(error) { throw error }
+          throw chunkFailed(k, "lastframe", error.localizedDescription)
+        }
+      }
+    }
+
+    // MARK: Audio
+
+    try Task.checkCancellation()
+    videoJobTracker.setStage(jobId, index: n, count: n)
+    var pcm: StereoPCM? = nil
+    let audioSource: String
+    do {
+      switch timeline.audio.mode {
+      case .imported:
+        // The user's clips, mixed onto the timeline at 48 kHz; the chunks
+        // rendered with audio off. Never mastered (LTX2AudioEnhance is for
+        // generated audio only).
+        var placed: [PlacedAudio] = []
+        for clip in timeline.audioClips {
+          let decoded = try DirectorAudioIngest.decode(path: clip.audioPath)
+          placed.append(PlacedAudio(
+            pcm: decoded, startFrame: clip.startFrame, lengthFrames: clip.lengthFrames,
+            trimStartFrames: clip.trimStartFrames, gain: clip.gain))
+        }
+        pcm = DirectorAudioMixer.mix(placed, fps: settings.fps, lengthFrames: settings.lengthFrames)
+        audioSource = "imported"
+      case .generated:
+        // Each chunk generated its own audio from noise; place chunk k's
+        // track at its span (the boundary frame's 1/fps is dropped for
+        // k > 0, matching the stitcher's dropped frame). Seams are expected
+        // (validator warning `generated_audio_seams`). A chunk whose audio
+        // failed or has no track contributes silence.
+        var placed: [PlacedAudio] = []
+        for (chunk, result) in zip(compilation.chunks, chunkResults) {
+          if result.audioError != nil { continue }
+          do {
+            let decoded = try DirectorAudioIngest.decode(path: result.outputPath)
+            placed += DirectorAudioMixer.chunkPlacement(chunkPCM: [decoded], spans: [chunk.span], fps: settings.fps)
+          } catch DirectorAudioIngestError.noAudioTrack(_) {
+            continue
+          }
+        }
+        if placed.isEmpty {
+          pcm = nil
+          audioSource = "none"
+        } else {
+          pcm = DirectorAudioMixer.mix(placed, fps: settings.fps, lengthFrames: settings.lengthFrames)
+          audioSource = "generated"
+        }
+      case .inpaint:
+        // Rejected by the validator (audio_mode_unsupported) before compile.
+        audioSource = "none"
+      }
+    } catch {
+      if ltx2IsCancellation(error) { throw error }
+      throw chunkFailed(n - 1, "audio", error.localizedDescription)
+    }
+
+    // MARK: Stitch
+
+    // The chunks' REAL encoded dims (the delivery downscale can make a chunk
+    // smaller than settings.width/height); the writer scales every chunk to
+    // these, so a mismatched chunk is a resample, never a failure.
+    let firstChunk = chunkResults[0]
+    let stitchWidth = firstChunk.outputWidth > 0 ? firstChunk.outputWidth : settings.width
+    let stitchHeight = firstChunk.outputHeight > 0 ? firstChunk.outputHeight : settings.height
+    logger.info("Director[\(session)]: stitching \(n) chunk(s) at \(stitchWidth)x\(stitchHeight) @ \(settings.fps) fps, audio \(audioSource) -> \(resolvedOutput)")
+    let stitch: StitchResult
+    do {
+      try Task.checkCancellation()
+      stitch = try DirectorStitcher.stitch(
+        chunkPaths: chunkPaths,
+        expectedFrames: compilation.chunks.map(\.span.frames),
+        fps: settings.fps, width: stitchWidth, height: stitchHeight,
+        audio: pcm, outputPath: resolvedOutput)
+    } catch let error as DirectorError {
+      throw error
+    } catch {
+      if ltx2IsCancellation(error) { throw error }
+      throw DirectorError.stitchFailed(error.localizedDescription)
+    }
+
+    // Aggregate record: the per-chunk clips carried their own sidecars via
+    // `LTX2VideoGenerator.render` (deleted with them); the stitched output
+    // gets one aggregate here. `audio` keeps its generated-audio meaning
+    // (`audio_source` says where the track came from).
+    let effectiveLoras = firstChunk.generationRecord?.loras
+      ?? settings.loras.map { VideoGenerationRecord.LoRAEntry(name: VideoGenerationRecord.basename($0.path), scale: $0.scale) }
+    let record = VideoGenerationRecord(
+      prompt: timeline.globalPrompt,
+      negativePrompt: settings.negativePrompt,
+      seed: settings.seed,
+      steps: firstChunk.generationRecord?.steps ?? settings.steps,
+      model: "ltx2-director",
+      engine: "ltx2",
+      width: settings.width, height: settings.height,
+      frames: stitch.frameCount, fps: settings.fps,
+      weightsDir: firstChunk.generationRecord?.weightsDir,
+      gemma: firstChunk.generationRecord?.gemma,
+      engineBuild: firstChunk.generationRecord?.engineBuild,
+      resolvedWidth: stitchWidth, resolvedHeight: stitchHeight,
+      twoPass: false, refine: false,
+      audio: pcm != nil,
+      recipeHash: firstChunk.generationRecord?.recipeHash,
+      kind: "director",
+      source: source,
+      loras: effectiveLoras,
+      audioSource: audioSource,
+      chunkCount: n,
+      stitchPath: stitch.path)
+    VideoSidecar.write(record, forMediaAt: stitch.outputPath)
+    auditLog.append(
+      kind: "video.director",
+      message: "\(n) chunk(s), \(stitch.frameCount)f @ \(settings.fps) fps, audio \(audioSource) -> \(stitch.outputPath)",
+      metadata: [:])
+    report(100)
+
+    return LTX2VideoResult(
+      outputPath: stitch.outputPath,
+      frameCount: stitch.frameCount,
+      durationSeconds: Float(stitch.durationSeconds),
+      elapsedSeconds: Date().timeIntervalSince(started),
+      generationRecord: record,
+      outputWidth: stitchWidth, outputHeight: stitchHeight)
+  }
+
   // MARK: - Montage (#232)
 
   /// Wire response for POST /v1/montage/compose.
@@ -7089,6 +7649,17 @@ public final class WarmServer {
       case .stepCountBelowMinimum:
         return .error(status: 400, message: error.description)
       case .missingMu:
+        return .error(status: 500, message: error.description)
+      }
+
+    // WP2c: a timeline the route could not accept is the caller's error;
+    // a stage failure inside the orchestration is the server's (the job
+    // status carries the formatted "chunk k/n (stage)" string either way).
+    case let error as DirectorError:
+      switch error {
+      case .invalid, .unsupportedVersion, .fileUnreadable, .importFailed:
+        return .error(status: 400, message: error.description)
+      case .chunkFailed, .stitchFailed:
         return .error(status: 500, message: error.description)
       }
 
@@ -8676,6 +9247,13 @@ private final class LocalVideoJob: @unchecked Sendable {
   var generationRecord: VideoGenerationRecord?
   /// Frozen at admission and unchanged for the job's full lifetime.
   var recipeHash: String?
+  /// Director (WP2c): the compiled plan, set at register and unchanged.
+  var plan: DirectorPlan?
+  /// Director: 0-based chunk currently rendering (nil before the first chunk
+  /// starts; == `stageCount` during the final audio mix + stitch).
+  var stageIndex: Int?
+  /// Director: number of chunks.
+  var stageCount: Int?
 
   init(id: String, source: String, mode: VideoMode) {
     self.id = id
@@ -8705,7 +9283,10 @@ private final class LocalVideoJob: @unchecked Sendable {
       interrupted: interrupted ? true : nil,
       refineSkipped: refineSkippedReason,
       generationRecord: generationRecord,
-      recipeHash: recipeHash
+      recipeHash: recipeHash,
+      plan: plan,
+      stageIndex: stageIndex,
+      stageCount: stageCount
     )
   }
 }
@@ -8745,12 +9326,16 @@ final class VideoJobTracker: @unchecked Sendable {
     source: String, mode: VideoMode,
     resolvedConfig: [LTX2ResolvedParam]? = nil,
     recipeHash: String? = nil,
-    tracePayload: [String: String] = [:]
+    tracePayload: [String: String] = [:],
+    plan: DirectorPlan? = nil,
+    stageCount: Int? = nil
   ) -> (jobId: String, status: VideoJobStatus) {
     let jobId = UUID().uuidString
     let job = LocalVideoJob(id: jobId, source: source, mode: mode)
     job.resolvedConfig = resolvedConfig
     job.recipeHash = recipeHash
+    job.plan = plan
+    job.stageCount = stageCount
     lock.lock(); jobs[jobId] = job; lock.unlock()
     var payload = tracePayload
     payload["source"] = source
@@ -8810,17 +9395,31 @@ final class VideoJobTracker: @unchecked Sendable {
   /// so each step takes a normal turn on the FIFO GPU queue and other jobs
   /// can interleave between shots. Wrapping the whole storyboard in one queue
   /// entry would deadlock: the closure would enqueue from inside the queue.
-  fileprivate func submitOrchestrated(
+  ///
+  /// WP2c: the director orchestration registers with the chunk-0 dry-run
+  /// snapshot (`resolvedConfig`/`recipeHash`), its plan on the trace payload
+  /// and the status, and a `stageCount`; the work closure receives the job id
+  /// so it can pass it to `enqueueLocalVideo(videoJobId:)` and `setStage`. The
+  /// storyboard passes none of these (defaults) and ignores the id. Internal
+  /// (not fileprivate) so the state machine is testable with a stub `work`.
+  func submitOrchestrated(
     source: String,
     mode: VideoMode,
-    work: @escaping @Sendable (@escaping @Sendable (Int) -> Void) async throws -> LTX2VideoResult
+    resolvedConfig: [LTX2ResolvedParam]? = nil,
+    recipeHash: String? = nil,
+    tracePayload: [String: String] = [:],
+    plan: DirectorPlan? = nil,
+    stageCount: Int? = nil,
+    work: @escaping @Sendable (String, @escaping @Sendable (Int) -> Void) async throws -> LTX2VideoResult
   ) -> VideoJobStatus {
-    let (jobId, queued) = register(source: source, mode: mode)
+    let (jobId, queued) = register(
+      source: source, mode: mode, resolvedConfig: resolvedConfig, recipeHash: recipeHash,
+      tracePayload: tracePayload, plan: plan, stageCount: stageCount)
     Task { [weak self] in
       guard let self else { return }
       self.markProcessing(jobId)
       do {
-        let result = try await work { pct in
+        let result = try await work(jobId) { pct in
           self.setProgress(jobId, pct)
         }
         self.markSucceeded(jobId, result: result)
@@ -8858,6 +9457,32 @@ final class VideoJobTracker: @unchecked Sendable {
 
   func setProgress(_ jobId: String, _ percent: Int) {
     lock.lock(); jobs[jobId]?.progressPercent = min(100, max(0, percent)); lock.unlock()
+  }
+
+  /// Director (WP2c): which chunk is rendering (`index` 0-based; == `count`
+  /// during the final audio mix + stitch; nil before the first chunk).
+  func setStage(_ jobId: String, index: Int?, count: Int) {
+    lock.lock()
+    jobs[jobId]?.stageIndex = index
+    jobs[jobId]?.stageCount = count
+    lock.unlock()
+  }
+
+  /// Director (WP2c): the failure string a director job reports —
+  /// `"chunk <k+1>/<n> (<stage>): <message>"` for a chunk failure and
+  /// `"chunk <n>/<n> (stitch): <message>"` for the final stitch. nil when the
+  /// job has no stage count or the error is not a director stage failure, so
+  /// every other job keeps `localizedDescription`.
+  static func directorFailureMessage(_ error: Error, stageCount: Int?) -> String? {
+    guard let n = stageCount, let director = error as? DirectorError else { return nil }
+    switch director {
+    case .chunkFailed(let chunk, let stage, let message):
+      return "chunk \(chunk + 1)/\(n) (\(stage)): \(message)"
+    case .stitchFailed(let message):
+      return "chunk \(n)/\(n) (stitch): \(message)"
+    default:
+      return nil
+    }
   }
 
   func markSucceeded(_ jobId: String, result: LTX2VideoResult) {
@@ -8903,15 +9528,21 @@ final class VideoJobTracker: @unchecked Sendable {
       return
     }
     lock.lock()
+    var message = error.localizedDescription
     if let job = jobs[jobId] {
+      // WP2c: director jobs name the failing chunk/stage ("chunk k/n (stage): …").
+      if job.mode == .director,
+         let formatted = Self.directorFailureMessage(error, stageCount: job.stageCount) {
+        message = formatted
+      }
       job.state = .failed
-      job.error = error.localizedDescription
+      job.error = message
       job.completedAt = Date()
     }
     lock.unlock()
     traceStore?.append(RenderTraceEvent(
       renderId: jobId, event: .terminal, taskKind: .videoRender,
-      payload: ["status": "failed", "error": error.localizedDescription]))
+      payload: ["status": "failed", "error": message]))
   }
 
   /// comfybox#322: terminal, but not a failure — `/v1/queue/interrupt` stopped

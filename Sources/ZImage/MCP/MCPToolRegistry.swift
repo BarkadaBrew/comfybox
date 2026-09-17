@@ -39,6 +39,8 @@ public enum MCPToolRegistry {
     getJob.annotated(.readOnly),
     composeMontage.annotated(.additive),
     renderStoryboard.annotated(.additive),
+    generateDirectorVideo.annotated(.additive),
+    validateDirectorTimeline.annotated(.readOnly),
     rerenderVideo.annotated(.additive),
     extendVideo.annotated(.additive),
     importWorkflow.annotated(.additive),
@@ -851,6 +853,46 @@ public enum MCPToolRegistry {
       "required": ["shots"] as [String],
     ] as [String: Any],
     routes: [RouteRef(method: "POST", path: "/v1/storyboard/render")]
+  )
+
+  static let generateDirectorVideo = MCPToolDefinition(
+    name: "generate_director_video",
+    description: "Render a Director timeline (LTX-2): one global prompt, image keyframes pinned to frames (multiples of 8; is_end_frame pins the last frame), timed prompt segments and optional imported audio clips. The engine validates, splits the timeline into single-pass chunks (<= 289 frames each, chained on the previous chunk's rendered last frame) and stitches them frame-accurately. Long-running: returns a job_id plus the chunk plan immediately — poll video_status (stage_index/stage_count name the chunk). Run validate_director_timeline first to see issues and the plan without rendering.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "timeline": [
+          "type": "object",
+          "description": "DirectorTimeline v1 (snake_case): {version?: 1, settings: {width, height (multiples of 32), length_frames (snapped up to 1+8k, >= 97), fps? (24), seed? (42), preset?, loras?: [{path, scale}], negative_prompt?, steps?, character?}, global_prompt, keyframes?: [{id, image_path | image_base64, frame, strength? (1.0), is_end_frame?}], prompt_segments?: [{id, start_frame, length_frames, prompt}], audio_clips?: [{id, audio_path, start_frame, length_frames, trim_start_frames?, gain?}], audio?: {mode: generated | imported}}.",
+        ] as [String: Any],
+        "output_path": [
+          "type": "string",
+          "description": "Output .mp4 name or absolute path under the engine's output directory (default director-<session>.mp4).",
+        ] as [String: Any],
+        "source": [
+          "type": "string",
+          "description": "Queue attribution (default api).",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["timeline"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/video/director")]
+  )
+
+  static let validateDirectorTimeline = MCPToolDefinition(
+    name: "validate_director_timeline",
+    description: "Validate a Director timeline without rendering: returns ok, snapped_length_frames, the chunk plan (chunk spans, per-chunk keyframes and beat schedule, boundary frames) and every issue (errors block rendering, warnings do not). No weights are loaded.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "timeline": [
+          "type": "object",
+          "description": "DirectorTimeline v1 (snake_case) — same shape as generate_director_video's timeline.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["timeline"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/video/director/validate")]
   )
 
   static let videoStatus = MCPToolDefinition(

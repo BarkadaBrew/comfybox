@@ -16,6 +16,9 @@ public enum VideoMode: String, Codable, Sendable {
   /// Storyboard: an ordered shot list executed as chained i2v renders +
   /// assembly (comfybox#237).
   case storyboard
+  /// Director timeline (docs/FDD-ltx-director-tab.md, WP2c): single-pass
+  /// chunks chained on the rendered last frame, stitched frame-accurately.
+  case director
 }
 
 // MARK: - VideoJobState
@@ -254,6 +257,14 @@ public struct VideoJobStatus: Codable, Sendable {
   /// Stable identity of the admission-time render recipe. Present on local
   /// LTX jobs from the 2026-09 composer contract onward, including HTTP 202.
   public let recipeHash: String?
+  /// Director (WP2c): the compiled chunk plan — on the 202 and every poll.
+  /// nil for every non-director job (omitted from JSON).
+  public let plan: DirectorPlan?
+  /// Director: 0-based chunk currently rendering; nil before the first chunk
+  /// starts; == `stageCount` during the final audio mix + stitch.
+  public let stageIndex: Int?
+  /// Director: number of chunks.
+  public let stageCount: Int?
 
   public init(
     jobId: String,
@@ -275,7 +286,10 @@ public struct VideoJobStatus: Codable, Sendable {
     interrupted: Bool? = nil,
     refineSkipped: String? = nil,
     generationRecord: VideoGenerationRecord? = nil,
-    recipeHash: String? = nil
+    recipeHash: String? = nil,
+    plan: DirectorPlan? = nil,
+    stageIndex: Int? = nil,
+    stageCount: Int? = nil
   ) {
     self.jobId = jobId
     self.status = status
@@ -297,5 +311,8 @@ public struct VideoJobStatus: Codable, Sendable {
     self.refineSkipped = refineSkipped
     self.generationRecord = generationRecord
     self.recipeHash = recipeHash
+    self.plan = plan
+    self.stageIndex = stageIndex
+    self.stageCount = stageCount
   }
 }
