@@ -1977,8 +1977,15 @@ public final class LTX2VideoGenerator {
                     // loudness raise with soft ceiling. The de-harsh dip targeted
                     // the BigVGAN path. LTX2_AUDIO_ENHANCE=0 disables it.
                     if ProcessInfo.processInfo.environment["LTX2_AUDIO_ENHANCE"] != "0" && av.externalVocoder == nil {
-                        clamped = LTX2AudioEnhance.process(clamped, sampleRate: audioSR)
-                        logger.info("LTX-2 audio: enhancement chain applied (hp50 + dip7.5k + loudnorm).")
+                        // Content-aware loudness: a prompt with no quoted
+                        // spoken line is an ambience bed, not programme audio
+                        // (Todd 2026-09-17 "way too much ambient bed noise").
+                        let audioContent: LTX2AudioEnhance.Content =
+                            guardedPrompt.quotedLinePresent ? .speech : .ambience
+                        clamped = LTX2AudioEnhance.process(
+                            clamped, sampleRate: audioSR, content: audioContent,
+                            bedTargetDB: typedConfig.audioBedTargetDb)
+                        logger.info("LTX-2 audio: enhancement chain applied (\(audioContent.rawValue): hp\(audioContent == .ambience ? 80 : 50) + dip7.5k\(audioContent == .ambience ? " + dip150" : "") + loudnorm).")
                     }
                     eval(clamped)
                     audioTrack = LTX2PostProcess.AudioTrack(samples: clamped, sampleRate: audioSR)

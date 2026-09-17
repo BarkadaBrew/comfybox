@@ -7,9 +7,22 @@
 //
 //   1. High-pass biquad (50Hz, Q .707) — rumble/DC guard.
 //   2. Peaking biquad (7.5kHz, Q 1.2, -2.5dB) — softens the BWE grain band.
-//   3. RMS loudness raise toward -18dBFS (~-16 LUFS for this content) with
-//      a bounded gain and a tanh soft-knee ceiling at 0.85 FS — loud input
-//      passes through nearly unity, quiet input comes up, nothing clips.
+//   3. RMS loudness toward a target with a bounded gain and a tanh soft-knee
+//      ceiling at 0.85 FS — loud input passes through nearly unity, quiet
+//      input comes up, nothing clips.
+//
+// CONTENT-AWARE TARGET (Todd 2026-09-17, "way too much ambient bed noise …
+// sounds like she is in a laundromat"). A clip with no spoken line is a BED,
+// not a programme: the old -18 dBFS speech target raised faint room tone by
+// up to +20 dB, and the 50 Hz high-pass left the model's low hum underneath
+// it (measured on the ladder: bed at -21 dBFS, 9 dB more energy under 250 Hz
+// than in the midrange, and only ~3 dB between its loudest and quietest
+// moments). Prompt wording barely moves it: naming a clink and a spoon tap
+// bought 2.5 dB and produced no transients at all. So a bed gets
+//   * its own target (-32 dBFS default, `audio_bed_target_db`),
+//   * a hard no-boost rule (gain <= 1: a bed is never raised, only lowered),
+//   * an 80 Hz high-pass instead of 50 Hz, and a -4 dB dip at 150 Hz.
+// Speech clips are untouched: same 50 Hz, same -18 dBFS, same gain range.
 //
 // Deliberately NO spectral denoise in v1 (the biquads + loudness carry most
 // of the audible win; a gate can misfire on breath/ambience). Pure function,
@@ -56,6 +69,12 @@ public enum LTX2AudioEnhance {
     }
   }
 
+  /// What the track carries. `speech` is the historical behaviour.
+  public enum Content: String, Sendable {
+    case speech
+    case ambience
+  }
+
   /// `(channels, N)` float in [-1, 1] -> mastered, same shape/dtype domain.
   /// Resolve the loudness target: explicit param > LTX2_AUDIO_TARGET_DB env >
   /// -18 dBFS default (#1517 — render-time knob, no rebuild to change level).
@@ -66,13 +85,37 @@ public enum LTX2AudioEnhance {
     return -18
   }
 
-  public static func process(_ samples: MLXArray, sampleRate: Int, targetDB: Float? = nil) -> MLXArray {
+  /// Bed target: explicit param > LTX2_AUDIO_BED_TARGET_DB env > -32 dBFS.
+  static func resolveBedTargetDB(_ explicit: Float?) -> Float {
+    if let t = explicit { return min(max(t, -60), -12) }
+    if let raw = ProcessInfo.processInfo.environment["LTX2_AUDIO_BED_TARGET_DB"],
+       let t = Float(raw) { return min(max(t, -60), -12) }
+    return -32
+  }
+
+  /// A prompt carries a spoken line when it quotes one (the same convention
+  /// the daemon's dialogue anchor uses): straight or curly quotes around at
+  /// least two words. No quoted line => the track is a bed.
+  public static func contentOfPrompt(_ prompt: String) -> Content {
+    let pattern = "[\"\u{201C}][^\"\u{201D}]*\\s+[^\"\u{201D}]*[\"\u{201D}]"
+    let range = NSRange(prompt.startIndex..., in: prompt)
+    let re = try? NSRegularExpression(pattern: pattern)
+    return re?.firstMatch(in: prompt, range: range) != nil ? .speech : .ambience
+  }
+
+  public static func process(
+    _ samples: MLXArray, sampleRate: Int, targetDB: Float? = nil,
+    content: Content = .speech, bedTargetDB: Float? = nil
+  ) -> MLXArray {
     let channels = samples.dim(0)
     let n = samples.dim(1)
     guard n > 0 else { return samples }
     let rate = Float(sampleRate)
-    let hp = Biquad.highPass(hz: 50, q: 0.707, rate: rate)
+    let isBed = content == .ambience
+    let hp = Biquad.highPass(hz: isBed ? 80 : 50, q: 0.707, rate: rate)
     let dip = Biquad.peaking(hz: 7500, q: 1.2, gainDB: -2.5, rate: rate)
+    // Bed only: the model's low room hum sits right here.
+    let hum = isBed ? Biquad.peaking(hz: 150, q: 0.9, gainDB: -4, rate: rate) : nil
 
     var outChannels: [[Float]] = []
     outChannels.reserveCapacity(channels)
@@ -80,6 +123,7 @@ public enum LTX2AudioEnhance {
       var ch = samples[c].asType(.float32).asArray(Float.self)
       ch = hp.run(ch)
       ch = dip.run(ch)
+      if let hum { ch = hum.run(ch) }
       outChannels.append(ch)
     }
 
@@ -87,7 +131,9 @@ public enum LTX2AudioEnhance {
     var sumSq: Float = 0
     for ch in outChannels { for v in ch { sumSq += v * v } }
     let rms = sqrt(sumSq / Float(channels * n))
-    let targetRMS: Float = pow(10, resolveTargetDB(targetDB) / 20.0)
+    let targetRMS: Float = isBed
+      ? pow(10, resolveBedTargetDB(bedTargetDB) / 20.0)
+      : pow(10, resolveTargetDB(targetDB) / 20.0)
     // BIDIRECTIONAL normalization (#1517, 2026-08-07). The original floor of
     // 1.0 meant this stage could only BOOST: quiet room tone took up to +20dB
     // toward a speech target and ambience arrived at dialogue level ("ambient
@@ -95,7 +141,10 @@ public enum LTX2AudioEnhance {
     // maxed, so the level has to be governed here). Loud content now comes
     // DOWN toward target too; the 0.25 floor stops a hot clip from being
     // crushed, and the soft-knee limiter below still guards the ceiling.
-    let gain = min(max(targetRMS / max(rms, 1e-6), 0.25), 10.0)
+    // A bed is never RAISED — only brought down toward its target.
+    let gain = isBed
+      ? min(max(targetRMS / max(rms, 1e-6), 0.05), 1.0)
+      : min(max(targetRMS / max(rms, 1e-6), 0.25), 10.0)
 
     // Limiter with a REAL knee (2026-08-05 fix): the first version ran tanh
     // over the whole signal — ~10% compression at half-scale = audible

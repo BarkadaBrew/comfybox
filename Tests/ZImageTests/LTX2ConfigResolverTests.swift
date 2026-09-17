@@ -140,7 +140,7 @@ final class LTX2ConfigResolverTests: XCTestCase {
       "two_stage", "cond_fps", "img_compression", "sampler", "stg_scale", "stg_head_boost",
       "face_anchor_strength", "ic_control", "nag_scale", "nag_alpha", "nag_tau",
       "plain_decode_max_vol", "refine_max_vol", "decode_mode", "upsampler_path",
-      "video_bits_per_px", "beat_window_margin",
+      "video_bits_per_px", "beat_window_margin", "audio_bed_target_db",
     ] {
       XCTAssertTrue(names.contains(expected), "registry missing \(expected)")
     }
