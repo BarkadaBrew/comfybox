@@ -508,9 +508,8 @@ public final class LibraryStore: @unchecked Sendable {
   /// Insert or replace. `updatedAt` is stamped here; `createdAt` and
   /// `useCount` are carried over from an existing item so a client cannot
   /// reset them by omitting them.
-  @discardableResult
-  public func upsert(_ incoming: LibraryEntry, now: Date = Date()) throws -> LibraryEntry {
-    var item = incoming
+  /// Shared by the single and batch writes.
+  static func validate(_ item: inout LibraryEntry) throws {
     let trimmedId = item.id.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmedId.isEmpty else { throw LibraryError.invalid("'id' is required") }
     item.id = trimmedId
@@ -522,13 +521,19 @@ public final class LibraryStore: @unchecked Sendable {
     }
     if item.kind == .template {
       let declared = Set((item.slots ?? []).map(\.id))
-      let used = Self.slotMarkers(in: item.value)
+      let used = slotMarkers(in: item.value)
       let undeclared = used.subtracting(declared).sorted()
       guard undeclared.isEmpty else {
         throw LibraryError.invalid(
           "template body uses undeclared slot(s): \(undeclared.joined(separator: ", "))")
       }
     }
+  }
+
+  @discardableResult
+  public func upsert(_ incoming: LibraryEntry, now: Date = Date()) throws -> LibraryEntry {
+    var item = incoming
+    try Self.validate(&item)
     lock.lock(); defer { lock.unlock() }
     if let existing = itemsById[item.id] {
       item.createdAt = existing.createdAt
@@ -539,6 +544,67 @@ public final class LibraryStore: @unchecked Sendable {
     itemsById[item.id] = item
     try persistItems()
     return item
+  }
+
+  /// Insert or replace MANY items with ONE write. A pack import is 1,400
+  /// items; persisting after each one rewrites the whole file every time
+  /// (quadratic, and it wedged the first real import of the reference pack).
+  /// Validation and the createdAt/useCount carry-over are identical to
+  /// ``upsert(_:now:)``; an item that fails validation is returned in
+  /// `rejected` rather than aborting the batch.
+  @discardableResult
+  public func upsert(
+    contentsOf incoming: [LibraryEntry], now: Date = Date()
+  ) throws -> (saved: [LibraryEntry], rejected: [(LibraryEntry, Error)]) {
+    var saved: [LibraryEntry] = []
+    var rejected: [(LibraryEntry, Error)] = []
+    lock.lock()
+    for var item in incoming {
+      do {
+        try Self.validate(&item)
+      } catch {
+        rejected.append((item, error))
+        continue
+      }
+      if let existing = itemsById[item.id] {
+        item.createdAt = existing.createdAt
+        item.useCount = max(item.useCount, existing.useCount)
+        item.lastUsedAt = item.lastUsedAt ?? existing.lastUsedAt
+      }
+      item.updatedAt = now
+      itemsById[item.id] = item
+      saved.append(item)
+    }
+    do {
+      try persistItems()
+    } catch {
+      lock.unlock()
+      throw error
+    }
+    lock.unlock()
+    return (saved, rejected)
+  }
+
+  /// Same for collections: one write for the whole set.
+  @discardableResult
+  public func upsertCollections(_ incoming: [LibraryCollection]) throws -> Int {
+    lock.lock()
+    var count = 0
+    for collection in incoming {
+      guard !collection.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            !collection.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            collection.parentId != collection.id else { continue }
+      collectionsById[collection.id] = collection
+      count += 1
+    }
+    do {
+      try persistCollections()
+    } catch {
+      lock.unlock()
+      throw error
+    }
+    lock.unlock()
+    return count
   }
 
   @discardableResult

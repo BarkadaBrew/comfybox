@@ -75,6 +75,39 @@ final class LibraryStoreTests: XCTestCase {
     XCTAssertEqual(raw, "{ not json")
   }
 
+  func testBatchUpsertWritesOnceAndReportsRejects() throws {
+    let s = store()
+    let good = (0..<50).map { wardrobe("w\($0)", "item \($0)") }
+    var bad = wardrobe("bad", "nameless")
+    bad.name = "  "
+    let (saved, rejected) = try s.upsert(contentsOf: good + [bad])
+    XCTAssertEqual(saved.count, 50)
+    XCTAssertEqual(rejected.count, 1, "one bad item is returned, not thrown — the batch survives")
+    XCTAssertEqual(rejected.first?.0.id, "bad")
+    XCTAssertEqual(store().allItems().count, 50, "persisted in one write")
+  }
+
+  func testBatchUpsertKeepsExistingCreatedAtAndUseCount() throws {
+    let s = store()
+    let first = try s.upsert(wardrobe("w1", "grey tee"))
+    try s.markUsed(id: "w1")
+    let (saved, _) = try s.upsert(contentsOf: [wardrobe("w1", "grey tee v2")])
+    XCTAssertEqual(saved.first?.createdAt, first.createdAt)
+    XCTAssertEqual(saved.first?.useCount, 1)
+  }
+
+  func testBatchCollectionUpsertSkipsInvalidOnesAndWritesOnce() throws {
+    let s = store()
+    let count = try s.upsertCollections([
+      LibraryCollection(id: "a", name: "A"),
+      LibraryCollection(id: "", name: "no id"),
+      LibraryCollection(id: "b", name: "B", parentId: "a"),
+      LibraryCollection(id: "c", name: "C", parentId: "c"),
+    ])
+    XCTAssertEqual(count, 2, "the blank id and the self-parent are skipped")
+    XCTAssertEqual(store().allCollections().map(\.id), ["a", "b"])
+  }
+
   // MARK: validation
 
   func testValidation() throws {
