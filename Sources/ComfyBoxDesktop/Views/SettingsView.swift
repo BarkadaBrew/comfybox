@@ -91,6 +91,10 @@ struct DesktopSettings: Codable {
     var serverHealthEndpoint: String?
     /// Directories scanned for .cbarchive bundles. nil = [~/.comfybox/archives].
     var archiveRoots: [String]?
+    /// Remote galleries assets can be MOVED to (a folder on a portable drive,
+    /// an Immich server). nil = none configured. Credentials are not stored
+    /// here; see RemoteGalleryConfig.keychainAccount (FDD-remote-galleries).
+    var remoteGalleries: [RemoteGalleryConfig]?
 
     /// The local Glimmer host (Todd 2026-09-16: "dashboard is monitoring
     /// lmstudio. we are no longer using and want to monitor mlx serve
@@ -242,6 +246,8 @@ struct SettingsView: View {
         self.engine = engine
         self._settings = State(initialValue: DesktopSettings.load())
     }
+
+    @State private var showingImmichSheet = false
 
     var body: some View {
         TabView {
@@ -520,6 +526,8 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            remoteGalleriesSection
+
             Section {
                 HStack {
                     Spacer()
@@ -533,6 +541,79 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    // MARK: - Remote galleries
+    //
+    // Todd 2026-09-17: "the ability to configure remote gallery locations
+    // where ever they might live". Sending MOVES an asset, so the list is
+    // deliberately plain: what it is, where it is, and a way to remove the
+    // entry (which never touches the remote's contents).
+
+    private var remoteGalleriesSection: some View {
+        Section("Remote Galleries") {
+            let remotes = settings.remoteGalleries ?? []
+            if remotes.isEmpty {
+                Text("No remote galleries. Add a folder on a drive, or an Immich server.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(remotes) { remote in
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(remote.name)
+                        Text(RemoteGallerySettings.summary(for: remote))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Remove") { removeRemote(remote) }
+                        .buttonStyle(.borderless)
+                }
+            }
+            HStack {
+                Button("Add Folder…") { addFolderRemote() }
+                Button("Add Immich…") { showingImmichSheet = true }
+                Spacer()
+            }
+            Text("Sending an asset to a remote MOVES it: the remote becomes the only copy.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .sheet(isPresented: $showingImmichSheet) {
+            ImmichRemoteSheet { remote, apiKey in
+                addRemote(remote, apiKey: apiKey)
+            }
+        }
+    }
+
+    private func addFolderRemote() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose the drive or folder that will hold the gallery."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let remote = RemoteGalleryConfig.folder(
+            name: url.lastPathComponent,
+            rootPath: url.path,
+            volumeUUID: RemoteGallerySettings.volumeUUID(forPath: url.path))
+        addRemote(remote, apiKey: nil)
+    }
+
+    private func addRemote(_ remote: RemoteGalleryConfig, apiKey: String?) {
+        let updated = RemoteGallerySettings.appending(remote, to: settings.remoteGalleries ?? [])
+        guard updated.count != (settings.remoteGalleries ?? []).count else { return }
+        if let apiKey, !apiKey.isEmpty { Keychain.set(apiKey, remote.keychainAccount) }
+        settings.remoteGalleries = updated
+        hasUnsavedChanges = true
+    }
+
+    private func removeRemote(_ remote: RemoteGalleryConfig) {
+        Keychain.delete(remote.keychainAccount)
+        settings.remoteGalleries = RemoteGallerySettings.removing(id: remote.id, from: settings.remoteGalleries ?? [])
+        hasUnsavedChanges = true
     }
 
     // MARK: - Motion (LTX-2 Video) Tab
