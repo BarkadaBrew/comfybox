@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- mlx-serve: the Mac's LLM + TTS server (Glimmer for Bree/Kira, Kokoro/Qwen3-TTS voices).
+         Source of truth: comfybox ops/launchd/. Installed by scripts/deploy-mlx-serve.sh.
+         Decisions: docs/FDD-mlx-serve-tuning.md (D1 no idle-evict — the daemons' keep-warm
+         probes are gone with it; D3 prefix cache 6 GB RAM + 20 GB SSD; metrics on; resident
+         slots 4 = Glimmer + drafter, two voice packs, one spare). -->
+    <key>Label</key>
+    <string>com.barkadabrew.mlx-serve</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/toddwalderman/mlx-serve/current/mlx-serve</string>
+        <string>serve</string>
+        <string>--model</string>
+        <string>/Users/toddwalderman/LocalModels/Muse-Glimmer-30B-heretic-MLX-Q6</string>
+        <string>--model-dir</string>
+        <string>/Users/toddwalderman/.mlx-serve/models</string>
+        <string>--max-resident-models</string>
+        <string>4</string>
+        <string>--prefix-cache-mem</string>
+        <string>6GB</string>
+        <string>--prefix-cache-disk</string>
+        <string>20GB</string>
+        <string>--metrics</string>
+        <string>--port</string>
+        <string>11234</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/toddwalderman/Library/Logs/mlx-serve.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/toddwalderman/Library/Logs/mlx-serve.err.log</string>
+</dict>
+</plist>
