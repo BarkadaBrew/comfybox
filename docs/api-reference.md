@@ -79,6 +79,11 @@ or carry a reasoned exemption (§3.5 assertion 3).
 | GET | `/v1/queue/admission` | get_admission_mode |  |
 | POST | `/v1/queue/admission` | set_admission_mode |  |
 | POST | `/v1/queue/clear` |  | The clear_queue tool targets the ComfyUI-bridge queue path (POST /queue {"clear": true}, executeClearQueue) -- a pre-parity contract the old api-reference documented; the native /v1/queue/clear route currently has no agent caller. Declared reality (G1); re-point the tool in a behavior phase. |
+| GET | `/v1/queue/inference-slot` |  |  |
+| POST | `/v1/queue/inference-slot` |  | Daemon-internal GPU slot protocol (FDD-glimmer-gpu-slot): Bree/Kira acquire a top-priority slot around each Glimmer call. Not an operator or agent action. |
+| DELETE | `/v1/queue/inference-slot/{id}` |  | Daemon-internal GPU slot protocol (FDD-glimmer-gpu-slot): releases a slot when the Glimmer call ends. Not an operator or agent action. |
+| GET | `/v1/queue/inference-slot/{id}` |  |  |
+| POST | `/v1/queue/inference-slot/{id}/renew` |  | Daemon-internal GPU slot protocol (FDD-glimmer-gpu-slot): lease heartbeat for a long Glimmer call. Not an operator or agent action. |
 | POST | `/v1/queue/interrupt` | interrupt_render |  |
 | GET | `/v1/queue/lifecycle` |  |  |
 | POST | `/v1/queue/pause` | pause_queue |  |

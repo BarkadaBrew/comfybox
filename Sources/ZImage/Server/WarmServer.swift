@@ -1886,6 +1886,17 @@ public final class WarmServer {
 
     // MARK: - Queue management
 
+    // FDD-glimmer-gpu-slot: same handler as the sync control plane (used only
+    // when COMFYBOX_CONTROL_PLANE_SYNC=0). Before the generic /v1/queue/{id} arms.
+    case ("POST", "/v1/queue/inference-slot"), ("GET", "/v1/queue/inference-slot"):
+      return .json(inferenceSlotHTTPResponse(request))
+    case ("POST", _) where request.path.hasPrefix("/v1/queue/inference-slot/") && request.path.hasSuffix("/renew"):
+      return .json(inferenceSlotHTTPResponse(request))
+    case ("GET", _) where request.path.hasPrefix("/v1/queue/inference-slot/"):
+      return .json(inferenceSlotHTTPResponse(request))
+    case ("DELETE", _) where request.path.hasPrefix("/v1/queue/inference-slot/"):
+      return .json(inferenceSlotHTTPResponse(request))
+
     case ("GET", "/v1/queue"):
       return await queueListResponse()
 
@@ -4317,6 +4328,7 @@ public final class WarmServer {
       "is_rendering": snap.isRendering,
       "is_paused": snap.isPaused,
       "admission_mode": admission.snapshot().mode.rawValue,
+      "inference_slots": inferenceSlots.activeSlots().count,
       "max_pending": snap.maxPending,
       "render_count": snap.renderCount,
       "failed_count": snap.failedRenderCount,
@@ -4374,6 +4386,16 @@ public final class WarmServer {
     switch (request.method, request.path) {
     case ("GET", "/health"):       return healthRouteResponse()
     case ("GET", "/v1/queue"):     return syncQueueResponse()
+    // FDD-glimmer-gpu-slot: top-priority inference slots. Placed before the
+    // generic `/v1/queue/{id}` arms so a slot id is never read as a job id.
+    case ("POST", "/v1/queue/inference-slot"), ("GET", "/v1/queue/inference-slot"):
+      return inferenceSlotHTTPResponse(request)
+    case ("POST", _) where request.path.hasPrefix("/v1/queue/inference-slot/") && request.path.hasSuffix("/renew"):
+      return inferenceSlotHTTPResponse(request)
+    case ("GET", _) where request.path.hasPrefix("/v1/queue/inference-slot/"):
+      return inferenceSlotHTTPResponse(request)
+    case ("DELETE", _) where request.path.hasPrefix("/v1/queue/inference-slot/"):
+      return inferenceSlotHTTPResponse(request)
     case ("GET", "/v1/queue/lifecycle"): return syncQueueLifecycleResponse(request: request)
     case ("GET", "/v1/models"):    return syncModelsResponse()
     case ("GET", "/v1/model/family"): return syncModelFamilyResponse(request: request)
@@ -4491,6 +4513,59 @@ public final class WarmServer {
     } catch {
       return .error(.error(status: 400, message: "Invalid merge-patch: \(error.localizedDescription)"))
     }
+  }
+
+  /// FDD-glimmer-gpu-slot: the lock-based view the slot routes read, and the
+  /// closure that asks an in-flight LTX-2 video to checkpoint for the slots
+  /// (the #1479 signal, with an inference hold instead of an image preemptor).
+  private func inferenceSlotContext() -> InferenceSlotRouteContext {
+    let live = liveHealth
+    let video = videoHolder
+    let hold = inferenceHold
+    let signal = ltx2PreemptionSignal
+    let inFlight = preemptionInFlight
+    let telemetry = ltx2Telemetry
+    let log = logger
+    return InferenceSlotRouteContext(
+      table: inferenceSlots, hold: hold,
+      gpuBusy: { live.read().0.isRendering || video.isRendering() },
+      videoRendering: { video.isRendering() },
+      progress: {
+        let (snap, pct) = live.read()
+        return (pct, snap.activeRenderStartedAt)
+      },
+      raiseHold: {
+        // One preemption at a time: an image job's #1479 episode already owns it.
+        guard inFlight.trySet() else { return }
+        guard hold.request() else { inFlight.clear(); return }
+        guard video.isRendering() else {
+          _ = hold.cancelIfRequested()
+          inFlight.clear()
+          return
+        }
+        log.info("inference slot: asking the in-flight LTX-2 video to checkpoint (top priority)")
+        signal.raise()
+        // Same fallback window as #1479: if the render never yields (deep in an
+        // uninterruptible phase, or it simply finishes first), withdraw the
+        // request — the slots then wait for the render to end.
+        let windowSec = telemetry.view().meanStepSec.map { $0 * 2 + 30 } ?? 120
+        DispatchQueue.global().asyncAfter(deadline: .now() + windowSec) {
+          if hold.cancelIfRequested() {
+            signal.clear()
+            inFlight.clear()
+            log.warning("inference slot: video did not yield within \(Int(windowSec))s — slots wait for the render to finish")
+          }
+        }
+      })
+  }
+
+  private func inferenceSlotHTTPResponse(_ request: HTTPRequest) -> HTTPResponse {
+    let result = InferenceSlotRoute.handle(
+      method: request.method, path: request.path, body: request.body, ctx: inferenceSlotContext())
+    guard let data = try? JSONSerialization.data(withJSONObject: result.payload) else {
+      return .error(status: 500, message: "Failed to serialize inference slot response")
+    }
+    return .rawJSON(status: result.status, data: data)
   }
 
   private func syncQueueResponse() -> HTTPResponse {
@@ -7946,7 +8021,8 @@ public final class WarmServer {
     videoAvailable: Bool,
     activeVideoJobs: Int,
     localVideoReadiness: LocalVideoReadiness = .unchecked,
-    admission: AdmissionSnapshot? = nil
+    admission: AdmissionSnapshot? = nil,
+    inferenceSlots: Int = 0
   ) -> Data? {
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -7961,6 +8037,8 @@ public final class WarmServer {
     // "Local mode" visibility for every caller (daemons, MCP server_health, Desktop).
     healthJSON["admission_mode"] = admission?.mode.rawValue ?? AdmissionMode.open.rawValue
     healthJSON["admission_allow_sources"] = admission?.allowSources ?? []
+    // FDD-glimmer-gpu-slot: Glimmer inference slots currently held.
+    healthJSON["inference_slots"] = inferenceSlots
     healthJSON["video"] = [
       "available": videoAvailable,
       "backend": videoAvailable ? "replicate" : "none",
@@ -8002,7 +8080,8 @@ public final class WarmServer {
       health, videoAvailable: replicateVideoProxy != nil,
       activeVideoJobs: videoJobTracker.activeJobCount + (replicateVideoProxy?.activeJobCount ?? 0),
       localVideoReadiness: localVideoReadinessMonitor.current(),
-      admission: admission.snapshot()) {
+      admission: admission.snapshot(),
+      inferenceSlots: inferenceSlots.activeSlots().count) {
       return .rawJSON(status: 200, data: data)
     }
     return .json(status: 200, payload: health)

@@ -238,3 +238,123 @@ public enum InferenceSlotGrant {
     return elapsed * Double(100 - pct) / Double(pct)
   }
 }
+
+// MARK: - Route
+
+/// Everything the `/v1/queue/inference-slot` routes read or do, injected so the
+/// protocol is unit-testable without a live render. The server supplies
+/// lock-based readers (never the coordinator actor) and the hold-raising
+/// closure that talks to the #1479 preemption machinery.
+public struct InferenceSlotRouteContext: Sendable {
+  public let table: InferenceSlotTable
+  public let hold: InferenceHold
+  /// Anything on the GPU right now (image render, video render, model op).
+  public let gpuBusy: @Sendable () -> Bool
+  /// An LTX-2 video render specifically — the only preemptible kind.
+  public let videoRendering: @Sendable () -> Bool
+  /// Progress of whatever is on the GPU, for `eta_sec`.
+  public let progress: @Sendable () -> (Int?, Date?)
+  /// Ask the in-flight video to checkpoint for the slots. Called at most once
+  /// per pending request (the route checks `hold` first).
+  public let raiseHold: @Sendable () -> Void
+  public let now: @Sendable () -> Date
+
+  public init(
+    table: InferenceSlotTable, hold: InferenceHold,
+    gpuBusy: @escaping @Sendable () -> Bool, videoRendering: @escaping @Sendable () -> Bool,
+    progress: @escaping @Sendable () -> (Int?, Date?), raiseHold: @escaping @Sendable () -> Void,
+    now: @escaping @Sendable () -> Date = { Date() }
+  ) {
+    self.table = table
+    self.hold = hold
+    self.gpuBusy = gpuBusy
+    self.videoRendering = videoRendering
+    self.progress = progress
+    self.raiseHold = raiseHold
+    self.now = now
+  }
+}
+
+public enum InferenceSlotRoute {
+  static let base = "/v1/queue/inference-slot"
+
+  public static func matches(method: String, path: String) -> Bool {
+    if path == base { return method == "POST" || method == "GET" }
+    guard path.hasPrefix(base + "/") else { return false }
+    let rest = path.dropFirst(base.count + 1)
+    guard !rest.isEmpty else { return false }
+    if rest.hasSuffix("/renew") { return method == "POST" && rest.split(separator: "/").count == 2 }
+    return (method == "GET" || method == "DELETE") && !rest.contains("/")
+  }
+
+  public static func handle(method: String, path: String, body: Data, ctx: InferenceSlotRouteContext) -> (status: Int, payload: [String: Any]) {
+    if path == base {
+      return method == "POST" ? acquire(body: body, ctx: ctx) : list(ctx: ctx)
+    }
+    let rest = String(path.dropFirst(base.count + 1))
+    if method == "POST", rest.hasSuffix("/renew") {
+      let id = String(rest.dropLast("/renew".count))
+      guard let slot = ctx.table.renew(id: id, ttl: ttl(from: body)) else { return notFound(id) }
+      return (200, status(of: slot, ctx: ctx))
+    }
+    switch method {
+    case "GET":
+      guard let slot = ctx.table.get(id: rest) else { return notFound(rest) }
+      return (200, status(of: slot, ctx: ctx))
+    case "DELETE":
+      let released = ctx.table.release(id: rest)
+      return (200, ["released": released, "active_slots": ctx.table.activeSlots().count])
+    default:
+      return (405, ["error": "method not allowed"])
+    }
+  }
+
+  // MARK: Private
+
+  private static func acquire(body: Data, ctx: InferenceSlotRouteContext) -> (status: Int, payload: [String: Any]) {
+    let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+    guard let holder = (obj?["holder"] as? String)?.trimmingCharacters(in: .whitespaces), !holder.isEmpty else {
+      return (400, ["error": "'holder' is required (who is taking the slot, e.g. \"kira:chat\")"])
+    }
+    let slot = ctx.table.acquire(holder: holder, ttl: ttl(from: body))
+    // Top priority over video: ask the in-flight render to checkpoint, once.
+    if ctx.videoRendering(), !ctx.hold.isParked, !ctx.hold.isRequested {
+      ctx.raiseHold()
+    }
+    return (200, status(of: slot, ctx: ctx))
+  }
+
+  private static func list(ctx: InferenceSlotRouteContext) -> (status: Int, payload: [String: Any]) {
+    let slots = ctx.table.activeSlots()
+    return (200, ["active_slots": slots.count, "slots": slots.map { status(of: $0, ctx: ctx) }])
+  }
+
+  private static func status(of slot: InferenceSlot, ctx: InferenceSlotRouteContext) -> [String: Any] {
+    let state = InferenceSlotGrant.state(
+      isParked: ctx.hold.isParked, isRequested: ctx.hold.isRequested, gpuBusy: ctx.gpuBusy())
+    var out: [String: Any] = [
+      "slot_id": slot.id,
+      "holder": slot.holder,
+      "state": state.rawValue,
+      "expires_at": ISO8601DateFormatter().string(from: slot.expiresAt),
+      "active_slots": ctx.table.activeSlots().count,
+    ]
+    if state == .waiting {
+      let (pct, started) = ctx.progress()
+      if let eta = InferenceSlotGrant.etaSec(progressPct: pct, renderStartedAt: started, now: ctx.now()) {
+        out["eta_sec"] = eta
+      }
+    }
+    return out
+  }
+
+  private static func ttl(from body: Data) -> TimeInterval? {
+    let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+    if let n = obj?["ttl_sec"] as? NSNumber { return n.doubleValue }
+    return nil
+  }
+
+  private static func notFound(_ id: String) -> (status: Int, payload: [String: Any]) {
+    (404, ["error": "unknown or expired inference slot '\(id)'"])
+  }
+}
