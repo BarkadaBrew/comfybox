@@ -58,9 +58,12 @@ struct GalleryMaintenanceViewFormattingTests {
 
     @Test("missing assets line uses singular/plural wording")
     func missingAssetsLine() {
-        #expect(GalleryMaintenanceView.missingAssetsLine(count: 1) == "1 asset whose file is gone")
-        #expect(GalleryMaintenanceView.missingAssetsLine(count: 12) == "12 assets whose file is gone")
-        #expect(GalleryMaintenanceView.missingAssetsLine(count: 0) == "0 assets whose file is gone")
+        #expect(GalleryMaintenanceView.missingAssetsLine(orphans: 1, unattached: 0) == "1 asset whose file is gone")
+        #expect(GalleryMaintenanceView.missingAssetsLine(orphans: 12, unattached: 0) == "12 assets whose file is gone")
+        // Nothing deleted, but rows are waiting on an unplugged drive: the
+        // headline must not claim deletions (FDD-remote-galleries §3.6).
+        #expect(GalleryMaintenanceView.missingAssetsLine(orphans: 0, unattached: 4) == "No deleted files")
+        #expect(GalleryMaintenanceView.missingAssetsLine(orphans: 0, unattached: 0) == "No missing files")
     }
 
     @Test("missing removed line reports the count")

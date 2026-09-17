@@ -29,6 +29,39 @@ public struct GalleryMaintenance {
         self.ingestor = ingestor
     }
 
+    // MARK: - Missing files (FDD-remote-galleries §3.6)
+    //
+    // The Gallery Health sheet used to preview missing rows in-view and then
+    // remove them through `AssetIngestor.pruneOrphans()` — the UNATTENDED
+    // sweep, which refuses above 5% of the library. On a catalog where half
+    // the files are gone (Todd 2026-09-17: 188 of 411) the one screen built
+    // to fix it could not. These pass the reviewed path through instead, and
+    // report what is merely unplugged separately.
+
+    /// What is missing, split into genuine deletions and unattached volumes.
+    public func scanMissingFiles() async throws -> DAMStore.MissingFileReport {
+        try await store.scanMissingFiles()
+    }
+
+    /// Purge reviewed rows and drop their cached thumbnails. Returns the count
+    /// actually removed; rows whose file exists, or that are merely
+    /// unattached, are skipped however they were selected.
+    @discardableResult
+    public func purgeMissingFiles(ids: [String]) async throws -> Int {
+        let purged = try await store.purgeMissing(ids: ids)
+        guard purged > 0 else { return 0 }
+        for id in ids {
+            try? FileManager.default.removeItem(atPath: ingestor.thumbnailPath(for: id))
+        }
+        return purged
+    }
+
+    /// Drop `asset_locations` rows whose asset no longer exists.
+    @discardableResult
+    public func vacuumStaleLocations() async throws -> Int {
+        try await store.vacuumStaleLocations()
+    }
+
     /// Scan the thumbnail directory (non-recursive) for `.jpg` files whose
     /// derived asset id has no matching row in DAMStore.
     public func scanOrphanThumbnails() async throws -> ThumbnailOrphanReport {

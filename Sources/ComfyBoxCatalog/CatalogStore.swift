@@ -1033,6 +1033,141 @@ public actor CatalogStore {
     /// whether the id exists.
     ///
     /// No default on `scope`, for the reason given on `edges(for:scope:)`.
+    // MARK: - Remote galleries: relocation and the transfer journal
+    //
+    // FDD-remote-galleries §3.3. A move is NOT a delete: `deleteAsset` takes
+    // the FTS row, collections, folder mappings and lineage edges with it, and
+    // a moved asset keeps all of them. `relocateAsset` writes where the bytes
+    // are and nothing else.
+
+    /// Where an asset's bytes are, as recorded on the row itself.
+    public struct StorageState: Sendable, Equatable {
+        public let storageState: String?   // "local" | "remote" | "missing"
+        public let primaryHost: String?    // "mac" | "remote:<id>"
+    }
+
+    /// A transfer in flight. Finished and failed transfers are removed.
+    public enum TransferState: String, Sendable {
+        case copying, verified, relocated, failed
+    }
+
+    public struct PendingTransfer: Sendable, Equatable {
+        public let assetID: String
+        public let remoteID: String
+        public let state: TransferState
+        public let remotePath: String
+        public let sha256: String?
+    }
+
+    /// Point an asset at a new home. `host` is "mac" for a local file or
+    /// "remote:<id>" for a remote gallery; `path` is absolute for the Mac and
+    /// relative to the gallery root for a remote. Idempotent: the asset ends
+    /// with exactly one location row, whatever it had before.
+    public func relocateAsset(id: String, host: String, path: String) throws {
+        let isLocal = (host == "mac")
+        try CatalogSchema.exec(db, "SAVEPOINT catalog_relocate")
+        do {
+            // Drop only the copy being moved and any stale row for the target
+            // host. Other hosts' copies — Kira's and Bree's server trees — are
+            // still real and are left alone (Codex review of the
+            // implementation, finding 6).
+            try execBind("DELETE FROM asset_locations WHERE asset_id = ? AND (host = ? OR host = ?)",
+                         [id, isLocal ? host : "mac", host])
+            try execBind("INSERT OR REPLACE INTO asset_locations (asset_id, host, path, mtime) VALUES (?,?,?,?)",
+                         [id, host, path, Date().timeIntervalSince1970])
+            try execBind("UPDATE assets SET storage_state = ?, primary_host = ? WHERE id = ?",
+                         [isLocal ? "local" : "remote", host, id])
+            try CatalogSchema.exec(db, "RELEASE catalog_relocate")
+        } catch {
+            _ = try? CatalogSchema.exec(db, "ROLLBACK TO catalog_relocate")
+            _ = try? CatalogSchema.exec(db, "RELEASE catalog_relocate")
+            throw error
+        }
+    }
+
+    public func storageState(of assetID: String) throws -> StorageState? {
+        var stmt: OpaquePointer?
+        let sql = "SELECT storage_state, primary_host FROM assets WHERE id = ?"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (assetID as NSString).utf8String, -1, CatalogSchema.transient)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        func text(_ column: Int32) -> String? {
+            guard let c = sqlite3_column_text(stmt, column) else { return nil }
+            return String(cString: c)
+        }
+        return StorageState(storageState: text(0), primaryHost: text(1))
+    }
+
+    public func beginTransfer(assetID: String, remoteID: String, remotePath: String, sha256: String? = nil) throws {
+        let now = Date().timeIntervalSince1970
+        try execBind("""
+            INSERT OR REPLACE INTO asset_transfers
+            (asset_id, remote_id, state, remote_path, sha256, started_at, updated_at)
+            VALUES (?,?,?,?,?,?,?)
+            """, [assetID, remoteID, TransferState.copying.rawValue, remotePath, sha256 as Any, now, now])
+    }
+
+    /// Advance a transfer. `failed` drops the row: there is nothing to resume,
+    /// and the local copy is still authoritative.
+    public func setTransferState(assetID: String, state: TransferState, remotePath: String? = nil) throws {
+        if state == .failed { try finishTransfer(assetID: assetID); return }
+        if let remotePath {
+            try execBind("UPDATE asset_transfers SET state = ?, remote_path = ?, updated_at = ? WHERE asset_id = ?",
+                         [state.rawValue, remotePath, Date().timeIntervalSince1970, assetID])
+        } else {
+            try execBind("UPDATE asset_transfers SET state = ?, updated_at = ? WHERE asset_id = ?",
+                         [state.rawValue, Date().timeIntervalSince1970, assetID])
+        }
+    }
+
+    public func finishTransfer(assetID: String) throws {
+        try execBind("DELETE FROM asset_transfers WHERE asset_id = ?", [assetID])
+    }
+
+    /// Transfers that were interrupted: what recovery has to finish or undo.
+    public func pendingTransfers() throws -> [PendingTransfer] {
+        var stmt: OpaquePointer?
+        let sql = "SELECT asset_id, remote_id, state, remote_path, sha256 FROM asset_transfers ORDER BY started_at"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        var out: [PendingTransfer] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            func text(_ column: Int32) -> String? {
+                guard let c = sqlite3_column_text(stmt, column) else { return nil }
+                return String(cString: c)
+            }
+            guard let assetID = text(0), let remoteID = text(1),
+                  let raw = text(2), let state = TransferState(rawValue: raw),
+                  let remotePath = text(3) else { continue }
+            out.append(PendingTransfer(assetID: assetID, remoteID: remoteID, state: state,
+                                       remotePath: remotePath, sha256: text(4)))
+        }
+        return out
+    }
+
+    /// Bind-and-run for the small statements above.
+    private func execBind(_ sql: String, _ values: [Any]) throws {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw CatalogSchemaError.execFailed(sql, String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        for (offset, value) in values.enumerated() {
+            let index = Int32(offset + 1)
+            switch value {
+            case let s as String: sqlite3_bind_text(stmt, index, (s as NSString).utf8String, -1, CatalogSchema.transient)
+            case let d as Double: sqlite3_bind_double(stmt, index, d)
+            case let i as Int: sqlite3_bind_int64(stmt, index, Int64(i))
+            case let o as Optional<String> where o == nil: sqlite3_bind_null(stmt, index)
+            default: sqlite3_bind_null(stmt, index)
+            }
+        }
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw CatalogSchemaError.execFailed(sql, String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
     public func locations(of assetID: String, scope: CatalogRealm?) throws -> [AssetLocation] {
         var stmt: OpaquePointer?
         let sql = """

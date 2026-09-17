@@ -101,6 +101,36 @@ public final class AssetIngestor {
         knownPaths.insert(path)
     }
 
+    /// Forget a path that has left this Mac — a remote-gallery send moves the
+    /// file away (FDD-remote-galleries §3.3). Without this the poller keeps it
+    /// in `knownPaths` forever, and a file that later reappears under the same
+    /// name would never be noticed.
+    public func forgetKnownPath(_ path: String) {
+        knownPaths.remove(path)
+        reservedPaths.remove(path)
+    }
+
+    /// Paths a remote-gallery transfer is working on right now. The poller
+    /// skips them: a send copies the file away and then deletes it, and a scan
+    /// landing in that window would re-ingest a half-moved asset
+    /// (FDD-remote-galleries §3.3, Codex review of the implementation).
+    private var reservedPaths: Set<String> = []
+
+    /// Claim a path for the length of a transfer.
+    public func reservePath(_ path: String) {
+        reservedPaths.insert(path)
+    }
+
+    /// Release a claim. Safe to call for a path that was never reserved.
+    public func releasePath(_ path: String) {
+        reservedPaths.remove(path)
+    }
+
+    /// Is this path claimed by a transfer? (Test seam and diagnostics.)
+    public func isReserved(_ path: String) -> Bool {
+        reservedPaths.contains(path)
+    }
+
     /// Manually ingest a single file at the given path. Returns the stored
     /// asset (which keeps its original id if the path was already tracked).
     @discardableResult
@@ -481,6 +511,8 @@ public final class AssetIngestor {
             let path = (watchDirectory as NSString).appendingPathComponent(filename)
 
             guard !knownPaths.contains(path) else { continue }
+            // A transfer owns this path right now — do not ingest it mid-move.
+            guard !reservedPaths.contains(path) else { continue }
 
             // Check file is fully written (size stable).
             guard isFileStable(at: path) else { continue }

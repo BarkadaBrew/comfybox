@@ -251,6 +251,7 @@ public actor DAMStore {
         let secured = try securedAssetIds()
         let elsewhere = try assetIDsHostedElsewhere()
         let total = try assetCount()
+        let mounted = Self.mountedVolumeRoots()
 
         // Decide the whole sweep before performing any of it. Walked a page
         // of lightweight (id, path) pairs at a time rather than fetching
@@ -262,9 +263,12 @@ public actor DAMStore {
             if page.isEmpty { break }
             for (id, path) in page {
                 guard !secured.contains(id), !elsewhere.contains(id) else { continue }
-                if !FileManager.default.fileExists(atPath: path) {
-                    candidates.append(id)
-                }
+                guard !FileManager.default.fileExists(atPath: path) else { continue }
+                // A file on a volume that is not mounted is not a deletion.
+                // Counting it as one is what made a pulled drive look like a
+                // mass disappearance and trip the breaker on every load.
+                guard Self.classifyMissingFile(path: path, mountedVolumeRoots: mounted) == .orphan else { continue }
+                candidates.append(id)
             }
             offset += page.count
             if page.count < Self.pruneScanPageSize { break }
@@ -280,6 +284,126 @@ public actor DAMStore {
             try deleteAsset(id: id)  // FTS + folders + collections + locations
         }
         return candidates
+    }
+
+    // MARK: - Missing files: deleted here vs. unattached elsewhere
+    //
+    // Todd 2026-09-17: "the current gallery ... assumes it is unattached
+    // storage that the thumbnail cant find and wont clean itself." Both halves
+    // of that are real. A row whose file sits on an UNMOUNTED volume is not an
+    // orphan and must never be pruned; a row whose file was deleted from a
+    // mounted volume is, and there must be a way to clean it even when the
+    // unattended sweep's circuit breaker refuses (FDD-remote-galleries §3.6).
+
+    /// Why a row's file is not on disk.
+    public enum MissingFileClass: Sendable, Equatable {
+        /// The volume is mounted and the file is gone: a genuine orphan row.
+        case orphan
+        /// The file lives on a volume that is not mounted right now.
+        case unattached
+    }
+
+    /// One row whose backing file is not on disk.
+    public struct MissingAssetRow: Sendable, Equatable {
+        public let id: String
+        public let absolutePath: String
+        public var filename: String { (absolutePath as NSString).lastPathComponent }
+    }
+
+    /// Everything the catalog knows about files that are not there.
+    public struct MissingFileReport: Sendable {
+        /// Deleted from a mounted volume — safe to purge, with review.
+        public var orphans: [MissingAssetRow]
+        /// On a volume that is not mounted — never purged.
+        public var unattached: [MissingAssetRow]
+        public var total: Int { orphans.count + unattached.count }
+    }
+
+    /// Mount points of every currently mounted volume, `/` included.
+    static func mountedVolumeRoots() -> Set<String> {
+        var roots: Set<String> = ["/"]
+        let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: nil, options: []) ?? []
+        for url in urls { roots.insert(url.path) }
+        return roots
+    }
+
+    /// Pure classifier: is this missing file gone, or just not attached?
+    ///
+    /// A path under `/Volumes/<name>/` whose volume is not in
+    /// `mountedVolumeRoots` is unattached. The volume component is compared
+    /// whole, so `/Volumes/Vault2` is not satisfied by `/Volumes/Vault`.
+    public static func classifyMissingFile(path: String, mountedVolumeRoots: Set<String>) -> MissingFileClass {
+        let parts = (path as NSString).pathComponents
+        guard parts.count >= 3, parts[0] == "/", parts[1] == "Volumes" else { return .orphan }
+        let volumeRoot = "/Volumes/" + parts[2]
+        return mountedVolumeRoots.contains(volumeRoot) ? .orphan : .unattached
+    }
+
+    /// Every row whose file is missing, split by why. Secured assets (vault
+    /// paths) and rows the catalog hosts on another machine are excluded: for
+    /// those, "not here" is the normal case.
+    public func scanMissingFiles() throws -> MissingFileReport {
+        let secured = try securedAssetIds()
+        let elsewhere = try assetIDsHostedElsewhere()
+        let mounted = Self.mountedVolumeRoots()
+
+        var orphans: [MissingAssetRow] = []
+        var unattached: [MissingAssetRow] = []
+        var offset = 0
+        while true {
+            let page = try assetLocations(limit: Self.pruneScanPageSize, offset: offset)
+            if page.isEmpty { break }
+            for (id, path) in page {
+                guard !secured.contains(id), !elsewhere.contains(id) else { continue }
+                guard !FileManager.default.fileExists(atPath: path) else { continue }
+                let row = MissingAssetRow(id: id, absolutePath: path)
+                switch Self.classifyMissingFile(path: path, mountedVolumeRoots: mounted) {
+                case .orphan: orphans.append(row)
+                case .unattached: unattached.append(row)
+                }
+            }
+            offset += page.count
+            if page.count < Self.pruneScanPageSize { break }
+        }
+        return MissingFileReport(orphans: orphans, unattached: unattached)
+    }
+
+    /// Delete the named rows, provided their files really are missing.
+    ///
+    /// This is the REVIEWED path: an operator has seen the list, so the
+    /// unattended sweep's circuit breaker does not apply. Rows whose file is
+    /// present, or which are secured, hosted elsewhere or merely unattached,
+    /// are skipped however they were selected. Returns how many were deleted.
+    @discardableResult
+    public func purgeMissing(ids: [String]) throws -> Int {
+        guard !ids.isEmpty else { return 0 }
+        let report = try scanMissingFiles()
+        let purgeable = Set(report.orphans.map(\.id))
+        var deleted = 0
+        for id in ids where purgeable.contains(id) {
+            try deleteAsset(id: id)
+            deleted += 1
+        }
+        return deleted
+    }
+
+    /// Drop `asset_locations` rows whose asset no longer exists — leftovers
+    /// from an earlier database (885 of them in Todd's live catalog on
+    /// 2026-09-17). Returns how many were removed.
+    @discardableResult
+    public func vacuumStaleLocations() throws -> Int {
+        let exists = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='asset_locations'"
+        var check: OpaquePointer?
+        guard sqlite3_prepare_v2(db, exists, -1, &check, nil) == SQLITE_OK else { return 0 }
+        let hasTable = sqlite3_step(check) == SQLITE_ROW
+        sqlite3_finalize(check)
+        guard hasTable else { return 0 }
+
+        let sql = "DELETE FROM asset_locations WHERE asset_id NOT IN (SELECT id FROM assets)"
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw DAMStoreError.execFailed(sql, String(cString: sqlite3_errmsg(db)))
+        }
+        return Int(sqlite3_changes(db))
     }
 
     /// Ids the catalog records a copy of on a host other than this Mac.
@@ -418,6 +542,11 @@ public actor DAMStore {
     /// needs (a restore's live-row lookup, a folder's member set, a
     /// crash-recovery sweep) instead of fetching the whole table to filter
     /// in memory (#265). Chunks the `IN (...)` list at `idChunkSize`.
+    /// One asset by id, or nil.
+    public func fetchAsset(id: String) throws -> DAMAsset? {
+        try assets(withIDs: [id]).first
+    }
+
     public func assets(withIDs ids: Set<String>) throws -> [DAMAsset] {
         guard !ids.isEmpty else { return [] }
         var results: [DAMAsset] = []
