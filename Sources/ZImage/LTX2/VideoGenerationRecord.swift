@@ -133,6 +133,20 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
 
   public let loras: [LoRAEntry]
 
+  /// Director aggregate sidecar (WP2c): where the stitched track came from —
+  /// `"generated"` (each chunk's own audio, placed on the timeline),
+  /// `"imported"` (the timeline's audio clips) or `"none"`. `audio` keeps its
+  /// written-track meaning. nil (omitted) on every non-director record.
+  public let audioSource: String?
+  /// Director: number of single-pass chunks stitched into this file.
+  public let chunkCount: Int?
+  /// Director: how the chunks were joined (`"reencode"` in Phase 1).
+  public let stitchPath: String?
+  /// Director, generated audio: 0-based indices of chunks whose own audio
+  /// failed or could not be decoded and so contributed silence. nil (omitted)
+  /// when none were skipped and on every non-director record.
+  public let audioSkippedChunks: [Int]?
+
   public struct LoRAEntry: Codable, Sendable, Equatable {
     public let name: String
     public let scale: Float
@@ -155,7 +169,9 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     nagScale: Float? = nil, nagAlpha: Float? = nil, nagTau: Float? = nil,
     nagApplied: Bool? = nil, audioRefine: Bool? = nil, recipeHash: String? = nil,
     kind: String, source: String? = nil, contentMode: String? = nil, truncated: Bool = false,
-    loras: [LoRAEntry] = []
+    loras: [LoRAEntry] = [],
+    audioSource: String? = nil, chunkCount: Int? = nil, stitchPath: String? = nil,
+    audioSkippedChunks: [Int]? = nil
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -196,6 +212,10 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     self.contentMode = contentMode
     self.truncated = truncated
     self.loras = loras
+    self.audioSource = audioSource
+    self.chunkCount = chunkCount
+    self.stitchPath = stitchPath
+    self.audioSkippedChunks = audioSkippedChunks
   }
 }
 

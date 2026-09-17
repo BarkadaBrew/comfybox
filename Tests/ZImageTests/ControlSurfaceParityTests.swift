@@ -47,7 +47,8 @@ final class ControlSurfaceParityTests: XCTestCase {
   /// `/v1/models` and `/v1/model/family`; the ROUTE SET is unchanged, so
   /// `docs/api-reference.md` is byte-identical.
   /// Local mode (2026-09-15) added GET + POST /v1/queue/admission: 97 → 99.
-  private static let expectedWarmServerTuples = 99
+  /// Director WP2c added POST /v1/video/director + /validate: 99 → 101.
+  private static let expectedWarmServerTuples = 101
   private static let expectedBridgeTuples = 17
 
   private static let repoRoot: URL = {

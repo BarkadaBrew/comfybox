@@ -21,6 +21,7 @@ final class MCPToolAnnotationTests: XCTestCase {
     "queue_status",
     "server_health",
     "system_stats",
+    "validate_director_timeline",
     "video_status",
     "workflow_run_status",
   ]

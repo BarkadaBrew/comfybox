@@ -34,3 +34,50 @@ func handleImageDrop(_ providers: [NSItemProvider], apply: @escaping (String) ->
 
     return false
 }
+
+/// Multi-image variant of `handleImageDrop` for drops that may carry several
+/// files at once (the Director keyframe track). Resolves every provider —
+/// file URLs first, raw image bytes written to temp PNGs — and calls `apply`
+/// ONCE on the main queue with the resolved paths in provider order.
+/// Returns whether any provider looked like an image.
+@MainActor
+func handleImageDrops(_ providers: [NSItemProvider], apply: @escaping ([String]) -> Void) -> Bool {
+    let group = DispatchGroup()
+    let lock = NSLock()
+    var resolved: [Int: String] = [:]
+    var accepted = false
+
+    for (index, provider) in providers.enumerated() {
+        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            accepted = true
+            group.enter()
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                if let url {
+                    lock.lock(); resolved[index] = url.path; lock.unlock()
+                }
+                group.leave()
+            }
+        } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+            accepted = true
+            group.enter()
+            provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                if let data {
+                    let tempPath = NSTemporaryDirectory() + "dropped-\(UUID().uuidString).png"
+                    if (try? data.write(to: URL(fileURLWithPath: tempPath))) != nil {
+                        lock.lock(); resolved[index] = tempPath; lock.unlock()
+                    }
+                }
+                group.leave()
+            }
+        }
+    }
+
+    guard accepted else { return false }
+    group.notify(queue: .main) {
+        lock.lock()
+        let paths = resolved.keys.sorted().compactMap { resolved[$0] }
+        lock.unlock()
+        if !paths.isEmpty { apply(paths) }
+    }
+    return true
+}

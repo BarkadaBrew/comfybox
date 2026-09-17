@@ -513,6 +513,8 @@ public final class EngineService {
     /// submit→poll generation flow can be driven end-to-end in unit tests with a
     /// fake — the same seam `MCPToolExecutor` uses (#217).
     private var client: WarmServerTransport?
+    /// The live transport for sibling-file extensions (EngineService+Director).
+    var transport: WarmServerTransport? { client }
     // nonisolated(unsafe) so the nonisolated deinit can cancel it; Task.cancel()
     // is thread-safe, and all other accesses happen on the main actor.
     private nonisolated(unsafe) var healthPollTask: Task<Void, Never>?
@@ -1901,6 +1903,14 @@ public final class EngineService {
         public let frameCount: Int?
         public let videoDurationSeconds: Int?
         public let elapsedMs: Int?
+        /// Director jobs (WP3, additive): "director" | "t2v" | "i2v" | ….
+        public var mode: String? = nil
+        /// 0-based chunk rendering now (== stageCount while stitching); nil
+        /// before the first chunk starts or for non-director jobs.
+        public var stageIndex: Int? = nil
+        public var stageCount: Int? = nil
+        /// The director job's compiled chunk plan (boundary/keyframe ticks).
+        public var plan: DirectorPlan? = nil
 
         public var isTerminal: Bool { status == "succeeded" || status == "failed" }
     }
@@ -1961,7 +1971,11 @@ public final class EngineService {
             progressPercent: json["progress_percent"] as? Int,
             frameCount: json["frame_count"] as? Int,
             videoDurationSeconds: json["video_duration_seconds"] as? Int,
-            elapsedMs: json["elapsed_ms"] as? Int
+            elapsedMs: json["elapsed_ms"] as? Int,
+            mode: json["mode"] as? String,
+            stageIndex: json["stage_index"] as? Int,
+            stageCount: json["stage_count"] as? Int,
+            plan: Self.decodeDirectorPlan(json["plan"])
         )
     }
 

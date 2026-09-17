@@ -259,6 +259,9 @@ struct ZImageCLI {
       case "video":
         try runVideo(args: Array(args.dropFirst()))
         return
+      case "director-render":
+        try runDirectorRender(args: Array(args.dropFirst()))
+        return
       case "ltx-image":
         try runLTXImage(args: Array(args.dropFirst()))
         return
@@ -1321,6 +1324,13 @@ struct ZImageCLI {
         -r, --resolution     Resolution: 480p, 720p, 1080p (default: 720p)
         --aspect-ratio       16:9 or 9:16 (default: 16:9)
         Use 'ComfyBox video --help' for full options
+
+      director-render        Submit a Director timeline (.cbdirector) to a running server
+        <file.cbdirector>    Timeline file (required)
+        --server             Server URL (default: http://127.0.0.1:7870)
+        --validate-only      Validate and print issues + chunk plan, no render
+        --wait               Poll the job until it finishes
+        Use 'ComfyBox director-render --help' for full options
 
       ltx-image              Native LTX-2.3 text-to-image (same LTX weights)
         -p, --prompt         Text prompt (required)

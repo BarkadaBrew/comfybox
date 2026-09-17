@@ -92,6 +92,8 @@ or carry a reasoned exemption (§3.5 assertion 3).
 | POST | `/v1/upscale` | upscale |  |
 | GET | `/v1/video/config/effective` |  |  |
 | POST | `/v1/video/config/effective` |  | POST-for-body READ: echoes the effective video config for a hypothetical request without changing state (GET variant also exists). |
+| POST | `/v1/video/director` | generate_director_video |  |
+| POST | `/v1/video/director/validate` | validate_director_timeline |  |
 | POST | `/v1/video/extend` | extend_video |  |
 | POST | `/v1/video/generate` |  | Synchronous variant; the generate_video tool proxies POST /v1/video/generate/async (job-based) so an agent is never blocked for a whole video render. |
 | POST | `/v1/video/generate/async` | generate_video |  |

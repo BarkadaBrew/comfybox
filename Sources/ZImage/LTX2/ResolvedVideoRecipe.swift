@@ -48,6 +48,9 @@ public struct ResolvedVideoRecipe: Codable, Sendable, Equatable {
   public let twoStageRequested: Bool?
   public let loras: [LoRA]
   public let beatSchedule: [BeatSegment]?
+  /// WP2a: extra keyframe conditions (frame > 0). nil when the request has
+  /// none, so pre-WP2a recipes fingerprint identically.
+  public let keyframes: [LTX2KeyframeRef]?
   public let parameters: [Parameter]
 
   /// Full lowercase SHA-256 over the canonical recipe JSON. Encoding errors
@@ -100,6 +103,7 @@ public struct ResolvedVideoRecipe: Codable, Sendable, Equatable {
       twoStageRequested: request.twoStageRequested,
       loras: request.effectiveLoRAs.map { LoRA(path: $0.path, scale: $0.scale) },
       beatSchedule: request.beatSchedule,
+      keyframes: request.keyframes.isEmpty ? nil : request.keyframes,
       parameters: snapshot.params
         .map { Parameter(name: $0.name, value: $0.value) }
         .sorted { $0.name < $1.name })

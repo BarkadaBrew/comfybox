@@ -237,4 +237,134 @@ final class VideoJobTrackerTests: XCTestCase {
     XCTAssertEqual(tracker.status(jobId: queuedId)?.status, .queued)
     XCTAssertEqual(tracker.status(jobId: processingId)?.status, .processing)
   }
+
+  // MARK: - Director (WP2c)
+
+  private func directorPlan() -> DirectorPlan {
+    DirectorPlan(
+      lengthFrames: 577, fps: 24, width: 576, height: 896, audioMode: "generated",
+      chunks: [
+        .init(index: 0, startFrame: 0, endFrame: 288, frames: 289, seed: 42, carryOver: false, audio: "generated"),
+        .init(index: 1, startFrame: 288, endFrame: 576, frames: 289, seed: 43, carryOver: true, audio: "generated"),
+      ],
+      keyframeTicks: [.init(id: "k1", frame: 0)], boundaryFrames: [288], warnings: [])
+  }
+
+  func testSubmitOrchestratedDirectorRegistersPlanConfigHashAndStages() throws {
+    let traceDir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("director-trace-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: traceDir) }
+    let tracker = VideoJobTracker()
+    tracker.traceStore = RenderTraceStore(directory: traceDir)
+    let plan = directorPlan()
+    let config = [LTX2ResolvedParam(
+      name: "two_stage", envKey: nil, tier: "A", value: "false", source: .builtin, valid: true, note: nil)]
+
+    let started = expectation(description: "work started")
+    let release = DispatchSemaphore(value: 0)
+    let seenJobId = LockedBox<String?>(nil)
+    let queued = tracker.submitOrchestrated(
+      source: "desktop", mode: .director,
+      resolvedConfig: config, recipeHash: "hash-0",
+      tracePayload: ["director_plan": "{\"length_frames\":577}", "director_chunks": "2"],
+      plan: plan, stageCount: 2
+    ) { jobId, report in
+      seenJobId.set(jobId)
+      tracker.setStage(jobId, index: 1, count: 2)
+      report(50)
+      started.fulfill()
+      release.wait()
+      return LTX2VideoResult(outputPath: "/out/director.mp4", frameCount: 577, durationSeconds: 24, elapsedSeconds: 1)
+    }
+
+    XCTAssertEqual(queued.status, .queued)
+    XCTAssertEqual(queued.mode, .director)
+    XCTAssertEqual(queued.plan, plan)
+    XCTAssertEqual(queued.stageCount, 2)
+    XCTAssertNil(queued.stageIndex)
+    XCTAssertEqual(queued.recipeHash, "hash-0")
+    XCTAssertEqual(queued.resolvedConfig, config)
+
+    wait(for: [started], timeout: 5)
+    XCTAssertEqual(seenJobId.get(), queued.jobId, "the work closure receives the tracker job id")
+    let mid = try XCTUnwrap(tracker.status(jobId: queued.jobId))
+    XCTAssertEqual(mid.stageIndex, 1)
+    XCTAssertEqual(mid.stageCount, 2)
+    XCTAssertEqual(mid.progressPercent, 50)
+    release.signal()
+
+    let deadline = Date().addingTimeInterval(5)
+    while tracker.status(jobId: queued.jobId)?.status != .succeeded, Date() < deadline {
+      usleep(10_000)
+    }
+    let done = try XCTUnwrap(tracker.status(jobId: queued.jobId))
+    XCTAssertEqual(done.status, .succeeded)
+    XCTAssertEqual(done.mode, .director)
+    XCTAssertEqual(done.plan, plan)
+
+    tracker.traceStore?.flush()
+    let submitted = try XCTUnwrap(tracker.traceStore?.events(renderId: queued.jobId).first { $0.event == .submitted })
+    XCTAssertEqual(submitted.payload["mode"], "director")
+    XCTAssertEqual(submitted.payload["director_chunks"], "2")
+    XCTAssertNotNil(submitted.payload["director_plan"])
+  }
+
+  func testDirectorChunkFailedErrorStringFormat() {
+    let tracker = VideoJobTracker()
+    let (jobId, _) = tracker.register(source: "api", mode: .director, plan: directorPlan(), stageCount: 3)
+    tracker.markProcessing(jobId)
+    tracker.markFailed(jobId, error: DirectorError.chunkFailed(chunk: 1, stage: "render", message: "x"))
+    let s = tracker.status(jobId: jobId)
+    XCTAssertEqual(s?.status, .failed)
+    XCTAssertEqual(s?.error, "chunk 2/3 (render): x")
+    XCTAssertNil(s?.interrupted)
+
+    let (stitchId, _) = tracker.register(source: "api", mode: .director, stageCount: 3)
+    tracker.markFailed(stitchId, error: DirectorError.stitchFailed("writer died"))
+    XCTAssertEqual(tracker.status(jobId: stitchId)?.error, "chunk 3/3 (stitch): writer died")
+
+    // Cancellation still classifies as an interrupt, not a chunk failure.
+    let (cancelId, _) = tracker.register(source: "api", mode: .director, stageCount: 3)
+    tracker.markFailed(cancelId, error: CancellationError())
+    XCTAssertEqual(tracker.status(jobId: cancelId)?.interrupted, true)
+
+    // Non-director jobs keep localizedDescription.
+    let (plainId, _) = tracker.register(source: "api", mode: .t2v)
+    tracker.markFailed(plainId, error: DirectorError.chunkFailed(chunk: 1, stage: "render", message: "x"))
+    XCTAssertEqual(tracker.status(jobId: plainId)?.error, "chunk 2 (render): x")
+  }
+
+  func testDirectorNamedInterruptThroughChunkWrappingEndsInterrupted() {
+    let tracker = VideoJobTracker()
+    let done = expectation(description: "orchestration finished")
+    let status = tracker.submitOrchestrated(
+      source: "api", mode: .director, plan: directorPlan(), stageCount: 2
+    ) { _, _ in
+      defer { done.fulfill() }
+      do {
+        // What `coordinator.enqueueLocalVideo` throws on /v1/queue/interrupt.
+        throw WarmServerError.renderInterrupted
+      } catch {
+        // runDirector's per-chunk catch.
+        throw WarmServer.directorChunkError(error, chunk: 1, stage: "render")
+      }
+    }
+    wait(for: [done], timeout: 5)
+    let deadline = Date().addingTimeInterval(5)
+    while tracker.status(jobId: status.jobId)?.status != .failed, Date() < deadline {
+      RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+    }
+    let s = tracker.status(jobId: status.jobId)
+    XCTAssertEqual(s?.status, .failed)
+    XCTAssertEqual(s?.interrupted, true, "an operator interrupt is not a chunk failure (comfybox#322)")
+    XCTAssertFalse(s?.error?.hasPrefix("chunk ") == true, s?.error ?? "")
+  }
+}
+
+private final class LockedBox<T>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: T
+  init(_ value: T) { self.value = value }
+  func set(_ v: T) { lock.lock(); value = v; lock.unlock() }
+  func get() -> T { lock.lock(); defer { lock.unlock() }; return value }
 }
