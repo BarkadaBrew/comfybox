@@ -123,6 +123,8 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeLibraryUpsert(arguments)
       case "library_mark_used":
         return try await executeLibraryMarkUsed(arguments)
+      case "library_import_studio_packs":
+        return try await executeLibraryImportStudioPacks(arguments)
       case "library_import_pack":
         return try await executeLibraryImportPack(arguments)
       case "library_delete":
@@ -1342,6 +1344,12 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
     let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
     let (status, data) = try await client.post("/v1/library/used/\(encoded)", body: Data("{}".utf8))
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  private func executeLibraryImportStudioPacks(_ params: MCPParams?) async throws -> MCPToolResult {
+    let body = try JSONEncoder().encode(params?.raw ?? [:])
+    let (status, data) = try await client.post("/v1/library/import-studio-packs", body: body)
     return Self.mapHTTPResponse(status: status, data: data)
   }
 
