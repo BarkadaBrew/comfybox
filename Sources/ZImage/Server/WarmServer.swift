@@ -5959,7 +5959,7 @@ public final class WarmServer {
   ) async throws -> LTX2VideoResult {
     let started = Date()
     let session = UUID().uuidString.prefix(8)
-    let dir = configuration.allowedOutputDirectory
+    let dir = (configuration.allowedOutputDirectory as NSString).expandingTildeInPath
     var anchor: String? = nil
     var clips: [String] = []
     // Assembly gets the final ~4%; shots split the rest evenly.
@@ -6356,6 +6356,7 @@ public final class WarmServer {
   static func directorMaterializeAssets(
     _ timeline: inout DirectorTimeline, session: String, directory: String
   ) throws -> [String] {
+    let directory = (directory as NSString).expandingTildeInPath
     var written: [String] = []
     for i in timeline.keyframes.indices {
       guard let b64 = timeline.keyframes[i].imageBase64, !b64.isEmpty else { continue }
@@ -6384,6 +6385,10 @@ public final class WarmServer {
   /// `runStoryboard`, not re-verified against coffeeshop-server).
   static func directorRemoveIntermediates(session: String, directory: String, extra: [String]) {
     let fm = FileManager.default
+    // The configured output directory is "~/Pictures/ComfyBox" verbatim;
+    // contentsOfDirectory does not expand "~", so without this the listing
+    // failed silently and every intermediate was left behind.
+    let directory = (directory as NSString).expandingTildeInPath
     let prefix = "director-\(session)-"
     if let names = try? fm.contentsOfDirectory(atPath: directory) {
       for name in names where name.hasPrefix(prefix) {
@@ -6416,7 +6421,7 @@ public final class WarmServer {
     }
 
     let session = String(UUID().uuidString.prefix(8))
-    let dir = configuration.allowedOutputDirectory
+    let dir = (configuration.allowedOutputDirectory as NSString).expandingTildeInPath
     var materialized: [String] = []
     func discardAssets() {
       for path in materialized { try? FileManager.default.removeItem(atPath: path) }
@@ -6586,7 +6591,7 @@ public final class WarmServer {
     report: @escaping @Sendable (Int) -> Void
   ) async throws -> LTX2VideoResult {
     let started = Date()
-    let dir = configuration.allowedOutputDirectory
+    let dir = (configuration.allowedOutputDirectory as NSString).expandingTildeInPath
     let settings = timeline.settings
     // The submit route pinned fps/seed into the timeline (resolvingDefaults);
     // the fallbacks only cover a caller that did not.

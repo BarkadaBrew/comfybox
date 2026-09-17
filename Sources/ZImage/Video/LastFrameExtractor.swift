@@ -3,6 +3,7 @@ import Foundation
 #if canImport(AVFoundation) && canImport(CoreGraphics)
 import AVFoundation
 import CoreGraphics
+import CoreImage
 import ImageIO
 
 /// Extracts a clip's last frame as a PNG — the anchor for the next shot in a
@@ -32,21 +33,16 @@ public enum LastFrameExtractor {
     let duration = CMTimeGetSeconds(asset.duration)
     guard duration > 0 else { throw ExtractError.unreadable(videoPath) }
 
-    let generator = AVAssetImageGenerator(asset: asset)
-    generator.appliesPreferredTrackTransform = true
-    generator.requestedTimeToleranceBefore = .positiveInfinity
-    generator.requestedTimeToleranceAfter = .zero
-
-    // Ask for a hair before the nominal end — the true last sample's PTS is
-    // one frame earlier than the duration, and zero-after tolerance walks
-    // back to it.
-    let target = CMTime(seconds: max(0, duration - 0.001), preferredTimescale: 600)
-    let image: CGImage
-    do {
-      image = try generator.copyCGImage(at: target, actualTime: nil)
-    } catch {
-      throw ExtractError.unreadable("\(videoPath): \(error.localizedDescription)")
-    }
+    // EXACT last frame (2026-09-17). The previous AVAssetImageGenerator call
+    // used `requestedTimeToleranceBefore = .positiveInfinity`, which lets
+    // AVFoundation return any earlier frame that is cheaper to decode — in
+    // practice the nearest sync frame. A 193-frame Director chunk handed back
+    // frame 178; a single-GOP clip hands back frame 0. Director carry-over,
+    // storyboard chaining and /v1/video/extend all restarted from that frame.
+    // (Zero tolerance at the final sample is refused by the generator:
+    // "Cannot Open".) So decode the track with AVAssetReader — its
+    // decompressed output is in presentation order — and keep the last frame.
+    let image = try decodeLastFrame(of: asset, videoPath: videoPath)
 
     let outURL = URL(fileURLWithPath: outputPath)
     try FileManager.default.createDirectory(
@@ -59,6 +55,57 @@ public enum LastFrameExtractor {
       throw ExtractError.writeFailed(outputPath)
     }
     return outputPath
+  }
+
+  /// Decode every frame of the first video track (BGRA) and return the last
+  /// one in presentation order as a CGImage, with the track's preferred
+  /// transform applied (what `appliesPreferredTrackTransform` did before).
+  static func decodeLastFrame(of asset: AVAsset, videoPath: String) throws -> CGImage {
+    guard let track = asset.tracks(withMediaType: .video).first else {
+      throw ExtractError.unreadable("\(videoPath): no video track")
+    }
+    let reader: AVAssetReader
+    do {
+      reader = try AVAssetReader(asset: asset)
+    } catch {
+      throw ExtractError.unreadable("\(videoPath): \(error.localizedDescription)")
+    }
+    let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+    ])
+    output.alwaysCopiesSampleData = false
+    guard reader.canAdd(output) else { throw ExtractError.unreadable("\(videoPath): reader refused the track output") }
+    reader.add(output)
+    guard reader.startReading() else {
+      throw ExtractError.unreadable("\(videoPath): \(reader.error?.localizedDescription ?? "startReading failed")")
+    }
+    var last: CVPixelBuffer?
+    var lastPTS = CMTime.negativeInfinity
+    while let sample = output.copyNextSampleBuffer() {
+      guard let pixels = CMSampleBufferGetImageBuffer(sample) else { continue }
+      let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+      // Presentation order is the decoder's output order; the comparison
+      // guards against a reader that ever emits out of order.
+      if last == nil || !pts.isValid || CMTimeCompare(pts, lastPTS) >= 0 {
+        last = pixels
+        if pts.isValid { lastPTS = pts }
+      }
+    }
+    if reader.status == .failed {
+      throw ExtractError.unreadable("\(videoPath): \(reader.error?.localizedDescription ?? "decode failed")")
+    }
+    guard let frame = last else { throw ExtractError.unreadable("\(videoPath): no decodable frames") }
+    var ci = CIImage(cvPixelBuffer: frame)
+    let transform = track.preferredTransform
+    if !transform.isIdentity {
+      ci = ci.transformed(by: transform)
+      ci = ci.transformed(by: CGAffineTransform(translationX: -ci.extent.origin.x, y: -ci.extent.origin.y))
+    }
+    let context = CIContext(options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
+    guard let cg = context.createCGImage(ci, from: ci.extent) else {
+      throw ExtractError.unreadable("\(videoPath): could not render the last frame")
+    }
+    return cg
   }
 }
 
