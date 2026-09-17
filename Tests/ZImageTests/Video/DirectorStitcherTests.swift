@@ -249,4 +249,56 @@ final class DirectorStitcherTests: XCTestCase {
     XCTAssertEqual(result.frameCount, 9)
     XCTAssertEqual(try decodeFrames(out).count, 9)
   }
+
+  // MARK: - Tone transforms (Director chunk tone match)
+
+  private let grey: RGB = (0.45, 0.45, 0.45)
+
+  func testNilToneTransformsMatchesDefaultAndIdentityOutput() throws {
+    let a = try gradientChunk(name: "a.mp4", frames: 9, from: red, to: blue)
+    let b = try gradientChunk(name: "b.mp4", frames: 9, from: blue, to: green)
+    let plain = tempDir.appendingPathComponent("plain.mp4").path
+    let explicitNil = tempDir.appendingPathComponent("nil.mp4").path
+    let identity = tempDir.appendingPathComponent("identity.mp4").path
+    _ = try DirectorStitcher.stitch(
+      chunkPaths: [a, b], expectedFrames: [9, 9], fps: 24, width: w, height: h, audio: nil, outputPath: plain)
+    _ = try DirectorStitcher.stitch(
+      chunkPaths: [a, b], expectedFrames: [9, 9], fps: 24, width: w, height: h, audio: nil,
+      toneTransforms: nil, outputPath: explicitNil)
+    _ = try DirectorStitcher.stitch(
+      chunkPaths: [a, b], expectedFrames: [9, 9], fps: 24, width: w, height: h, audio: nil,
+      toneTransforms: [.identity, .identity], outputPath: identity)
+    let p = try decodeFrames(plain), n = try decodeFrames(explicitNil), i = try decodeFrames(identity)
+    XCTAssertEqual(p.count, 17); XCTAssertEqual(n.count, 17); XCTAssertEqual(i.count, 17)
+    assertColour(n.first, p.first, tolerance: 0.001, "nil first == default first")
+    assertColour(n.last, p.last, tolerance: 0.001, "nil last == default last")
+    assertColour(i.first, p.first, tolerance: 0.02, "identity first")
+    assertColour(i.last, p.last, tolerance: 0.02, "identity last")
+  }
+
+  func testToneTransformShiftsOnlyItsChunk() throws {
+    let a = try gradientChunk(name: "a.mp4", frames: 9, from: grey, to: grey)
+    let b = try gradientChunk(name: "b.mp4", frames: 9, from: grey, to: grey)
+    let out = tempDir.appendingPathComponent("toned.mp4").path
+    let darken = ToneTransform(gain: [1, 1, 1], offset: [-40, -40, -40])
+    let result = try DirectorStitcher.stitch(
+      chunkPaths: [a, b], expectedFrames: [9, 9], fps: 24, width: w, height: h, audio: nil,
+      toneTransforms: [.identity, darken], outputPath: out)
+    XCTAssertEqual(result.frameCount, 17)
+    let decoded = try decodeFrames(out)
+    let src = try decodeFrames(a)
+    assertColour(decoded.first, src.first, tolerance: 0.03, "chunk 0 untouched")
+    let shift = CGFloat(40.0 / 255.0)
+    assertColour(decoded.last, (src.last.r - shift, src.last.g - shift, src.last.b - shift),
+                 tolerance: 0.03, "chunk 1 darkened by 40/255")
+  }
+
+  func testToneTransformsCountMustMatchChunks() throws {
+    let a = try gradientChunk(name: "a.mp4", frames: 9, from: red, to: blue)
+    let out = tempDir.appendingPathComponent("out-tone-count.mp4").path
+    XCTAssertThrowsError(try DirectorStitcher.stitch(
+      chunkPaths: [a], expectedFrames: [9], fps: 24, width: w, height: h, audio: nil,
+      toneTransforms: [.identity, .identity], outputPath: out))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: out))
+  }
 }

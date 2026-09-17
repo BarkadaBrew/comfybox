@@ -6605,6 +6605,14 @@ public final class WarmServer {
     var previousLastFrame: String? = nil
     var chunkPaths: [String] = []
     var chunkResults: [LTX2VideoResult] = []
+    // Chunk tone match (DirectorToneMatch): chunk k > 0 is matched onto the
+    // stats of chunk k-1's CORRECTED last frame — the carry-over it was
+    // conditioned on — so stabilizeColor's per-render frame-0 lift neither
+    // pops at the seam nor compounds through the carry-over chain. Best
+    // effort: a read/write failure logs and falls back to identity for that
+    // chunk (and an unknown target for the next), never failing the job.
+    var toneTransforms: [ToneTransform] = []
+    var carryTarget: ChannelStats? = nil
 
     for chunk in compilation.chunks {
       let k = chunk.index
@@ -6683,6 +6691,24 @@ public final class WarmServer {
       chunkPaths.append(result.outputPath)
       chunkResults.append(result)
 
+      var tone = ToneTransform.identity
+      if k == 0 {
+        logger.info("Director[\(session)] chunk \(k)/\(n) tone-match \(DirectorToneMatch.describe(tone)) (reference)")
+      } else {
+        if let target = carryTarget {
+          do {
+            let first = try DirectorToneMatch.firstFrameStats(videoPath: result.outputPath)
+            tone = DirectorToneMatch.match(source: first, target: target)
+            logger.info("Director[\(session)] chunk \(k)/\(n) tone-match \(DirectorToneMatch.describe(tone))")
+          } catch {
+            logger.warning("Director[\(session)] chunk \(k)/\(n) tone-match skipped (identity): \(error.localizedDescription)")
+          }
+        } else {
+          logger.warning("Director[\(session)] chunk \(k)/\(n) tone-match skipped (identity): no carry-over stats from chunk \(k - 1)")
+        }
+      }
+      toneTransforms.append(tone)
+
       // Chain: this chunk's last frame is the next chunk's frame-0 keyframe.
       if k < n - 1 {
         let framePath = (dir as NSString).appendingPathComponent(chunk.lastFrameName)
@@ -6690,6 +6716,14 @@ public final class WarmServer {
           previousLastFrame = try LastFrameExtractor.extractLastFrame(from: result.outputPath, to: framePath)
         } catch {
           throw Self.directorChunkError(error, chunk: k, stage: "lastframe")
+        }
+        // Correct the carry-over BEFORE it conditions chunk k+1, and keep its
+        // stats as chunk k+1's match target.
+        do {
+          carryTarget = try DirectorToneMatch.rewritePNG(at: framePath, applying: tone)
+        } catch {
+          carryTarget = nil
+          logger.warning("Director[\(session)] chunk \(k)/\(n) carry-over tone correction failed: \(error.localizedDescription)")
         }
       }
     }
@@ -6765,7 +6799,7 @@ public final class WarmServer {
         chunkPaths: chunkPaths,
         expectedFrames: compilation.chunks.map(\.span.frames),
         fps: fps, width: stitchWidth, height: stitchHeight,
-        audio: pcm, outputPath: resolvedOutput)
+        audio: pcm, toneTransforms: toneTransforms, outputPath: resolvedOutput)
     } catch let error as DirectorError {
       throw error
     } catch {
