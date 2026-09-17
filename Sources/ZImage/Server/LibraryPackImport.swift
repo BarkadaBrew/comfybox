@@ -298,10 +298,44 @@ public enum LibraryPackImporter {
   /// Import a `.soslibrary` (or any zip in that shape). Extraction is
   /// in-process (``LibraryZip``): spawning `ditto` from inside the engine
   /// never returned, and a serving path should not depend on a subprocess.
+  /// macOS privacy protection (TCC) guards ~/Downloads, ~/Desktop and
+  /// ~/Documents. A GUI app gets a prompt; a launchd daemon like this engine
+  /// gets NEITHER a prompt nor an error — the read simply never returns, and
+  /// the import request hangs until the caller gives up (observed 2026-09-17
+  /// on the reference pack: the same file imported in 1.2 s from /tmp).
+  /// So every pack read is probed first, with a deadline, and a path we cannot
+  /// read becomes an error that says what to do about it.
+  static let readProbeSeconds: Double = 5
+
+  static func probeReadable(_ url: URL) throws {
+    let semaphore = DispatchSemaphore(value: 0)
+    var readError: Error?
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let handle = try FileHandle(forReadingFrom: url)
+        _ = try handle.read(upToCount: 4)
+        try handle.close()
+      } catch {
+        readError = error
+      }
+      semaphore.signal()
+    }
+    guard semaphore.wait(timeout: .now() + readProbeSeconds) == .success else {
+      throw LibraryPackError.unreadable(
+        "\(url.path) could not be read within \(Int(readProbeSeconds))s — macOS privacy "
+        + "protection blocks this engine from ~/Downloads, ~/Desktop and ~/Documents. "
+        + "Copy the pack elsewhere (e.g. ~/.comfybox) or grant ComfyBox Full Disk Access.")
+    }
+    if let readError {
+      throw LibraryPackError.unreadable("\(url.path): \(readError.localizedDescription)")
+    }
+  }
+
   @discardableResult
   public static func importPack(
     at packURL: URL, into store: LibraryStore, dryRun: Bool = false
   ) throws -> LibraryPackReport {
+    try probeReadable(packURL)
     let temp = FileManager.default.temporaryDirectory
       .appendingPathComponent("library-pack-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: temp) }
