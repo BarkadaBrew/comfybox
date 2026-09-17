@@ -123,6 +123,8 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeLibraryUpsert(arguments)
       case "library_mark_used":
         return try await executeLibraryMarkUsed(arguments)
+      case "library_import_pack":
+        return try await executeLibraryImportPack(arguments)
       case "library_delete":
         return try await executeLibraryDelete(arguments)
       case "library_collection_upsert":
@@ -1340,6 +1342,15 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
     let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
     let (status, data) = try await client.post("/v1/library/used/\(encoded)", body: Data("{}".utf8))
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  private func executeLibraryImportPack(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let params, let path = params.string("path"), !path.isEmpty else {
+      return MCPToolResult(error: "Error: 'path' is required")
+    }
+    let body = try JSONEncoder().encode(params.raw)
+    let (status, data) = try await client.post("/v1/library/import-pack", body: body)
     return Self.mapHTTPResponse(status: status, data: data)
   }
 

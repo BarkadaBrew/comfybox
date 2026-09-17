@@ -52,7 +52,7 @@ final class ControlSurfaceParityTests: XCTestCase {
   /// /v1/queue/inference-slot, GET/DELETE …/{id}, POST …/{id}/renew) to BOTH
   /// dispatch switches — sync control plane + async arm, five tuples each: 101 → 111,
   /// then → 123 with the Creative Library routes (PRD-creative-library L2).
-  private static let expectedWarmServerTuples = 123
+  private static let expectedWarmServerTuples = 124
   private static let expectedBridgeTuples = 17
 
   private static let repoRoot: URL = {
