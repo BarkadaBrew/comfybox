@@ -1,6 +1,6 @@
 # FDD: "Director" — a timeline editor tab for LTX-2.3 in CoffeeShop Desktop
 
-Status: v1.3 (2026-09-17) — codex-reviewed (v1.1); v1.2 adds Phase 2 regional prompting (§4.6, WP10) adapted from ComfyUI-LTX-BBox-Animator; v1.3 adds audio-driven chunks for long dialogue (§4.7, WP11) and animated GIF export (§4.8, WP12). Requested by Todd: "clone this product as a tab for
+Status: v1.3 (2026-09-17) — codex-reviewed (v1.1); v1.2 adds Phase 2 regional prompting (§4.6, WP10) adapted from ComfyUI-LTX-BBox-Animator; v1.3 adds audio-driven chunks for long dialogue (§4.7, WP11) animated GIF export (§4.8, WP12), and Sequences with presets and AI-assisted drafting (§4.9, WP13–15). Requested by Todd: "clone this product as a tab for
 desktop app and make an FDD for the initiative" — the product being
 [WhatDreamsCost-ComfyUI](https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI), whose
 flagship node **LTX Director 2.0** is "A Complete Timeline Editor For LTX 2.3".
@@ -408,6 +408,142 @@ that. Encoding is CPU-only and does not take the GPU lease, so it runs beside a 
 **MCP.** `export_gif(video_path, start_frame?, end_frame?, fps?, width?)` so Kira and Bree
 can send a GIF instead of an mp4 where a channel prefers it.
 
+### 4.9 Sequences, Sequence presets and AI-assisted drafting (Phase 2, WP13–WP15)
+
+**Todd's direction (2026-09-17).** A user can create, read, update and delete presets for
+video length and any other parameter. The AI-assisted system generates a video from those
+parameters. The Sequence concept already exists but is unused. The product of Director is a
+Sequence, and a Sequence has its own sidecar, the way ComfyUI has JSON workflows.
+
+#### 4.9.1 What exists today
+
+- **Kira's image Sequence.** `Sequence` in coffeeshop-server `src/kira/media-pool/sequence.ts`
+  is an ordered set of stills. It has a shared seed, img2img chaining, consistent elements
+  and a stored record. Nothing in the engine or Director uses it.
+- **Presets.** `PresetStore` (`Sources/ZImage/Server/PresetStore.swift`) already does CRUD
+  over `/v1/presets`. It stores `mediaKind` `"image" | "video"` and a `videoTuning` Tier A
+  block. The desktop edits presets in `PresetView`.
+- **Per-render records.** Every render writes a mandatory JSON sidecar and embeds the same
+  generation record in the mp4's metadata atom (`VideoGenerationRecord`, comfybox#401).
+  `RenderTraceStore` keeps append-only lifecycle traces.
+- **Director's aggregate sidecar.** Director writes one sidecar for the stitched output
+  (`kind: "director"`, `chunk_count`, `recipe_hash`, `stitch_path`).
+- **Workflows.** `WorkflowStore` imports ComfyUI workflow JSON (`/v1/workflows`).
+- **The desktop assistant.** `AgentService` runs on the `assistant` provider (Glimmer). It
+  emits `AgentAction` JSON that drives the Generate view's fields.
+
+#### 4.9.2 The Sequence document (WP13)
+
+A **Sequence** is the saved, replayable product of Director: everything needed to reopen,
+re-render, audit or share a clip. It generalises the Kira image Sequence. `kind: "director"`
+is the new video form, and `kind: "frames"` is reserved for the existing image form.
+
+```jsonc
+{
+  "schema": "comfybox.sequence", "version": 1,
+  "id": "seq_…", "kind": "director", "name": "…",
+  "created_at": "…", "updated_at": "…",
+  "preset": { "id": "…", "name": "…", "snapshot": { /* §4.9.3 fields as resolved */ } },
+  "brief": { "text": "…", "assistant_model": "…", "template_version": "director-author/1" },  // absent when hand-built
+  "timeline": { /* DirectorTimeline v1, unchanged */ },
+  "plan": { "chunks": [ { "index": 0, "start_frame": 0, "frames": 289, "seed": 42,
+                          "recipe_hash": "…", "resolved_config": { } } ] },
+  "assets": [ { "role": "keyframe|audio|reference", "path": "…", "sha256": "…" } ],
+  "audio": { "mode": "generated|imported", "master_path": "…", "master_sha256": "…", "av_sync": [] },
+  "outputs": [ { "kind": "mp4|gif|lastframe|thumb", "path": "…", "sha256": "…", "frames": 385 } ],
+  "engine": { "build_sha": "…", "stitch_path": "reencode", "tone_match": true },
+  "status": [ { "at": "…", "state": "drafted|validated|rendering|succeeded|failed|interrupted" } ]
+}
+```
+
+- **Sidecar.** `<output>.sequence.json` sits next to the stitched mp4, beside the existing
+  generation sidecar. It is written atomically after the mp4, following the comfybox#401 rule.
+- **Embedded like a ComfyUI workflow.** A compact copy (timeline, plan, preset snapshot, no
+  outputs) rides in the mp4 metadata atom under `com.barkadabrew.comfybox.sequence`. Dropping
+  any Director mp4 onto the Director tab, or choosing "Open as Sequence" in the Gallery,
+  reopens the exact timeline, the way dragging a ComfyUI PNG restores its graph.
+- **Replay.** `POST /v1/sequences/render { sequence, reseed?: false }` renders the plan with the
+  recorded seeds and recipe. When `recipe_hash` differs from the current resolver, the response
+  warns `recipe_drift`, so a replay never silently looks different.
+- **Store and catalog.** `GET /v1/sequences`, `GET/PUT/DELETE /v1/sequences/{id}`. The
+  gallery catalog indexes `kind: sequence` so pickers and search find them.
+- **Projects (FDD-director-projects-pickers).** A project render record *is* a Sequence
+  document. `renders/<id>/sequence.json` replaces the separate `timeline.cbdirector` +
+  `plan.json` pair, so one schema serves projects, the gallery and replay.
+- **Kira adoption is out of scope here.** The image Sequence keeps its own store. A later
+  package can write `kind: "frames"` documents so both appear in one catalog.
+
+#### 4.9.3 Sequence presets (WP14)
+
+A **Sequence preset** is a named, user-owned bundle of Director parameters. It extends
+`PresetStore` rather than adding a second store: `mediaKind: "sequence"` with a `sequence`
+block. Every `mediaKind` switch today treats "not video" as image
+(`PresetStore.swift` ~1126, ~1220, ~1343). Those three sites must learn the third kind, and
+tests pin each one.
+
+| Field | Example | Meaning |
+|---|---|---|
+| `length_seconds` or `length_frames` | 10 | Snapped to `1 + 8k` at the preset fps. |
+| `fps` | 24 | |
+| `aspect`, `width`, `height` | 9:16, 576×896 | |
+| `video_preset_id` | a video preset | The render recipe: LoRAs and `videoTuning` (including `color_anchor` and `beat_window_margin`). |
+| `keyframe_policy` | `fflf` \| `every_n_seconds:4` \| `none` | Where the drafter places keyframes. |
+| `keyframe_image_preset_id` | an image preset | Used when the drafter generates keyframe stills. |
+| `segment_cadence_seconds` | 3 | Target prompt-segment length for the drafter. |
+| `audio` | `generated` \| `imported` \| `driven` | `driven` requires a driving clip (§4.7). |
+| `character` | null | As `settings.character`. |
+| `negative_prompt`, `steps`, `seed_policy` | `fixed:42` \| `random` | |
+| `export` | `{ gif: { fps: 12, width: 480 } }` | Defaults for §4.8. |
+| `author_notes` | text | Style guidance handed to the drafter, such as "static camera, slow push-in". |
+
+- **CRUD.** The existing `/v1/presets` routes with `mediaKind: "sequence"` handle it.
+  Validation rejects an unknown `video_preset_id`, a length outside 97–4609 frames after the
+  snap, and `audio: driven` with `keyframe_policy: none` on an i2v-only recipe.
+- **Desktop.** `PresetView` gains a Sequence section with the same list, detail and duplicate
+  flow, and a length slider that shows seconds and snapped frames. Director's toolbar gets a
+  preset picker that applies a preset to the open timeline's settings. Applying it never
+  deletes placed clips. It warns when a clip falls past the new end.
+- **MCP.** `list_sequence_presets`, `upsert_sequence_preset`, `delete_sequence_preset`.
+
+#### 4.9.4 AI-assisted drafting (WP15)
+
+The user gives a **brief** (text, plus optional stills or a voice clip) and picks a Sequence
+preset. The assistant drafts a complete Director timeline that respects every preset
+parameter. The user reviews it on the canvas, then renders.
+
+1. **Template-driven author.** The assistant follows an engine-owned authoring template,
+   `director-author/1`. The template carries the LTX-2.3 prompt practice: one camera line,
+   present-tense action per segment, sound woven into the action, no meta language, and
+   segment prompts that name only what changes. It also carries the preset's constraints as
+   hard rules: exact segment count and boundaries, keyframe slots, length. The template is
+   versioned, and the version is recorded in the Sequence `brief` so drafts are auditable.
+2. **Structured output.** The model returns a `DirectorTimeline` JSON object only. The engine
+   fills everything deterministic itself: frame math, snapping, ids, seeds from the seed
+   policy, and settings from the preset. The model authors prose and keyframe descriptions,
+   never numbers the preset already fixed.
+3. **Validate and repair once.** The draft goes through `/v1/video/director/validate`. Errors
+   go back to the model once with the issue list. A second failure returns the draft with
+   the issues attached for the user to fix, never a silent fallback.
+4. **Keyframes.**
+   - A keyframe slot the brief did not fill gets a still description.
+   - With `keyframe_image_preset_id` set, the drafter renders those stills through the image
+     lane before the video, as separate queued jobs, and places them.
+   - User-supplied stills always win their slot.
+5. **Surfaces.**
+   - Route: `POST /v1/sequences/draft { preset_id, brief, assets? }` returns a Sequence in
+     state `drafted`.
+   - Desktop: a "Draft from brief" sheet on the Director tab, and an `AgentAction`
+     `{ kind: "director_draft" }` so the chat assistant can hand a draft to the tab.
+   - MCP: `draft_sequence`.
+   - Rendering is always a separate, explicit step (`/v1/sequences/render`).
+
+**Validation first.** WP15 rung 1 runs 10 briefs × 2 presets (a 10 s FFLF preset and a 30 s
+every-4 s preset), with no rendering.
+- **Pass:** 20/20 drafts validate within one repair, every draft honours its preset's length,
+  segment count and keyframe slots exactly, and Todd judges ≥ 16/20 prompts usable as
+  written.
+- **Then:** two of those drafts render at the production recipe.
+
 ### 4.5 What this deliberately does not do
 
 - Run or vendor any upstream Python (repo rule: ComfyBox is self-standing Swift/MLX).
@@ -438,6 +574,9 @@ can send a GIF instead of an mp4 where a channel prefers it.
 | WP10 (Phase 2) | Regional prompting (§4.6): `regions` track in the timeline schema; spatiotemporal bias (per-frame interpolated box + soft edge) in `LTX2BeatSchedule`; compiler support incl. chunk-boundary split; wire-level ladder FIRST (two-person static + crossing), then the desktop Regions track | WP2b, WP7 | M (engine) + M (desktop) |
 | WP11 (Phase 2) | Audio-driven chunks (§4.7): `drives_video` flag, pause-snapped chunk boundaries, per-chunk `audio_condition` (mel → audio VAE encode under a keep mask), master-track-only assembly mux, `av_sync[]` probe + `av_sync_drift`; single-chunk ladder FIRST | WP6 (encode parity), WP2d | M (engine) + S (desktop flag + sync readout) |
 | WP12 (Phase 2) | Animated GIF export (§4.8): ImageIO encoder with frame-exact decimation + size-cap step-down, `POST /v1/video/export/gif` (sync ≤ 20 s, job beyond), desktop Export GIF sheet in result view + render strip, `export_gif` MCP tool | WP2d (decode path) | S (engine) + S (desktop) |
+| WP13 (Phase 2) | Sequence document (§4.9.2): schema + `.sequence.json` sidecar, mp4 metadata embed, open-from-mp4, `/v1/sequences` store + replay with `recipe_drift`, catalog `kind: sequence`; project render records adopt it | WP2c | M |
+| WP14 (Phase 2) | Sequence presets (§4.9.3): `mediaKind: "sequence"` in `PresetStore` (+ the three image/video switch sites), validation, PresetView section, Director preset picker, MCP CRUD | WP13 | M |
+| WP15 (Phase 2) | AI-assisted drafting (§4.9.4): `director-author/1` template, structured timeline output, validate-and-repair-once, keyframe still generation via image preset, `/v1/sequences/draft`, desktop "Draft from brief" + `director_draft` AgentAction, MCP `draft_sequence`; 20-draft ladder FIRST | WP13, WP14 | M (engine) + M (desktop) |
 
 Phase 1 = WP1, WP2a–d, WP3, WP4, WP5. It ships a usable Director: FFLF and middle keyframes,
 prompt relay via the beat schedule, long timelines, imported audio, project files, at
@@ -472,6 +611,12 @@ whatever recipe the resolver stack yields (the production config today).
     length, and a 2 s range at 24 fps. Pass = frame count matches the requested range and fps,
     loops in Safari and Messages, under the size cap, no visible banding on skin at the default
     dither.
+11. Sequence round trip (Phase 2, WP13, no GPU): open a rendered Director mp4 by dropping it
+    on the tab. Pass = the timeline, plan seeds and preset snapshot match the sidecar exactly,
+    and a replay reports no `recipe_drift` on an unchanged engine.
+12. AI drafting (Phase 2, WP15 gate): 10 briefs × 2 Sequence presets, no render. Pass = 20/20
+    validate within one repair, presets honoured exactly, ≥ 16/20 prompts usable per Todd;
+    then two drafts rendered at the production recipe.
 
 ## 7. Risks
 
