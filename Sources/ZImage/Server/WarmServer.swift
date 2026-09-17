@@ -2027,6 +2027,9 @@ public final class WarmServer {
     case ("POST", "/v1/library/items"), ("PUT", "/v1/library/items"):
       return libraryUpsertResponse(body: request.body)
 
+    case ("POST", "/v1/library/import-studio-packs"):
+      return libraryImportStudioPacksResponse(body: request.body)
+
     case ("POST", "/v1/library/import-pack"):
       return libraryImportPackResponse(body: request.body)
 
@@ -5043,6 +5046,28 @@ public final class WarmServer {
         status: deleted ? 200 : 404, payload: DeleteResult(success: deleted, id: id, deleted: deleted))
     } catch {
       return .error(.error(status: 500, message: error.localizedDescription))
+    }
+  }
+
+  /// `POST /v1/library/import-studio-packs` — `{dry_run?}`. Migrates every
+  /// installed Studio Pack into the Library (PRD L8): templates become
+  /// templates, the prompt shape becomes a look, the settings become a recipe.
+  private func libraryImportStudioPacksResponse(body: Data) -> RoutedResponse {
+    struct MigrateRequest: Decodable {
+      let dryRun: Bool?
+      enum CodingKeys: String, CodingKey { case dryRun = "dry_run" }
+    }
+    let dryRun = (try? JSONDecoder().decode(MigrateRequest.self, from: body))?.dryRun ?? false
+    do {
+      let report = try LibraryStudioPackImporter.importAll(into: libraryStore, dryRun: dryRun)
+      if !dryRun {
+        auditLog.append(
+          kind: "library.import",
+          message: "Migrated \(report.total) Studio Pack item(s) into the library")
+      }
+      return .json(status: 200, payload: report)
+    } catch {
+      return .error(.error(status: 500, message: "Studio Pack migration failed: \(error.localizedDescription)"))
     }
   }
 

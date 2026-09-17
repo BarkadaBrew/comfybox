@@ -61,6 +61,7 @@ public enum MCPToolRegistry {
     libraryCollectionUpsert.annotated(.additive),
     libraryCollectionDelete.annotated(.destructive),
     libraryImportPack.annotated(.additive),
+    libraryImportStudioPacks.annotated(.additive),
     importLegacyPresets.annotated(.additive),
     queueList.annotated(.readOnly),
     interruptRender.annotated(.destructive),
@@ -1186,6 +1187,20 @@ public enum MCPToolRegistry {
       "required": ["path"],
     ] as [String: Any],
     routes: [RouteRef(method: "POST", path: "/v1/library/import-pack")]
+  )
+
+  static let libraryImportStudioPacks = MCPToolDefinition(
+    name: "library_import_studio_packs",
+    description: """
+      Migrate every installed Studio Pack into the Creative Library: its slot templates become \
+      templates, its prompt prefix/suffix/negative become a look, and its model and LoRA \
+      defaults become a recipe. Idempotent; pass dry_run first to preview.
+      """,
+    inputSchema: [
+      "type": "object",
+      "properties": ["dry_run": ["type": "boolean"]] as [String: Any],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/library/import-studio-packs")]
   )
 
   static let libraryMarkUsed = MCPToolDefinition(
