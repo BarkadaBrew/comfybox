@@ -18,6 +18,9 @@
 //   * `audio` (48 kHz stereo PCM from DirectorAudioMixer) is muxed as AAC
 //     through LTX2PostProcess.makeAudioSampleBuffers, trimmed to
 //     ceil(frameCount / fps * sr) samples;
+//   * `toneTransforms` (optional, one per chunk; see DirectorToneMatch)
+//     applies chunk k's exposure match to every frame written from chunk k;
+//     nil (the default) and identity entries write the decoded frames as-is;
 //   * output dims are `width` x `height`; the writer scales appended buffers,
 //     so a chunk encoded at other dims is resampled, not rejected — callers
 //     should pass the chunks' real encoded dims (delivery downscale applies).
@@ -64,6 +67,7 @@ public enum DirectorStitcher {
     height: Int,
     audio: StereoPCM?,
     bitsPerPixel: Double? = nil,
+    toneTransforms: [ToneTransform]? = nil,
     outputPath: String
   ) throws -> StitchResult {
     guard !chunkPaths.isEmpty else { throw DirectorError.stitchFailed("no chunks to stitch") }
@@ -72,6 +76,9 @@ public enum DirectorStitcher {
     }
     guard fps > 0, width > 0, height > 0 else {
       throw DirectorError.stitchFailed("invalid fps/width/height \(fps)/\(width)/\(height)")
+    }
+    if let toneTransforms, toneTransforms.count != chunkPaths.count {
+      throw DirectorError.stitchFailed("toneTransforms (\(toneTransforms.count)) and chunkPaths (\(chunkPaths.count)) differ")
     }
 
     // MARK: Verify every chunk before touching the output.
@@ -168,7 +175,7 @@ public enum DirectorStitcher {
       audioInput = ai
     }
 
-    let source = SequentialFrameSource(paths: chunkPaths, expected: expectedFrames)
+    let source = SequentialFrameSource(paths: chunkPaths, expected: expectedFrames, toneTransforms: toneTransforms)
 
     guard writer.startWriting() else {
       throw DirectorError.stitchFailed(writer.error?.localizedDescription ?? "startWriting failed")
@@ -312,19 +319,28 @@ public enum DirectorStitcher {
   }
 
   /// Walks the chunks in order, decoding to BGRA and skipping the first
-  /// frame of every chunk after the first. Not thread-safe; driven from the
-  /// single video append queue.
+  /// frame of every chunk after the first, and applying chunk k's tone
+  /// transform (when given and not identity) to its frames in place. Not
+  /// thread-safe; driven from the single video append queue.
   private final class SequentialFrameSource {
     private let paths: [String]
     private let expected: [Int]
+    private let toneTransforms: [ToneTransform]?
     private var chunk = 0
     private var reader: AVAssetReader?
     private var output: AVAssetReaderTrackOutput?
     private var producedInChunk = 0
 
-    init(paths: [String], expected: [Int]) {
+    init(paths: [String], expected: [Int], toneTransforms: [ToneTransform]? = nil) {
       self.paths = paths
       self.expected = expected
+      self.toneTransforms = toneTransforms
+    }
+
+    /// The non-identity transform for the current chunk, if any.
+    private var currentTransform: ToneTransform? {
+      guard let toneTransforms, chunk < toneTransforms.count, !toneTransforms[chunk].isIdentity else { return nil }
+      return toneTransforms[chunk]
     }
 
     func next() throws -> CVPixelBuffer? {
@@ -336,6 +352,7 @@ public enum DirectorStitcher {
           producedInChunk += 1
           // Drop the carry-over copy of the previous chunk's last frame.
           if chunk > 0, producedInChunk == 1 { continue }
+          if let transform = currentTransform { try Self.apply(transform, to: pb, chunk: chunk) }
           return pb
         }
         guard reader.status == .completed else {
@@ -364,7 +381,8 @@ public enum DirectorStitcher {
       let o = AVAssetReaderTrackOutput(
         track: track,
         outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
-      o.alwaysCopiesSampleData = false
+      // A transformed chunk mutates the decoded buffer, so it must own it.
+      o.alwaysCopiesSampleData = currentTransform != nil
       r.add(o)
       guard r.startReading() else {
         throw DirectorError.stitchFailed("chunk \(chunk) unreadable: \(r.error?.localizedDescription ?? "startReading failed")")
@@ -372,6 +390,21 @@ public enum DirectorStitcher {
       reader = r
       output = o
       producedInChunk = 0
+    }
+
+    private static func apply(_ transform: ToneTransform, to pb: CVPixelBuffer, chunk: Int) throws {
+      guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+            CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else {
+        throw DirectorError.stitchFailed("chunk \(chunk) tone transform: decoded buffer is not a lockable BGRA buffer")
+      }
+      defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+      guard let base = CVPixelBufferGetBaseAddress(pb) else {
+        throw DirectorError.stitchFailed("chunk \(chunk) tone transform: no base address")
+      }
+      transform.apply(
+        buffer: base.assumingMemoryBound(to: UInt8.self),
+        width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb),
+        bytesPerRow: CVPixelBufferGetBytesPerRow(pb), format: .bgra)
     }
 
     func close() {
