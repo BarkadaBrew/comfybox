@@ -780,8 +780,17 @@ struct ComfyBoxDesktopApp: App {
             engine.connect()
         }
 
-        healthMonitor.watchedServices =
-            settings.watchedServices ?? DesktopSettings.defaultWatchedServices
+        if let saved = settings.watchedServices {
+            let migrated = DesktopSettings.migratingRetiredServices(saved)
+            if migrated != saved {
+                var s = DesktopSettings.load()
+                s.watchedServices = migrated
+                s.save()
+            }
+            healthMonitor.watchedServices = migrated
+        } else {
+            healthMonitor.watchedServices = DesktopSettings.defaultWatchedServices
+        }
         healthMonitor.startMonitoring()
     }
 
