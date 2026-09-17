@@ -1,6 +1,6 @@
 # FDD: "Director" — a timeline editor tab for LTX-2.3 in CoffeeShop Desktop
 
-Status: v1.3 (2026-09-17) — codex-reviewed (v1.1); v1.2 adds Phase 2 regional prompting (§4.6, WP10) adapted from ComfyUI-LTX-BBox-Animator; v1.3 adds audio-driven chunks for long dialogue (§4.7, WP11) animated GIF export (§4.8, WP12), and Sequences with presets and AI-assisted drafting (§4.9, WP13–15), and agent access through API, MCP and a skill (§4.9.5, WP16). Requested by Todd: "clone this product as a tab for
+Status: v1.3 (2026-09-17) — codex-reviewed (v1.1); v1.2 adds Phase 2 regional prompting (§4.6, WP10) adapted from ComfyUI-LTX-BBox-Animator; v1.3 adds audio-driven chunks for long dialogue (§4.7, WP11) animated GIF export (§4.8, WP12), and Sequences with presets and AI-assisted drafting (§4.9, WP13–15), and agent access through API, MCP and a skill (§4.9.5, WP16); v1.4 adds Phase 3 Programs, long-form video on request with no human in the loop (§4.10, WP17–WP22). Requested by Todd: "clone this product as a tab for
 desktop app and make an FDD for the initiative" — the product being
 [WhatDreamsCost-ComfyUI](https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI), whose
 flagship node **LTX Director 2.0** is "A Complete Timeline Editor For LTX 2.3".
@@ -596,6 +596,221 @@ truth, so no layer carries logic another layer lacks.
 - Bree lists and drafts through the proxy with no daemon code change.
 - The skill-template version test is green.
 
+### 4.10 Programs — long-form video on request (Phase 3, WP17–WP22)
+
+**Todd's direction (2026-09-17).** "I ask Claude or Bree for a 12 minute video, then I get a
+12 minute video after it is created and verified." An AI cannot operate Resolve or any
+manual editor. "This is the most powerful element. No meat in the middle."
+
+**Principle: no human between the ask and the delivery.** Every step that a person does in an
+editing suite is either automated with a measurable pass/fail check or removed. The requester
+is asked a question only before work starts (§4.10.2), never during it. A Program either
+delivers a verified video or delivers a report saying exactly what failed. It never waits
+silently for a human.
+
+#### 4.10.1 Scale
+
+| Quantity | 12 min at 24 fps |
+|---|---|
+| Frames | 17,280 |
+| Director ceiling per Sequence | 4,609 frames, about 3.2 min |
+| Chunks at ≤ 289 frames | about 60 |
+| GPU at the production recipe (about 25 min per chunk) | about 25 h, before retries |
+
+A Program is therefore a multi-day-capable job, not a render. Durability (WP9), scheduling and
+honest time estimates are requirements, not polish.
+
+#### 4.10.2 Flow
+
+1. **Ask.** The agent (Bree, Claude, or Kira's chat side) calls `request_program` with the
+   brief, the target duration and an optional Sequence preset. The engine returns an **estimate**
+   before any GPU work: shot count, chunk count, GPU hours, earliest finish time given the
+   current queue and admission state, and disk needed. The agent relays the estimate. A
+   request under the requester's standing budget (§4.10.6) starts without a question.
+   Anything over budget asks once, then runs.
+2. **Plan.** The planner, an LLM on the `assistant` provider following the versioned template
+   `program-planner/1`, writes the **Program document** (§4.10.3):
+   - A logline and a scene list.
+   - A shot list whose durations sum exactly to the target. The engine enforces the sum and
+     rebalances durations, never the model.
+   - A **bible** of the elements held constant across shots: characters, wardrobe, settings,
+     look, and the lens and lighting vocabulary.
+   - The narration script, timed per scene.
+   - The music plan.
+   
+   The plan is validated structurally before any render. That covers durations, the chunk
+   count per shot, bible references, and a script whose reading time fits its scenes.
+3. **Reference stills.** Before any video, the bible's characters and settings are rendered as
+   reference stills through the preset's image lane. The best of N is chosen by a vision check
+   against the bible text. Every shot's keyframes derive from these stills, so continuity is
+   anchored in pixels, not only in words.
+4. **Narration.** The script is voiced once through the voice lane into a single master track
+   per scene. Shots that carry narration become audio-driven Sequences (§4.7): boundaries snap to
+   pauses, each chunk conditions on its slice, and assembly muxes the untouched master.
+5. **Shots.** Each shot is drafted as a Sequence (§4.9.4) from the shot list, the bible and its
+   reference stills. Each draft is validated, then rendered through the normal queue. Shots
+   render in dependency order: a shot that continues the previous shot's last frame waits for
+   it, and independent shots can queue in any order.
+6. **Verify each shot** (§4.10.4). A failing shot takes the retry ladder. A passing shot is
+   frozen, and its Sequence version is pinned in the Program.
+7. **Assemble** (§4.10.5). This is automatic, rule-driven and engine-side.
+8. **Verify the whole program** (§4.10.4). It either passes or goes back to the retry ladder for
+   the offending shots.
+9. **Deliver.** The agent sends the video (or a link when the file is too large for the channel)
+   plus a delivery report: runtime, shots, retries, GPU hours used, anything flagged, and
+   the Program id for replay.
+
+#### 4.10.3 The Program document
+
+A Program is to Sequences what a Sequence is to chunks: a replayable sidecar.
+`<output>.program.json` sits next to the final mp4, and a compact copy rides in the mp4
+metadata atom (`com.barkadabrew.comfybox.program`).
+
+```jsonc
+{
+  "schema": "comfybox.program", "version": 1,
+  "id": "prg_…", "requested_by": "bree|claude|kira|desktop", "brief": "…",
+  "target_seconds": 720, "preset_id": "…",
+  "estimate": { "shots": 64, "chunks": 60, "gpu_hours": 25.1, "finish_by": "…" },
+  "planner": { "model": "…", "template_version": "program-planner/1" },
+  "bible": { "characters": [ { "id": "c1", "text": "…", "reference_stills": ["…"] } ],
+             "settings": [ … ], "look": "…" },
+  "scenes": [ { "id": "s1", "summary": "…", "narration": { "text": "…", "master_path": "…" },
+                "shots": [ { "id": "s1.1", "seconds": 9.0, "intent": "…", "bible_refs": ["c1"],
+                             "continues_from": null, "sequence_id": "seq_…", "sequence_version": 2,
+                             "verdicts": [ … ], "attempts": 2 } ] } ],
+  "music": { "source": "library|none", "path": "…", "gain_db": -18, "duck_under_narration": true },
+  "edit": { "transitions": [ { "after": "s1.3", "kind": "cut|crossfade|dip", "frames": 12 } ] },
+  "outputs": [ { "kind": "mp4|gif|report", "path": "…", "sha256": "…" } ],
+  "state": "estimating|planning|references|narration|shots|assembling|verifying|delivered|failed|cancelled",
+  "ledger": [ { "at": "…", "event": "…", "detail": { } } ]
+}
+```
+
+Every state change is appended to `ledger`, and the ledger is what resume reads (§4.10.6).
+
+#### 4.10.4 Verification gates
+
+Every gate is automated and records a verdict with its evidence. A verdict with no evidence
+fails.
+
+**Per shot**
+
+| Gate | Check | Evidence |
+|---|---|---|
+| Structural | Frame count equals the plan exactly, fps, dims, an audio track present and as long as the video | ffprobe-equivalent AVAsset read |
+| Render health | No NaN or black frames, no frozen run longer than 1 s unless the shot intent says static, exposure step between chunks under the tone-match threshold | per-frame luma and diff stats (the seam metrics used on ladder rung 2) |
+| Prompt adherence | A vision model scores sampled frames (1 per second plus every segment boundary) against the shot intent and its segment prompts | per-sample score, threshold set by ladder |
+| Continuity | Bible characters match their reference stills, and a shot that continues another matches its predecessor's last frame | face/appearance similarity against the reference stills, last-to-first frame diff |
+| Audio | `av_sync[]` within ±80 ms for driven shots, no clipping, no click at internal splices | §4.7 sync probe, sample-jump detector |
+
+**Whole program**
+
+| Gate | Check |
+|---|---|
+| Runtime | Within ±0.5 s of the target |
+| Joins | No click or level step at any shot boundary. Transition frames exactly as planned. |
+| Loudness | Integrated loudness at the delivery target (−16 LUFS stereo), true peak ≤ −1 dBTP, narration intelligible over music (ducking verified) |
+| Coverage | Every scene and every narration line present, in order |
+| Final read | A vision-model pass over a contact sheet (one frame every 5 s) against the logline and scene list. A flag here names the shots involved. |
+
+**Retry ladder** (per failing shot, stops at the first rung that passes)
+1. **Reseed.** The same draft with a new seed, up to 2 attempts.
+2. **Re-draft.** The drafter rewrites the shot with the verdict evidence in context, then up to
+   2 renders.
+3. **Simplify.** The shot intent is reduced (static camera, fewer segment changes, shorter
+   duration borrowed from a neighbouring shot so the total holds), then 1 render.
+4. **Flag.** The best-scoring attempt is kept and marked `flagged` in the report. The program
+   still assembles. A Program never blocks delivery on one shot unless the requester set
+   `strict: true`.
+
+Retries count against the GPU budget (§4.10.6). When the budget is exhausted, remaining failing
+shots go straight to Flag.
+
+#### 4.10.5 Automatic assembly
+
+- **Edit decision list.** The edit is data in `edit`, derived by rule from the plan, never hand-built:
+  - A cut is the default.
+  - A crossfade (12 frames) is used at scene changes.
+  - A dip to black (24 frames) is used at act breaks, when the planner marks one.
+  - `continues_from` shots are always butt-joined. Their shared frame is dropped, as Director
+    chunks do.
+- **Picture.** Shots are referenced by their pinned Sequence versions. Plain cuts use an
+  `AVMutableComposition` passthrough. Only transition regions re-encode, with tone matching
+  across every join (`DirectorToneMatch`).
+- **Audio.**
+  - **Beds.** Native LTX audio stays linked to its shot as the ambience bed.
+  - **Narration** masters are placed at their scene offsets and override the beds of driven shots.
+  - **Music** comes from a library file or is absent. Music generation is out of scope until a
+    local music model exists. It ducks under narration.
+  - **Joins.** Every audio join gets a 10 ms equal-power crossfade, so a click is impossible by
+    construction.
+- **No external tools.** Encoding uses AVFoundation only (repo rule). Output is H.264 or HEVC
+  with AAC. The GIF and thumbnail exports (§4.8) are produced from the final program.
+
+#### 4.10.6 Execution: durable, budgeted, schedulable
+
+- **Durable (WP9 is a hard prerequisite).**
+  - The Program is a persisted state machine. The ledger is written before and after every step.
+  - After an engine or daemon restart, the Program resumes at the first unfinished step. A
+    finished shot is never re-rendered, and an interrupted shot restarts from its last
+    finished chunk.
+- **Budget.**
+  - Each requester has a standing budget in config: `max_gpu_hours` per Program and `finish_by`
+    tolerance.
+  - The estimate is checked against it before work starts, and live spend is checked
+    after every shot.
+- **Schedule.**
+  - Program renders go through the normal queue in a `program` owner lane under the QoS credit
+    governor (#1485), so interactive work still preempts.
+  - A declared soak or `local` admission pauses Program rendering. Planning, reference
+    selection and verification can continue.
+  - The agent is told the new finish estimate whenever it moves by more than 1 h.
+- **Cancel.** `cancel_program` stops at the next step boundary and keeps every finished artifact.
+- **Progress.** `program_status` returns the state, shots done and total, GPU hours spent and
+  the estimate, the current step, and flags so far. Bree can answer "how's my video going" from
+  it.
+
+#### 4.10.7 Agent access
+
+The same three layers as §4.9.5, with the engine as the only place work happens.
+- **API.**
+  - Routes: `POST /v1/programs` (estimate, then start), `GET /v1/programs/{id}`,
+    `POST /v1/programs/{id}/cancel`, `GET /v1/programs`.
+  - `POST /v1/programs/{id}/resume` is for an operator after a hard failure. Normal resume is
+    automatic.
+- **MCP:** `request_program(brief, target_seconds, preset_id?, strict?)` returns the estimate and
+  the Program id. Also `program_status(id)`, `cancel_program(id)` and `list_programs()`.
+- **Skill:** the `comfybox-director` skill gains a Programs section.
+  - Relay the estimate honestly before starting.
+  - Never promise a finish time the estimate does not support.
+  - Poll sparingly: on state changes, not on a timer.
+  - Deliver with the report, and surface flagged shots plainly instead of calling the video
+    perfect.
+- **Delivery channels:** Bree through Telegram (file or link), Claude through the session.
+  The report is always attached.
+
+#### 4.10.8 Validation ladder (Phase 3)
+
+Each rung must pass before the next starts, at the production recipe.
+1. **Program dry run (no GPU).** 5 briefs at 1, 3 and 12 min.
+   - **Pass:** every plan validates, durations sum exactly, and estimates are within 15% of
+     the arithmetic.
+   - **Also:** Todd reads 2 plans and judges them coherent.
+2. **1-minute Program** end to end from a Bree request, including narration.
+   - **Pass:** delivered without human input, all gates recorded with evidence, runtime
+     ±0.5 s, no join click, and Todd's read.
+3. **Kill test.** Restart the engine and the daemon mid-shot during a 3-minute Program.
+   - **Pass:** it resumes, no finished shot re-renders, the final output matches the ledger,
+     and the delivery report lists the interruption.
+4. **Verification honesty.** Inject a known-bad shot (wrong prompt).
+   - **Pass:** the adherence gate fails it, the retry ladder runs, and the report names it.
+     A gate that passes a known-bad shot fails the rung.
+5. **12-minute Program** requested by Claude.
+   - **Pass:** delivered verified within the estimate +20%, with flagged shots ≤ 5% of shots
+     and each one named in the report.
+   - **Also:** Todd watches it end to end.
+
 ### 4.5 What this deliberately does not do
 
 - Run or vendor any upstream Python (repo rule: ComfyBox is self-standing Swift/MLX).
@@ -630,10 +845,22 @@ truth, so no layer carries logic another layer lacks.
 | WP14 (Phase 2) | Sequence presets (§4.9.3): `mediaKind: "sequence"` in `PresetStore` (+ the three image/video switch sites), validation, PresetView section, Director preset picker, MCP CRUD | WP13 | M |
 | WP15 (Phase 2) | AI-assisted drafting (§4.9.4): `director-author/1` template, structured timeline output, validate-and-repair-once, keyframe still generation via image preset, `/v1/sequences/draft`, desktop "Draft from brief" + `director_draft` AgentAction; 20-draft ladder FIRST | WP13, WP14 | M (engine) + M (desktop) |
 | WP16 (Phase 2) | Agent access (§4.9.5): api-notes "Sequences" contract, coffeeshop-server `director-client.ts`, full MCP tool set as thin wrappers, `comfybox-director` skill generated from `director-author/1` with a version-lock test | WP13–WP15 | S (engine MCP) + S (client) + S (skill) |
+| WP17 (Phase 3) | Program document + planner (§4.10.2–3): `program-planner/1` template, bible, exact-duration shot list with engine-side rebalancing, estimate (shots/chunks/GPU h/finish-by), structural plan validation; dry-run ladder rung 1 FIRST | WP13–WP16 | M |
+| WP18 (Phase 3) | Reference stills + narration (§4.10.2 steps 3–4): best-of-N reference stills with vision check against the bible, per-scene narration masters via the voice lane, audio-driven shots | WP17, WP11 | M |
+| WP19 (Phase 3) | Verification gates + retry ladder (§4.10.4): per-shot and whole-program gates with recorded evidence, reseed → re-draft → simplify → flag, budget-aware | WP17 | L |
+| WP20 (Phase 3) | Automatic assembly (§4.10.5): rule-derived EDL, composition passthrough + transition-only re-encode with tone match, beds/narration/music mix with ducking and equal-power joins, loudness normalisation, final exports | WP17, WP12 | M |
+| WP21 (Phase 3) | Durable execution (§4.10.6): persisted Program state machine + ledger resume, `program` QoS lane, budgets, soak/admission awareness, cancel, progress | WP9, WP17 | M |
+| WP22 (Phase 3) | Agent access + delivery (§4.10.7): `/v1/programs` routes, MCP tools, skill Programs section, Bree Telegram delivery with report; ladder rungs 2–5 | WP17–WP21 | M |
 
 Phase 1 = WP1, WP2a–d, WP3, WP4, WP5. It ships a usable Director: FFLF and middle keyframes,
 prompt relay via the beat schedule, long timelines, imported audio, project files, at
 whatever recipe the resolver stack yields (the production config today).
+
+Phase 3 = WP17–WP22, **Programs**: long-form video on request, planned, rendered,
+verified, assembled and delivered by the engine with no human in the loop (§4.10). It
+depends on Phase 2's Sequences, presets, drafting, agent access (WP13–WP16), audio-driven
+chunks (WP11), GIF export (WP12) and durable jobs (WP9). Its ladder (§4.10.8) runs 1-minute
+before 3-minute before 12-minute.
 
 ## 6. Validation ladder (each rung a real render, Todd's read, same seed where possible)
 
@@ -690,6 +917,15 @@ whatever recipe the resolver stack yields (the production config today).
 - **Pause snapping can fail on continuous speech.** A breathless 12 s sentence has no pause
   inside a chunk's reach. The boundary then falls mid-word with a warning, and the pre-roll
   guard band is the only mitigation.
+- **Programs amplify every weakness.** A defect that shows once in a 10 s clip shows sixty
+  times in a 12-minute Program. Phase 3 does not start until the Phase 2 ladders pass, and
+  §4.10.8 climbs 1 → 3 → 12 minutes.
+- **Automated judges can be wrong both ways.** A vision gate that passes bad shots delivers a
+  bad film unseen. One that fails good shots burns GPU on retries. Rung 4 (a known-bad shot)
+  is mandatory, and every verdict carries its evidence so the report can be audited.
+- **Throughput.** About 25 GPU hours per 12 minutes means one long Program a day at most,
+  competing with the soak and Kira. Budgets, the `program` lane and honest estimates keep the
+  request from silently starving other work.
 - **Non-durable jobs in Phase 1.** A daemon or engine restart mid-render loses the Director
   job like it loses a Motion job today. WP9 closes it.
 - **SwiftUI timeline UI is the largest desktop view yet.** Keep the model pure and tested;
