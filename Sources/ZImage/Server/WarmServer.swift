@@ -10808,6 +10808,30 @@ private actor WarmServerCoordinator {
       }
     }
 
+    // FDD-glimmer-gpu-slot: the yield was for Glimmer inference slots, not an
+    // image job. Park the checkpoint with the video weights still resident
+    // (inference needs GPU compute, not the video's memory — no evict, no
+    // reload) until every slot is released, then resume exactly as below.
+    if inferenceHold.takeRequest() {
+      logger.info("inference hold: video checkpointed at chunk \(state.chunkIndex), phase \(state.phase.rawValue), step \(state.stepIndex) — GPU yielded to \(inferenceSlots.activeSlots().count) inference slot(s); weights stay resident")
+      if let jobId = activeJobId {
+        lifecycleLedger.record(
+          jobId: jobId, kind: .checkpointed, jobKind: QueueJobKind.video.rawValue,
+          step: state.stepIndex, chunk: state.chunkIndex, reason: "inference-hold")
+      }
+      publishHealth()
+      await inferenceSlots.waitUntilFree()
+      inferenceHold.unpark()
+      let disposition = LTX2PreemptionEpisode.disposition(videoInterrupted: Task.isCancelled)
+      clearEpisodeState(abandoned: disposition == .abandonVideo)
+      if disposition == .abandonVideo {
+        logger.info("inference hold: video interrupted while parked — checkpoint dropped, no resume.")
+        throw CancellationError()
+      }
+      logger.info("inference hold released — resuming LTX-2 video")
+      return try await resumeCheckpointedVideo(state: state, wantsAudio: wantsAudio, report: report)
+    }
+
     guard let claimed = pendingPreemptorBox.claim() else {
       // The checkpoint-fallback watchdog already handled this preemptor (it
       // raced ahead of the yield, or the render finished on its own before
@@ -17173,8 +17197,9 @@ func localVideoCatchOutcome(for error: Error) -> LocalVideoCompletionOutcome? {
 /// that directory, and the LIVE engine's are not the test's to touch.
 final class WarmServerQueueProbe: @unchecked Sendable {
   private let coordinator: WarmServerCoordinator
-  /// FDD-glimmer-gpu-slot: the probe's own slot table, wired to the coordinator.
+  /// FDD-glimmer-gpu-slot: the probe's own slot table + hold, wired to the coordinator.
   let inferenceSlots = InferenceSlotTable()
+  let inferenceHold = InferenceHold()
   private let liveHealth = LiveHealthState()
   /// comfybox#283/#217: same `COMFYBOX_STATE_DIR` override every other piece
   /// of this probe's state honors (see `stateDirectory`'s doc comment on
@@ -17216,7 +17241,7 @@ final class WarmServerQueueProbe: @unchecked Sendable {
       preemptionInFlight: LockedFlag(),
       pendingPreemptorBox: PendingPreemptorBox(),
       lifecycleLedger: lifecycleLedger,
-      inferenceSlots: inferenceSlots)
+      inferenceSlots: inferenceSlots, inferenceHold: inferenceHold)
     let coordinatorForSlots = self.coordinator
     inferenceSlots.onEmpty = { Task { await coordinatorForSlots.wakeAfterInferenceRelease() } }
   }
