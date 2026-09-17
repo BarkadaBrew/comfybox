@@ -29,6 +29,71 @@ final class LTX2AudioEnhanceTests: XCTestCase {
     XCTAssertLessThanOrEqual(ch.map(abs).max()!, 0.9, "ceiling holds — no digital clipping")
   }
 
+  // MARK: content-aware bed level (Todd 2026-09-17)
+
+  /// A faint room tone with no spoken line used to be raised to the speech
+  /// target: the ladder measured a bed at -21 dBFS with a low hum. As a bed it
+  /// must never be raised at all.
+  func testAmbienceBedIsNeverRaised() {
+    let bed = sine(440, seconds: 1.0, rate: 48000, amp: 0.02)   // ~-34 dBFS
+    let stereo = MLXArray(bed + bed).reshaped([2, bed.count])
+    let speech = LTX2AudioEnhance.process(stereo, sampleRate: 48000)[0].asArray(Float.self)
+    let ambience = LTX2AudioEnhance.process(
+      stereo, sampleRate: 48000, content: .ambience)[0].asArray(Float.self)
+    XCTAssertGreaterThan(rms(speech) / rms(bed), 2.0, "speech target still raises a quiet track")
+    XCTAssertLessThanOrEqual(rms(ambience) / rms(bed), 1.0, "a bed is never boosted")
+    XCTAssertLessThan(rms(ambience), rms(speech), "the bed lands well below the speech target")
+  }
+
+  /// A loud bed still comes down to the bed target, not the speech target.
+  func testLoudAmbienceBedIsBroughtDownToTheBedTarget() {
+    let loudBed = sine(440, seconds: 1.0, rate: 48000, amp: 0.3)  // ~-13 dBFS
+    let stereo = MLXArray(loudBed + loudBed).reshaped([2, loudBed.count])
+    let out = LTX2AudioEnhance.process(
+      stereo, sampleRate: 48000, content: .ambience, bedTargetDB: -32)[0].asArray(Float.self)
+    let db = 20 * log10(rms(out))
+    XCTAssertEqual(db, -32, accuracy: 1.5, "bed lands on its target")
+  }
+
+  /// The hum the model puts under a bed is filtered harder than under speech.
+  /// Measured as the 120 Hz level RELATIVE to a 1 kHz reference in the same
+  /// track, so each path's loudness gain cancels out.
+  func testBedCutsLowHumHarderThanSpeech() {
+    let mix = zip(
+      sine(120, seconds: 1.0, rate: 48000, amp: 0.2),
+      sine(1000, seconds: 1.0, rate: 48000, amp: 0.2)
+    ).map(+)
+    let stereo = MLXArray(mix + mix).reshaped([2, mix.count])
+    func humOverMid(_ x: [Float]) -> Float {
+      // Goertzel magnitude at one frequency.
+      func mag(_ hz: Float) -> Float {
+        let w = 2 * Float.pi * hz / 48000
+        let coeff = 2 * cos(w)
+        var s1: Float = 0, s2: Float = 0
+        for v in x { let s0 = v + coeff * s1 - s2; s2 = s1; s1 = s0 }
+        return sqrt(s1 * s1 + s2 * s2 - coeff * s1 * s2)
+      }
+      return mag(120) / mag(1000)
+    }
+    let speech = LTX2AudioEnhance.process(stereo, sampleRate: 48000)[0].asArray(Float.self)
+    let ambience = LTX2AudioEnhance.process(
+      stereo, sampleRate: 48000, content: .ambience)[0].asArray(Float.self)
+    XCTAssertLessThan(
+      humOverMid(ambience), humOverMid(speech) * 0.75,
+      "a bed keeps at least ~2.5 dB less 120 Hz hum relative to the midrange")
+  }
+
+  func testQuotedLineDecidesSpeechVersusBed() {
+    XCTAssertEqual(
+      LTX2AudioEnhance.contentOfPrompt("She looks up and says, \"Todd, today was so good.\""),
+      .speech)
+    XCTAssertEqual(
+      LTX2AudioEnhance.contentOfPrompt("A quiet cafe, a faint espresso hiss."), .ambience)
+    XCTAssertEqual(
+      LTX2AudioEnhance.contentOfPrompt("She holds a sign reading \"open\"."), .ambience,
+      "a single quoted word is a sign, not dialogue")
+  }
+
   func testLoudTrackIsNotBoostedIntoTheCeiling() {
     let loud = sine(440, seconds: 1.0, rate: 48000, amp: 0.6)
     let stereo = MLXArray(loud + loud).reshaped([2, loud.count])
