@@ -95,6 +95,11 @@ Projects live under the desktop output directory (`DesktopSettings.outputDirecto
 | Export `.cbdirector` | Existing Save As with "Embed assets" (`DirectorView.saveDocument`). |
 | Import `.cbdirector` | Creates a project around it. Referenced files stay referenced. |
 
+> **Aligned with Director FDD §4.9.2 (Sequence document, WP13).** When WP13 lands, a render
+> record is a Sequence document: `renders/<id>/sequence.json` replaces the separate
+> `timeline.cbdirector` + `plan.json` snapshot, and the mp4 carries the embedded copy. Until
+> then the layout above stands.
+
 ### 2.4 Render history and compare
 
 A **Renders** strip under the player shows cards newest first, each with a poster, status dot, v-name, seed, chunks, elapsed time and rating.
