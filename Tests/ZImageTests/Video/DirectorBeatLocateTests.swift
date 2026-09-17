@@ -60,9 +60,10 @@ final class DirectorBeatLocateTests: XCTestCase {
       let beats = try XCTUnwrap(req.beatSchedule)
       XCTAssertFalse(beats.isEmpty)
       let full = tok.tokenize(req.prompt)
-      // Resolved ranges index the LEFT-PADDED axis (Gemma pads at the start).
+      // Resolved ranges are FRONT-indexed: the connector moves valid tokens
+      // to the front ahead of cross-attention.
       let maxLength = 1024
-      let padOffset = max(0, maxLength - full.count)
+      let padOffset = 0
       var dropped: [String] = []
       let resolved = LTX2BeatScheduleLocator.locate(
         beats: beats,

@@ -133,7 +133,13 @@ public enum LTX2BeatScheduleLocator {
     tokenize: (String) -> [Int]
   ) -> [LTX2ResolvedBeat] {
     let truncatedLen = min(fullPromptTokenIds.count, maxLength)
-    let padOffset = max(0, maxLength - fullPromptTokenIds.count)
+    // Columns are FRONT-indexed. The tokenizer left-pads to `maxLength`, but
+    // every LTX-2 connector (128 learnable registers) moves the valid tokens
+    // to the front and fills the tail with registers before cross-attention
+    // sees them (`LTX2Connector1D.replacePaddedWithRegisters`, upstream
+    // `_replace_padded_with_registers`). Adding the left-pad offset here put
+    // every beat's bias on register columns, so the relay barely steered and
+    // prompt switches landed seconds late (Director ladder R3).
     // Standalone-encode special-token prefix (Gemma: [2] — BOS). Empty for
     // tokenizers that add nothing (e.g. the test fakes).
     //
@@ -200,8 +206,8 @@ public enum LTX2BeatScheduleLocator {
       }
       let clampedEnd = min(localEnd, truncatedLen)
       resolved.append(LTX2ResolvedBeat(
-        tokenStart: padOffset + localStart,
-        tokenEnd: padOffset + clampedEnd,
+        tokenStart: localStart,
+        tokenEnd: clampedEnd,
         startFrac: startFrac,
         endFrac: endFrac,
         strength: beat.strength ?? 1.0))

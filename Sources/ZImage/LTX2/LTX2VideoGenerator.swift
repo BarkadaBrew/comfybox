@@ -1543,7 +1543,7 @@ public final class LTX2VideoGenerator {
                 tokenize: { tokenizer.untruncatedTokenIds(prompt: $0) })
         }()
         if !resolvedBeats.isEmpty {
-            logger.info("[LTX2] beat_schedule: \(resolvedBeats.count)/\(request.beatSchedule?.count ?? 0) beat(s) located.")
+            logger.info("[LTX2] beat_schedule: \(resolvedBeats.count)/\(request.beatSchedule?.count ?? 0) beat(s) located, token columns \(resolvedBeats.map { "\($0.tokenStart)..<\($0.tokenEnd)@\($0.startFrac)-\($0.endFrac)" }.joined(separator: " ")).")
         }
 
         segmentStart = CFAbsoluteTimeGetCurrent()
