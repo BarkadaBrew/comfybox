@@ -108,6 +108,9 @@ public final class AgentService {
     public var messages: [AgentMessage] = []
     public var isThinking = false
     public var lastError: String?
+    /// FDD-glimmer-gpu-slot: "Waiting for the GPU (~Ns)" while the reply waits
+    /// for a Glimmer inference slot; nil otherwise.
+    public var waitStatus: String?
     /// Resolved from the server config; nil until configured/available.
     public var modelName: String?
     /// The parameter action from the most recent assistant reply, if any.
@@ -249,9 +252,25 @@ public final class AgentService {
     square 1024×1024; landscape 1536×1024.
     """
 
-    public init(engine: EngineService, session: URLSession = .shared) {
+    private let glimmerEndpoints: [String]
+
+    /// The reply request's own timeout, and the turn's overall deadline (slot
+    /// wait + request): the assistant waits up to 3 min for the GPU.
+    nonisolated static let replyRequestSec: TimeInterval = 120
+    nonisolated static let replyDeadlineSec: TimeInterval = 300
+
+    public init(
+        engine: EngineService, session: URLSession = .shared,
+        glimmerEndpoints: [String] = InferenceSlotClient.glimmerEndpoints(environment: ProcessInfo.processInfo.environment)
+    ) {
         self.engine = engine
         self.session = session
+        self.glimmerEndpoints = glimmerEndpoints
+    }
+
+    /// The pending-reply line the assistant views show.
+    public nonisolated static func progressText(waitStatus: String?) -> String {
+        waitStatus ?? "Thinking…"
     }
 
     // MARK: - Conversation
@@ -336,7 +355,7 @@ public final class AgentService {
         messages.append(AgentMessage(role: .user, text: trimmed))
         isThinking = true
         lastError = nil
-        defer { isThinking = false }
+        defer { isThinking = false; waitStatus = nil }
 
         do {
             let endpoint = try await resolveEndpoint()
@@ -491,7 +510,7 @@ public final class AgentService {
     private func complete(endpoint: ResolvedEndpoint) async throws -> String {
         var request = URLRequest(url: endpoint.baseURL)
         request.httpMethod = "POST"
-        request.timeoutInterval = 120
+        request.timeoutInterval = Self.replyRequestSec
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let key = endpoint.apiKey, !key.isEmpty {
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
@@ -499,12 +518,31 @@ public final class AgentService {
         request.httpBody = try JSONSerialization.data(
             withJSONObject: Self.requestBody(model: endpoint.model, messages: messages, context: stackContext))
 
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await withGlimmerSlot(baseURL: endpoint.baseURL.absoluteString) { [session, request] in
+            try await session.data(for: request)
+        }
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw AgentError.requestFailed((response as? HTTPURLResponse)?.statusCode ?? -1)
         }
         guard let reply = Self.parseReply(data) else { throw AgentError.emptyReply }
         return reply
+    }
+}
+
+extension AgentService {
+    /// FDD-glimmer-gpu-slot: on Glimmer, the reply holds a top-priority
+    /// inference slot (an in-flight video parks) and the wait shows in
+    /// `waitStatus`; elsewhere the request runs as is.
+    fileprivate func withGlimmerSlot<T: Sendable>(baseURL: String, _ body: () async throws -> T) async throws -> T {
+        guard let transport = engine.transport else { return try await body() }
+        return try await InferenceSlotClient(transport: transport, endpoints: glimmerEndpoints).withSlot(
+            holder: "comfybox-desktop:assistant", baseURL: baseURL,
+            deadline: Date().addingTimeInterval(Self.replyDeadlineSec), reserveSec: Self.replyRequestSec,
+            onWait: { [weak self] wait in
+                let text = wait.statusText
+                Task { @MainActor in self?.waitStatus = text }
+            },
+            body)
     }
 }
 
