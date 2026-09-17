@@ -83,6 +83,13 @@ struct GalleryView: View {
 
     // Multi-selection (compare, bulk delete)
     @State private var selectedIds: Set<String> = []
+    // Remote galleries (FDD-remote-galleries): a send MOVES the asset, so the
+    // destination list is reachable remotes only and every send is confirmed.
+    @State private var remoteRegistry = RemoteGalleryRegistry()
+    @State private var catalogStore: CatalogStore?
+    @State private var pendingRemoteSend: (remote: RemoteGalleryConfig, assets: [DAMAsset])?
+    @State private var remoteSendInFlight = false
+    @State private var remoteSendResult: String?
     @State private var isSelectMode: Bool = false
     // Grid page size. Select All raises it to the full scope for the rest of
     // the session so the selection is truthful, not capped at one page.
@@ -410,9 +417,37 @@ struct GalleryView: View {
             // to its old (Mac-only) self instead of to nothing.
             guard browser == nil else { return }
             guard let catalog = try? await CatalogStore.open() else { return }
+            catalogStore = catalog
             let b = CatalogBrowser(store: catalog, engineBaseURL: engineBaseURL)
             browser = b
             await loadAssets()
+            // Remote galleries: which are here right now, and finish any send
+            // a crash or a pulled drive interrupted (FDD-remote-galleries).
+            let remotes = DesktopSettings.load().remoteGalleries ?? []
+            remoteRegistry.update(remotes: remotes)
+            await remoteRegistry.refresh()
+            if !remotes.isEmpty {
+                await RemoteGalleryTransfer(store: store, catalog: catalog, ingestor: ingestor)
+                    .recoverPending(remotes: remotes)
+            }
+        }
+        .confirmationDialog(
+            Self.sendConfirmationTitle(count: pendingRemoteSend?.assets.count ?? 0,
+                                       remoteName: pendingRemoteSend?.remote.name ?? ""),
+            isPresented: Binding(get: { pendingRemoteSend != nil },
+                                 set: { if !$0 { pendingRemoteSend = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Move", role: .destructive) {
+                if let pending = pendingRemoteSend {
+                    pendingRemoteSend = nil
+                    Task { await sendToRemote(pending.assets, remote: pending.remote) }
+                }
+            }
+            Button("Cancel", role: .cancel) { pendingRemoteSend = nil }
+        } message: {
+            Text(Self.sendConfirmationMessage(count: pendingRemoteSend?.assets.count ?? 0,
+                                              remoteName: pendingRemoteSend?.remote.name ?? ""))
         }
         .onAppear {
             consumeSearchFocusRequest()
@@ -542,6 +577,23 @@ struct GalleryView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
+                }
+
+                // Send the selection to a remote gallery — a MOVE, so only
+                // reachable remotes are offered and the send is confirmed.
+                if !selectedIds.isEmpty && !remoteRegistry.reachable.isEmpty {
+                    Menu {
+                        ForEach(remoteRegistry.reachable) { remote in
+                            Button(remote.name) {
+                                pendingRemoteSend = (remote, selectedAssetsList)
+                            }
+                        }
+                    } label: {
+                        Label("Send \(selectedIds.count)", systemImage: "externaldrive.badge.plus")
+                    }
+                    .controlSize(.small)
+                    .fixedSize()
+                    .disabled(remoteSendInFlight)
                 }
 
                 // Bulk move to folder
@@ -1743,6 +1795,42 @@ struct GalleryView: View {
         searchFocusRequests = 0
         // Defer a tick so the field is in the hierarchy before focusing.
         Task { focusSearch() }
+    }
+
+    // MARK: - Send to a remote gallery
+
+    /// What the confirmation says. A move deletes the local copy, so it says
+    /// so in words, not in an icon (FDD-remote-galleries §3.3).
+    static func sendConfirmationTitle(count: Int, remoteName: String) -> String {
+        "Move \(count) item\(count == 1 ? "" : "s") to \(remoteName)?"
+    }
+
+    static func sendConfirmationMessage(count: Int, remoteName: String) -> String {
+        "\(remoteName) becomes the only copy. The \(count == 1 ? "file" : "files") and "
+        + "\(count == 1 ? "its" : "their") thumbnail\(count == 1 ? "" : "s") are deleted from this Mac."
+    }
+
+    /// What the gallery reports when a send finishes.
+    static func sendResultLine(sent: Int, failed: Int, remoteName: String) -> String {
+        if failed == 0 { return "Moved \(sent) to \(remoteName)" }
+        if sent == 0 { return "Nothing moved to \(remoteName) — \(failed) failed, local copies kept" }
+        return "Moved \(sent) to \(remoteName); \(failed) failed and kept their local copies"
+    }
+
+    private func sendToRemote(_ assets: [DAMAsset], remote: RemoteGalleryConfig) async {
+        guard let catalog = catalogStore, !assets.isEmpty else { return }
+        remoteSendInFlight = true
+        defer { remoteSendInFlight = false }
+        let transfer = RemoteGalleryTransfer(store: store, catalog: catalog, ingestor: ingestor)
+        let outcome = await transfer.send(assets: assets, to: remote)
+        remoteSendResult = Self.sendResultLine(sent: outcome.sent.count,
+                                               failed: outcome.failed.count,
+                                               remoteName: remote.name)
+        if let first = outcome.failed.first {
+            print("[remote-gallery] send failed for \(first.assetID): \(first.reason)")
+        }
+        selectedIds.subtract(Set(outcome.sent))
+        await loadAssets()
     }
 
     /// Consume a pending "Gallery Health" palette request by opening the
