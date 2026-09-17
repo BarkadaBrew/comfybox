@@ -295,8 +295,9 @@ public enum LibraryPackImporter {
     return report
   }
 
-  /// Import a `.soslibrary` (or any zip in that shape). Extraction uses
-  /// `ditto`, the same tool the gallery archive path uses.
+  /// Import a `.soslibrary` (or any zip in that shape). Extraction is
+  /// in-process (``LibraryZip``): spawning `ditto` from inside the engine
+  /// never returned, and a serving path should not depend on a subprocess.
   @discardableResult
   public static func importPack(
     at packURL: URL, into store: LibraryStore, dryRun: Bool = false
@@ -324,18 +325,11 @@ public enum LibraryPackImporter {
   }
 
   static func unzip(_ archive: URL, to destination: URL) throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-    process.arguments = ["-x", "-k", archive.path, destination.path]
-    let errorPipe = Pipe()
-    process.standardError = errorPipe
-    try process.run()
-    process.waitUntilExit()
-    guard process.terminationStatus == 0 else {
-      let tail = String(
-        data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    do {
+      try LibraryZip.extract(archive, to: destination)
+    } catch let error as LibraryZipError {
       throw LibraryPackError.unreadable(
-        "could not unpack \(archive.lastPathComponent) (ditto \(process.terminationStatus)): \(tail.prefix(200))")
+        "could not unpack \(archive.lastPathComponent): \(error.localizedDescription)")
     }
   }
 
