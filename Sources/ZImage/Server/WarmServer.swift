@@ -340,6 +340,11 @@ public final class WarmServer {
   /// the yield, runs the image job, resumes the video) — see the mechanism
   /// note above `RollingMeanSec`.
   let pendingPreemptorBox = PendingPreemptorBox()
+  /// FDD-glimmer-gpu-slot: leased top-priority GPU slots for Glimmer inference
+  /// (`/v1/queue/inference-slot`), and the hold handshake that parks an
+  /// in-flight LTX-2 video for them.
+  let inferenceSlots = InferenceSlotTable()
+  let inferenceHold = InferenceHold()
 
   /// Unified-memory pressure monitor (#218). On warning/critical it sheds the
   /// MLX buffer cache and any idle heavy model to stay clear of jetsam.
@@ -388,7 +393,22 @@ public final class WarmServer {
       ltx2PreemptionSignal: self.ltx2PreemptionSignal, ltx2StepPosition: self.ltx2StepPosition,
       ltx2EvictMean: self.ltx2EvictMean, ltx2ReloadMean: self.ltx2ReloadMean,
       preemptionInFlight: self.preemptionInFlight, pendingPreemptorBox: self.pendingPreemptorBox,
-      lifecycleLedger: self.lifecycleLedger)
+      lifecycleLedger: self.lifecycleLedger,
+      inferenceSlots: self.inferenceSlots, inferenceHold: self.inferenceHold)
+    // Last slot released or expired: withdraw a hold request the video never
+    // claimed (it would otherwise strand the preemption flag), then wake any
+    // render that parked behind the slots.
+    let coordinatorForSlots = self.coordinator
+    let holdForSlots = self.inferenceHold
+    let signalForSlots = self.ltx2PreemptionSignal
+    let inFlightForSlots = self.preemptionInFlight
+    self.inferenceSlots.onEmpty = {
+      if holdForSlots.cancelIfRequested() {
+        signalForSlots.clear()
+        inFlightForSlots.clear()
+      }
+      Task { await coordinatorForSlots.wakeAfterInferenceRelease() }
+    }
     self.seedvr2WeightsPath = configuration.seedvr2WeightsPath
 
     self.comfyBridge = ComfyBridge(logger: logger)
@@ -9767,6 +9787,11 @@ final class VideoJobTracker: @unchecked Sendable {
 }
 
 private actor WarmServerCoordinator {
+  /// FDD-glimmer-gpu-slot: leased top-priority inference slots. While any is
+  /// held the loop starts no render (see the dequeue gate); an in-flight video
+  /// parks in `runPreemptionEpisode` when `inferenceHold` was requested.
+  nonisolated let inferenceSlots: InferenceSlotTable
+  nonisolated let inferenceHold: InferenceHold
   enum ServerError: Error {
     case queueFull(maxPending: Int)
     /// The model-operation cap (`maxPendingModelOps`), which is counted and
@@ -10081,8 +10106,12 @@ private actor WarmServerCoordinator {
     videoJobTracker: VideoJobTracker, ltx2Telemetry: LTX2PhaseTelemetry, ltx2PreemptionSignal: PreemptionSignal,
     ltx2StepPosition: LTX2StepPosition, ltx2EvictMean: RollingMeanSec, ltx2ReloadMean: RollingMeanSec,
     preemptionInFlight: LockedFlag, pendingPreemptorBox: PendingPreemptorBox,
-    lifecycleLedger: QueueLifecycleLedger = QueueLifecycleLedger()
+    lifecycleLedger: QueueLifecycleLedger = QueueLifecycleLedger(),
+    inferenceSlots: InferenceSlotTable = InferenceSlotTable(),
+    inferenceHold: InferenceHold = InferenceHold()
   ) {
+    self.inferenceSlots = inferenceSlots
+    self.inferenceHold = inferenceHold
     self.configuration = configuration
     self.logger = logger
     self.videoHolder = videoHolder
@@ -11937,6 +11966,14 @@ private actor WarmServerCoordinator {
     publishHealth()
   }
 
+  /// FDD-glimmer-gpu-slot: the last inference slot was released or expired —
+  /// start any render that parked behind it (unless the operator paused).
+  func wakeAfterInferenceRelease() {
+    guard !liveHealth.isPausedAuthoritative(), !inferenceSlots.isHeld() else { return }
+    startProcessingIfNeeded()
+    publishHealth()
+  }
+
   /// Move a pending job within the queue. direction: up | down | top | bottom.
   /// Returns true if the job was found and moved.
   func movePending(id: String, direction: String) -> Bool {
@@ -12155,7 +12192,10 @@ private actor WarmServerCoordinator {
       // jobs it passes are parked until resume, and they keep their relative
       // order for when it comes.
       let index: Int
-      if liveHealth.isPausedAuthoritative() {
+      // FDD-glimmer-gpu-slot: a held inference slot parks renders exactly like
+      // a manual pause (model operations still run), without touching the
+      // operator's pause bit — releasing slots never un-pauses a manual pause.
+      if liveHealth.isPausedAuthoritative() || inferenceSlots.isHeld() {
         guard let next = pending.firstIndex(where: { Self.runsWhilePaused($0.operation) }) else {
           isProcessing = false
           return
@@ -17054,6 +17094,8 @@ func localVideoCatchOutcome(for error: Error) -> LocalVideoCompletionOutcome? {
 /// that directory, and the LIVE engine's are not the test's to touch.
 final class WarmServerQueueProbe: @unchecked Sendable {
   private let coordinator: WarmServerCoordinator
+  /// FDD-glimmer-gpu-slot: the probe's own slot table, wired to the coordinator.
+  let inferenceSlots = InferenceSlotTable()
   private let liveHealth = LiveHealthState()
   /// comfybox#283/#217: same `COMFYBOX_STATE_DIR` override every other piece
   /// of this probe's state honors (see `stateDirectory`'s doc comment on
@@ -17094,7 +17136,10 @@ final class WarmServerQueueProbe: @unchecked Sendable {
       ltx2ReloadMean: RollingMeanSec(),
       preemptionInFlight: LockedFlag(),
       pendingPreemptorBox: PendingPreemptorBox(),
-      lifecycleLedger: lifecycleLedger)
+      lifecycleLedger: lifecycleLedger,
+      inferenceSlots: inferenceSlots)
+    let coordinatorForSlots = self.coordinator
+    inferenceSlots.onEmpty = { Task { await coordinatorForSlots.wakeAfterInferenceRelease() } }
   }
 
   /// comfybox#283/#217: the lifecycle events recorded for one job id, for a
