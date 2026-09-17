@@ -54,7 +54,7 @@ struct AgentView: View {
                     if agent.isThinking {
                         HStack(spacing: 6) {
                             ProgressView().controlSize(.small)
-                            Text("Thinking…").font(.caption).foregroundStyle(.secondary)
+                            Text(AgentService.progressText(waitStatus: agent.waitStatus)).font(.caption).foregroundStyle(.secondary)
                         }
                         .id("thinking")
                     }
@@ -193,7 +193,7 @@ struct GenerateAssistantPanel: View {
             if agent.isThinking {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
-                    Text("Thinking…").font(.caption).foregroundStyle(.secondary)
+                    Text(AgentService.progressText(waitStatus: agent.waitStatus)).font(.caption).foregroundStyle(.secondary)
                 }
             }
             if let error = agent.lastError {

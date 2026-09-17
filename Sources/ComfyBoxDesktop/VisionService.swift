@@ -13,8 +13,20 @@ import ZImage
 @MainActor
 public final class VisionService {
     private let engine: EngineService
+    /// FDD-glimmer-gpu-slot: host:port list whose calls hold an inference slot.
+    private let glimmerEndpoints: [String]
+    public init(
+        engine: EngineService,
+        glimmerEndpoints: [String] = InferenceSlotClient.glimmerEndpoints(environment: ProcessInfo.processInfo.environment)
+    ) {
+        self.engine = engine
+        self.glimmerEndpoints = glimmerEndpoints
+    }
 
-    public init(engine: EngineService) { self.engine = engine }
+    /// The caption request's own timeout, and its overall deadline (slot wait +
+    /// request): a batch caption waits up to 8 min per image for the GPU.
+    nonisolated static let captionRequestSec: TimeInterval = 120
+    nonisolated static let captionDeadlineSec: TimeInterval = 600
 
     public struct Description: Sendable, Equatable {
         public var caption: String
@@ -82,7 +94,9 @@ public final class VisionService {
 
     // MARK: - Describe
 
-    public func describe(imagePath: String) async throws -> Description {
+    /// - Parameter onWaitStatus: "Waiting for the GPU (~Ns)" while a Glimmer
+    ///   slot is pending (called off the main actor).
+    public func describe(imagePath: String, onWaitStatus: (@Sendable (String) -> Void)? = nil) async throws -> Description {
         let config = try await engine.fetchServerConfig()
         guard let provider = config.providers.captioning ?? config.providers.vision else {
             throw VisionError.noProvider
@@ -98,14 +112,16 @@ public final class VisionService {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 120
+        request.timeoutInterval = Self.captionRequestSec
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let key = provider.apiKey, !key.isEmpty {
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: Self.requestBody(model: provider.model, base64PNG: b64))
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await withGlimmerSlot(baseURL: base, onWaitStatus: onWaitStatus) { [request] in
+            try await URLSession.shared.data(for: request)
+        }
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw VisionError.requestFailed((response as? HTTPURLResponse)?.statusCode ?? -1)
         }
@@ -113,6 +129,19 @@ public final class VisionService {
               let desc = Self.parseDescription(from: content)
         else { throw VisionError.emptyReply }
         return desc
+    }
+
+    /// FDD-glimmer-gpu-slot: on Glimmer, hold a top-priority inference slot for
+    /// the request (an in-flight video parks); elsewhere run it as is.
+    private func withGlimmerSlot<T: Sendable>(
+        baseURL: String, onWaitStatus: (@Sendable (String) -> Void)?, _ body: () async throws -> T
+    ) async throws -> T {
+        guard let transport = engine.transport else { return try await body() }
+        return try await InferenceSlotClient(transport: transport, endpoints: glimmerEndpoints).withSlot(
+            holder: "comfybox-desktop:caption", baseURL: baseURL,
+            deadline: Date().addingTimeInterval(Self.captionDeadlineSec), reserveSec: Self.captionRequestSec,
+            onWait: onWaitStatus.map { report in { @Sendable wait in report(wait.statusText) } },
+            body)
     }
 
     /// Load, downscale, and PNG-base64 an image off the main actor.

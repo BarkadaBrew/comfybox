@@ -1859,10 +1859,15 @@ struct GalleryView: View {
         guard let engine else { return }
         let vision = VisionService(engine: engine)
         var done = 0, failed = 0
+        let status = $errorMessage
         for asset in assets {
-            errorMessage = "Captioning \(asset.filename)… (\(done + 1)/\(assets.count))"
+            let line = "Captioning \(asset.filename)… (\(done + 1)/\(assets.count))"
+            errorMessage = line
             do {
-                let desc = try await vision.describe(imagePath: asset.absolutePath)
+                // FDD-glimmer-gpu-slot: on Glimmer the caption waits for a GPU slot — say so.
+                let desc = try await vision.describe(imagePath: asset.absolutePath, onWaitStatus: { wait in
+                    Task { @MainActor in status.wrappedValue = "\(line) — \(wait)" }
+                })
                 if !desc.tags.isEmpty { try? FinderTags.addTextTags(desc.tags, atPath: asset.absolutePath) }
                 if !desc.caption.isEmpty { FinderTags.setCaption(desc.caption, atPath: asset.absolutePath) }
                 done += 1
