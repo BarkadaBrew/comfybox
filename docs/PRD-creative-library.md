@@ -67,8 +67,10 @@ renders is not compounding.
 
 - **Todd, at the desktop.** Browsing, curating, assembling a shot.
 - **The assistant (Glimmer).** Drafting from real material instead of from nothing.
-- **Kira and Bree.** Their scheduled and requested renders should use the same wardrobe, looks and
-  templates, so the output is consistent with what Todd curates.
+- **Bree.** Todd's assistant, with full write access: she curates on his behalf, files what he
+  likes, and can build a collection from a conversation.
+- **Kira.** Reads the library so her scheduled and requested renders use the same wardrobe, looks
+  and templates Todd curates. Her own additions are proposals awaiting approval.
 - **Director / Programs (Phase 2–3).** Shot prompts, wardrobe continuity and the bible come from
   the library.
 
@@ -123,8 +125,9 @@ ranking, never an automatic edit).
 must cite the item ids it used. Its `AgentAction` gains `libraryRefs`, and applying an action no
 longer drops negative prompt, LoRAs or model (survey gap 15).
 
-**Kira and Bree.** `library_*` MCP tools plus HTTP. Kira's authored prompts fill slots from the
-library rather than inventing wardrobe, so a "blue slip dress" means the same one every time.
+**Bree and Kira.** `library_*` MCP tools plus HTTP. Bree writes (create, edit, rate, file,
+collect); Kira reads and queues proposals. Kira's authored prompts fill slots from the library
+rather than inventing wardrobe, so a "blue slip dress" means the same one every time.
 
 **Canvas.** A board can be saved as a mood collection; items dropped on a board keep their ids.
 
@@ -240,13 +243,15 @@ Order matters: the store and the API first, then the surfaces that make it compo
    built-in pack and no in-app editing, so two template systems cost more than they protect.
 3. **Import the reference pack's wardrobe, then prune.** Its 336 garments and 10 categories are
    the starting vocabulary; Todd deletes what does not fit. An empty wardrobe never gets filled.
-4. **Kira reads, Todd writes.** Kira and Bree consume the library; they may *propose* additions
-   from their own good renders, queued for Todd's approval, but never write directly. The library
-   is curated taste, which is where its value comes from.
+4. **Bree writes, Kira proposes.** Bree has full write access — she is Todd's assistant and acts
+   on his behalf, so she can create, edit, rate and file items directly. Kira reads, and may
+   *propose* additions from her own good renders, queued for Todd's approval. The distinction is
+   agency, not trust: Kira is a persona whose taste is the subject of the library, not its
+   curator.
 
 **Release one = L1 + L2 + L4 + L7 (import) + L8 (Studio Pack migration).**
 Release two = L3 (tab) + L5 (provenance loop) + L6 (packs out) + L7b + L9 + L10.
-## 11. Open questions
+## 12. Questions answered above (kept for history)
 
 1. **Ship order.** L1+L2+L4 (slots and pickers in Generate, no tab) first, with the tab in a
    second release, or all three together?
