@@ -74,3 +74,32 @@ struct CatalogBrowserRemoteGalleryTests {
         #expect(browser.localPath(forID: "a1") == path)
     }
 }
+
+@Suite("Remote galleries: a file that comes back")
+@MainActor
+struct RemoteGalleryReadoptionTests {
+
+    @Test("a moved file that reappears on this Mac is local again")
+    func reappearsLocally() async throws {
+        let dbPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("re-\(UUID().uuidString).sqlite3")
+        let store = try await CatalogStore.open(path: dbPath)
+        defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+        let localPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("back-\(UUID().uuidString).png")
+        FileManager.default.createFile(atPath: localPath, contents: Data("bytes".utf8))
+        defer { try? FileManager.default.removeItem(atPath: localPath) }
+
+        try await store.upsert(CatalogAsset(id: "a1", filename: "back.png", absolutePath: localPath),
+                               explicitCollectionIDs: [])
+        try await store.relocateAsset(id: "a1", host: "remote:r1", path: "media/2026/09/back.png")
+
+        let browser = CatalogBrowser(store: store)
+        browser.remoteGalleryRoots = [:]        // the drive is not attached
+        await browser.apply(filter: CatalogQuery(limit: 10))
+
+        #expect(browser.items.map(\.id) == ["a1"], "the file is here, so it shows")
+        #expect(browser.localPath(forID: "a1") == localPath)
+        #expect(try await store.storageState(of: "a1")?.storageState == "local",
+                "and the catalog is corrected, so it is not hidden again next time")
+    }
+}

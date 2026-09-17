@@ -187,6 +187,15 @@ public final class CatalogBrowser {
             // like any other while the drive is attached, and vanish when it
             // is not — Todd's choice: "hide it until the drive is back".
             if let remoteLocation = locations.first(where: { $0.host.hasPrefix(Self.remoteHostPrefix) }) {
+                // A file that came BACK to this Mac (restored from a backup, or
+                // copied back by hand) is local again, whatever the catalog
+                // last recorded (Codex review of the implementation).
+                if fm.fileExists(atPath: row.absolutePath) {
+                    local[row.id] = row.absolutePath
+                    kept.append(row)
+                    try? await store.relocateAsset(id: row.id, host: Self.localHost, path: row.absolutePath)
+                    continue
+                }
                 guard let root = remoteGalleryRoots[remoteLocation.host] else { continue }
                 let path = (root as NSString).appendingPathComponent(remoteLocation.path)
                 guard fm.fileExists(atPath: path) else { continue }

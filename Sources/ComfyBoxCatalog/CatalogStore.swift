@@ -1067,7 +1067,12 @@ public actor CatalogStore {
         let isLocal = (host == "mac")
         try CatalogSchema.exec(db, "SAVEPOINT catalog_relocate")
         do {
-            try execBind("DELETE FROM asset_locations WHERE asset_id = ?", [id])
+            // Drop only the copy being moved and any stale row for the target
+            // host. Other hosts' copies — Kira's and Bree's server trees — are
+            // still real and are left alone (Codex review of the
+            // implementation, finding 6).
+            try execBind("DELETE FROM asset_locations WHERE asset_id = ? AND (host = ? OR host = ?)",
+                         [id, isLocal ? host : "mac", host])
             try execBind("INSERT OR REPLACE INTO asset_locations (asset_id, host, path, mtime) VALUES (?,?,?,?)",
                          [id, host, path, Date().timeIntervalSince1970])
             try execBind("UPDATE assets SET storage_state = ?, primary_host = ? WHERE id = ?",

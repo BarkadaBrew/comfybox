@@ -103,6 +103,11 @@ public struct ImmichClient: Sendable {
         }
 
         let formatter = ISO8601DateFormatter()
+        // `metadata` is REQUIRED by AssetMediaCreateDto in Immich 2.3.1
+        // (verified against the server's own /api/spec.json). It is a list of
+        // upsert items; ComfyBox's own metadata rides in `sidecarData`, so an
+        // empty list is what this send means.
+        field("metadata", "[]")
         field("deviceAssetId", assetID)
         field("deviceId", "comfybox-desktop")
         field("fileCreatedAt", formatter.string(from: createdAt))
@@ -125,14 +130,35 @@ public struct ImmichClient: Sendable {
         return ImmichAsset(id: id, status: status)
     }
 
+    /// What the server says it holds for an asset.
+    public struct RemoteAssetDetails: Sendable, Equatable {
+        public let id: String
+        /// Base64 SHA-1, the same spelling Immich takes in `x-immich-checksum`.
+        public let checksum: String?
+    }
+
     /// Confirm the asset is really there before anything local is deleted.
-    public func assetExists(id: String) async throws -> Bool {
+    public func assetDetails(id: String) async throws -> RemoteAssetDetails? {
         do {
             let json = try await getJSON(path: "/api/assets/\(id)")
-            return (json["id"] as? String) == id
+            guard (json["id"] as? String) == id else { return nil }
+            return RemoteAssetDetails(id: id, checksum: json["checksum"] as? String)
         } catch ImmichError.http(let code, _) where code == 404 {
-            return false
+            return nil
         }
+    }
+
+    /// True when the server holds this asset with these exact bytes. A server
+    /// that reports no checksum is trusted on the id alone; one that reports a
+    /// DIFFERENT checksum is not (Codex review of the implementation).
+    public func assetMatches(id: String, sha1Base64: String) async throws -> Bool {
+        guard let details = try await assetDetails(id: id) else { return false }
+        guard let remote = details.checksum, !remote.isEmpty else { return true }
+        return remote == sha1Base64
+    }
+
+    public func assetExists(id: String) async throws -> Bool {
+        try await assetDetails(id: id) != nil
     }
 
     // MARK: - Albums
@@ -172,6 +198,17 @@ public struct ImmichClient: Sendable {
     }
 
     // MARK: - Plumbing
+
+    /// Streamed SHA-1 of a file, in Immich's base64 spelling.
+    public static func sha1Base64(ofFileAt path: String) throws -> String {
+        let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+        defer { try? handle.close() }
+        var hasher = Insecure.SHA1()
+        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+        return Data(hasher.finalize()).base64EncodedString()
+    }
 
     static func sha1Base64(of data: Data) -> String {
         Data(Insecure.SHA1.hash(data: data)).base64EncodedString()

@@ -87,6 +87,27 @@ struct CatalogRelocateTests {
         #expect(home?.primaryHost == "mac")
     }
 
+    @Test("another host's copy survives a relocation")
+    func otherHostsSurvive() async throws {
+        let (store, id, path) = try await makeStore()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        // Kira's server holds a copy too; moving the Mac's copy to a drive
+        // must not forget it (Codex review of the implementation).
+        var db: OpaquePointer?
+        #expect(sqlite3_open(path, &db) == SQLITE_OK)
+        let sql = "INSERT OR REPLACE INTO asset_locations (asset_id, host, path, mtime) VALUES (?,'kira','/home/todd/.kira/studio/gallery/kira-01.png',0)"
+        var stmt: OpaquePointer?
+        #expect(sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK)
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        #expect(sqlite3_step(stmt) == SQLITE_DONE)
+        sqlite3_finalize(stmt); sqlite3_close(db)
+
+        try await store.relocateAsset(id: id, host: "remote:r1", path: "media/2026/09/kira-01.png")
+        let hosts = Set(try await store.locations(of: id, scope: nil).map(\.host))
+        #expect(hosts == ["kira", "remote:r1"], "the server copy is still known: \(hosts)")
+    }
+
     // ── The journal ──────────────────────────────────────────────────────────
 
     @Test("a transfer is recorded, advanced, and finished")

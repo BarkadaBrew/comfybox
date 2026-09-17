@@ -107,6 +107,11 @@ public final class RemoteGalleryTransfer {
         let sidecarPath = Self.sidecarPath(forMedia: mediaPath)
         let thumbnailPath = "\(FolderGalleryIndex.thumbnailDirectory)/\(asset.id).jpg"
 
+        // Claim the path for the length of the move so the ingestor's poller
+        // cannot re-ingest it mid-transfer.
+        ingestor.reservePath(asset.absolutePath)
+        defer { ingestor.releasePath(asset.absolutePath) }
+
         let sourceDigest = try Self.sha256(ofFileAt: asset.absolutePath)
         try await catalog.beginTransfer(assetID: asset.id, remoteID: remote.id,
                                         remotePath: mediaPath, sha256: sourceDigest)
@@ -234,6 +239,9 @@ public final class RemoteGalleryTransfer {
         guard fm.fileExists(atPath: asset.absolutePath) else {
             throw TransferError.localFileMissing(asset.filename)
         }
+        ingestor.reservePath(asset.absolutePath)
+        defer { ingestor.releasePath(asset.absolutePath) }
+
         let sentAt = Date()
         let secured = (try? await store.securedAssetIds().contains(asset.id)) ?? false
         let digest = try Self.sha256(ofFileAt: asset.absolutePath)
@@ -246,7 +254,10 @@ public final class RemoteGalleryTransfer {
             uploaded = try await client.upload(fileAt: asset.absolutePath, assetID: asset.id,
                                                createdAt: asset.createdAt, modifiedAt: asset.modifiedAt,
                                                sidecar: sidecar)
-            guard uploaded.isPresent, try await client.assetExists(id: uploaded.id) else {
+            // Confirm by CHECKSUM, not merely by id: the local copy is about
+            // to be deleted (Codex review of the implementation).
+            let sha1 = try ImmichClient.sha1Base64(ofFileAt: asset.absolutePath)
+            guard uploaded.isPresent, try await client.assetMatches(id: uploaded.id, sha1Base64: sha1) else {
                 throw TransferError.notConfirmedOnServer(asset.filename)
             }
             if let albumID { try? await client.addToAlbum(albumID: albumID, assetIDs: [uploaded.id]) }
@@ -285,7 +296,20 @@ public final class RemoteGalleryTransfer {
                 }
                 try? await catalog.finishTransfer(assetID: transfer.assetID)
             case .verified, .relocated:
-                // The remote copy exists and was verified: finish the move.
+                // A journal row is not proof forever: the drive may have been
+                // written to, or the Immich asset removed, since (Codex review
+                // of the implementation). Re-check the remote copy BEFORE the
+                // local one is deleted.
+                guard await remoteCopyStillGood(transfer, remote: remote, galleryRoot: galleryRoot) else {
+                    // The remote copy is gone or changed: keep the local file
+                    // and drop the journal row. The asset is local again.
+                    if let asset = try? await store.fetchAsset(id: transfer.assetID),
+                       FileManager.default.fileExists(atPath: asset.absolutePath) {
+                        try? await catalog.relocateAsset(id: transfer.assetID, host: "mac", path: asset.absolutePath)
+                    }
+                    try? await catalog.finishTransfer(assetID: transfer.assetID)
+                    continue
+                }
                 let asset = try? await store.fetchAsset(id: transfer.assetID)
                 let localPath = asset?.absolutePath ?? ""
                 let secured = (try? await store.securedAssetIds().contains(transfer.assetID)) ?? false
@@ -295,6 +319,30 @@ public final class RemoteGalleryTransfer {
                 try? await catalog.finishTransfer(assetID: transfer.assetID)
             }
         }
+    }
+
+    /// Is the remote copy this journal row claims still there, and still the
+    /// same bytes? Checked on recovery, before any local delete.
+    private func remoteCopyStillGood(_ transfer: CatalogStore.PendingTransfer,
+                                     remote: RemoteGalleryConfig,
+                                     galleryRoot: String) async -> Bool {
+        if transfer.remotePath.hasPrefix("immich://") {
+            let immichID = String(transfer.remotePath.dropFirst("immich://".count))
+            guard !immichID.isEmpty, immichID != "pending", let client = immichClient(remote) else { return false }
+            guard let asset = try? await store.fetchAsset(id: transfer.assetID),
+                  FileManager.default.fileExists(atPath: asset.absolutePath) else {
+                // Nothing local to protect; trust the id alone.
+                return (try? await client.assetExists(id: immichID)) ?? false
+            }
+            guard let sha1 = try? ImmichClient.sha1Base64(ofFileAt: asset.absolutePath) else { return false }
+            return (try? await client.assetMatches(id: immichID, sha1Base64: sha1)) ?? false
+        }
+
+        let path = (galleryRoot as NSString).appendingPathComponent(transfer.remotePath)
+        guard FileManager.default.fileExists(atPath: path) else { return false }
+        guard let expected = transfer.sha256 else { return true }
+        guard let actual = try? Self.sha256(ofFileAt: path) else { return false }
+        return actual == expected
     }
 
     // MARK: - Helpers

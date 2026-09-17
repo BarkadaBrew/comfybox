@@ -232,6 +232,48 @@ struct RemoteGalleryTransferTests {
         #expect(try await world.catalog.storageState(of: "a1")?.storageState != "remote")
     }
 
+    @Test("recovery refuses to delete the local copy when the remote file is gone")
+    func recoveryRefusesMissingRemote() async throws {
+        let world = try await makeWorld()
+        defer { try? FileManager.default.removeItem(atPath: world.dbPath) }
+        let asset = try await makeAsset(world, id: "a1", filename: "kira-01.png")
+
+        // A journal row that claims a verified copy which is not there.
+        let galleryRoot = try #require(world.remote.galleryRoot)
+        _ = try FolderGalleryIndex.create(at: galleryRoot, name: world.remote.name)
+        try await world.catalog.beginTransfer(assetID: "a1", remoteID: world.remote.id,
+                                              remotePath: "media/2026/09/kira-01.png", sha256: "deadbeef")
+        try await world.catalog.setTransferState(assetID: "a1", state: .verified)
+
+        await world.transfer.recoverPending(remotes: [world.remote])
+
+        #expect(FileManager.default.fileExists(atPath: asset.absolutePath),
+                "a journal row is not proof: the local copy stays")
+        #expect(try await world.catalog.pendingTransfers().isEmpty)
+        #expect(try await world.catalog.storageState(of: "a1")?.storageState != "remote")
+    }
+
+    @Test("recovery refuses when the remote file is there but changed")
+    func recoveryRefusesChangedRemote() async throws {
+        let world = try await makeWorld()
+        defer { try? FileManager.default.removeItem(atPath: world.dbPath) }
+        let asset = try await makeAsset(world, id: "a1", filename: "kira-01.png")
+
+        let galleryRoot = try #require(world.remote.galleryRoot)
+        let index = try FolderGalleryIndex.create(at: galleryRoot, name: world.remote.name)
+        let mediaPath = "media/2026/09/kira-01.png"
+        let destination = index.absolutePath(for: mediaPath)
+        try FileManager.default.createDirectory(atPath: (destination as NSString).deletingLastPathComponent,
+                                                withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: destination, contents: Data("different bytes".utf8))
+        try await world.catalog.beginTransfer(assetID: "a1", remoteID: world.remote.id,
+                                              remotePath: mediaPath, sha256: "not-the-digest-of-those-bytes")
+        try await world.catalog.setTransferState(assetID: "a1", state: .verified)
+
+        await world.transfer.recoverPending(remotes: [world.remote])
+        #expect(FileManager.default.fileExists(atPath: asset.absolutePath), "a checksum mismatch keeps the local copy")
+    }
+
     // MARK: - Vault assets
 
     @Test("a secured asset leaves the vault and stops being hidden")
@@ -367,6 +409,60 @@ struct RemoteGalleryImmichTransferTests {
         #expect(outcome.failed.count == 1)
         #expect(FileManager.default.fileExists(atPath: asset.absolutePath), "nothing is deleted on an unconfirmed upload")
         #expect(try await catalog.pendingTransfers().isEmpty)
+    }
+
+    @Test("the upload carries the metadata field Immich requires")
+    func metadataFieldPresent() async throws {
+        ImmichTransferStubProtocol.reset()
+        nonisolated(unsafe) var uploadBody = ""
+        ImmichTransferStubProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            if path == "/api/server/version" { return (200, Data(#"{"major":2,"minor":3,"patch":1}"#.utf8)) }
+            if path == "/api/assets", request.httpMethod == "POST" {
+                if let stream = request.httpBodyStream {
+                    stream.open()
+                    var data = Data()
+                    let size = 4096
+                    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: size)
+                    while stream.hasBytesAvailable {
+                        let read = stream.read(buffer, maxLength: size)
+                        if read <= 0 { break }
+                        data.append(buffer, count: read)
+                    }
+                    buffer.deallocate(); stream.close()
+                    uploadBody = String(decoding: data, as: UTF8.self)
+                }
+                return (201, Data(#"{"id":"immich-9","status":"created"}"#.utf8))
+            }
+            return (200, Data(#"{"id":"immich-9"}"#.utf8))
+        }
+        let (transfer, store, catalog, _, dir, dbPath) = try await makeWorld()
+        defer { try? FileManager.default.removeItem(atPath: dbPath) }
+        let asset = try await makeAsset(store, catalog, dir: dir, id: "a1")
+        _ = await transfer.send(assets: [asset], to: remote)
+        #expect(uploadBody.contains("name=\"metadata\""),
+                "AssetMediaCreateDto requires it in Immich 2.3.1 — without it the upload is rejected")
+    }
+
+    @Test("a checksum the server does not match keeps the local copy")
+    func checksumMismatchKeepsLocal() async throws {
+        ImmichTransferStubProtocol.reset()
+        ImmichTransferStubProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            if path == "/api/server/version" { return (200, Data(#"{"major":2,"minor":3,"patch":1}"#.utf8)) }
+            if path == "/api/assets", request.httpMethod == "POST" {
+                return (201, Data(#"{"id":"immich-9","status":"created"}"#.utf8))
+            }
+            // The server holds SOMETHING under that id, but not these bytes.
+            return (200, Data(#"{"id":"immich-9","checksum":"c29tZXRoaW5nIGVsc2U="}"#.utf8))
+        }
+        let (transfer, store, catalog, _, dir, dbPath) = try await makeWorld()
+        defer { try? FileManager.default.removeItem(atPath: dbPath) }
+        let asset = try await makeAsset(store, catalog, dir: dir, id: "a1")
+
+        let outcome = await transfer.send(assets: [asset], to: remote)
+        #expect(outcome.sent.isEmpty)
+        #expect(FileManager.default.fileExists(atPath: asset.absolutePath))
     }
 
     @Test("a server version this build does not speak stops the whole send")
