@@ -1,6 +1,6 @@
 # FDD: "Director" — a timeline editor tab for LTX-2.3 in CoffeeShop Desktop
 
-Status: v1.1 (2026-09-16) — codex-reviewed; §3/§4/§5 corrected per `docs/FDD-ltx-director-tab.codex-review.md`. Requested by Todd: "clone this product as a tab for
+Status: v1.2 (2026-09-16) — codex-reviewed (v1.1); v1.2 adds Phase 2 regional prompting (§4.6, WP10) adapted from ComfyUI-LTX-BBox-Animator. Requested by Todd: "clone this product as a tab for
 desktop app and make an FDD for the initiative" — the product being
 [WhatDreamsCost-ComfyUI](https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI), whose
 flagship node **LTX Director 2.0** is "A Complete Timeline Editor For LTX 2.3".
@@ -251,6 +251,64 @@ New `AppTab.director` in the Create section, `Views/Director/`:
 
 The Motion tab stays as the quick single-shot path; Director is the editor.
 
+### 4.6 Regional prompting — animated boxes per prompt (Phase 2, WP10)
+
+**Source of the idea.** [ComfyUI-LTX-BBox-Animator](https://github.com/yuvraj108c/ComfyUI-LTX-BBox-Animator)
+(GPL-3.0, reviewed 2026-09-16): the user draws boxes around subjects, keyframes their position
+and size across the clip, and gives each box its own prompt. Two mechanisms work together
+there: (a) each object prompt is spatially restricted in text attention ("LTX Apply Regional
+Conditioning"), and (b) an IC-LoRA (`LTX-2.5-22b-IC-LoRA-Bbox`) is fed a control video of
+white boxes on black so the model tracks where each subject goes. Their stated limits: small
+boxes and unusual shapes lose adherence; memory grows with each object.
+
+**What we take and what we do not.**
+
+- **Not the IC-LoRA.** It is trained on LTX-2.5 22B; our base is LTX-2.3 (PinkCherry v1.8),
+  and the Hugging Face repo returned 401 to an unauthenticated request on 2026-09-16 (private,
+  gated, or pulled). Mechanism (b) is out unless a 2.3-compatible, obtainable adapter appears.
+- **Not the code.** GPL-3.0; behaviour only, as with Director itself.
+- **The idea (a), on what we already ship.** Our beat schedule is regional prompting in *time*:
+  `LTX2BeatScheduleBuilder.buildVideoBias` already walks every video token `q`, derives its
+  frame as `q / tokensPerFrame`, and writes an additive penalty into the text-attention cost
+  for tokens outside a beat's time window (`LTX2BeatSchedule.swift:258-300`). The token's
+  position *within* the frame is `q % tokensPerFrame`, i.e. a row and column on the latent
+  grid. A region is the same penalty applied when the token's (row, col) at that frame lies
+  outside the box interpolated for that frame. No transformer change, no LoRA, 2.3 weights.
+
+**Why it matters to us.** It targets failures we have measured, not a nice-to-have:
+
+- Two-body scenes where one person's description bleeds into the other (the 2026-09-15
+  extra-limbs / wrong-action renders; Kira's traits landing on the partner).
+- Multi-character apple and banana clips where one subject should hold still while the other
+  moves, and cast renders where "her friend" must stay a different body from Kira.
+
+**Design.**
+
+- **Timeline document:** a `regions` track — `{ id, prompt, strength, soft_edge,
+  keys: [{ frame, x, y, w, h }] }` with normalized box coordinates (0–1, resolution
+  independent), linear interpolation between keys, and the box held before the first key and
+  after the last. A region's prompt text is appended to the chunk's text like a prompt
+  segment, and its token range is recorded for the bias.
+- **Compiler:** each region becomes a spatiotemporal beat — token range + per-frame box. The
+  bias builder gains an optional per-frame box: tokens outside the box get the penalty with a
+  soft edge (distance to the box in latent cells, same Gaussian falloff as the time window) so
+  edges do not hard-cut. The global prompt stays unbiased and visible everywhere.
+- **Memory:** unchanged order — the bias is already a dense `videoTokens × textLen` cost
+  (576×896 × 37 latent frames ≈ 18.6k tokens × ~1k text tokens ≈ 75 MB float32). More regions
+  add token columns, not rows.
+- **Desktop:** a Regions track in the Director canvas; boxes drawn and resized on the preview
+  frame (a keyframe image or the last render as the backdrop, editor-only like upstream),
+  keyed at the playhead, colored per region, with the region prompt in the sidebar.
+- **Chunks:** a region spanning a chunk boundary is split with its interpolated box at the
+  boundary, same as prompt segments.
+
+**Validation first, UI second.** Before any canvas work, one wire-level ladder (WP10 rung 1):
+a two-person 10 s clip at the production recipe, same seed, (A) global prompt only, (B) two
+region prompts on static left and right boxes, (C) the same boxes with one subject crossing.
+Pass for (B) = attributes stay with their box; pass for (C) = the moving subject keeps its
+attributes across the crossing. If (B) fails at usable bias strengths, the bias alone is not
+enough and WP10 stops there (an adapter becomes the prerequisite).
+
 ### 4.5 What this deliberately does not do
 
 - Run or vendor any upstream Python (repo rule: ComfyBox is self-standing Swift/MLX).
@@ -278,6 +336,7 @@ The Motion tab stays as the quick single-shot path; Director is the editor.
 | WP7 (Phase 2) | Prompt relay residue: bias-strength dial, authoring preview, intra-chunk action-change ladder | WP2b | S |
 | WP8 (Phase 2b) | IC-LoRA weights + attention entries | WP6 | M |
 | WP9 (Phase 2) | Durable video/director jobs: serializable job state + crash recovery (today local video is non-persisted) | WP2c | M |
+| WP10 (Phase 2) | Regional prompting (§4.6): `regions` track in the timeline schema; spatiotemporal bias (per-frame interpolated box + soft edge) in `LTX2BeatSchedule`; compiler support incl. chunk-boundary split; wire-level ladder FIRST (two-person static + crossing), then the desktop Regions track | WP2b, WP7 | M (engine) + M (desktop) |
 
 Phase 1 = WP1, WP2a–d, WP3, WP4, WP5. It ships a usable Director: FFLF and middle keyframes,
 prompt relay via the beat schedule, long timelines, imported audio, project files, at
@@ -298,6 +357,10 @@ whatever recipe the resolver stack yields (the production config today).
 6. Reference guide (Phase 2): a hand-wave clip on the reference track, strength 1.0. Pass =
    the wave lands on the timeline where placed.
 
+7. Regions (Phase 2, WP10 gate): two people, one global prompt vs two region prompts on
+   static left/right boxes vs the same with a crossing. Pass = attributes stay in their box,
+   including through the crossing. Fail at usable strengths = stop WP10.
+
 ## 7. Risks
 
 - **Model ceiling.** The spike found jump cuts when keyframes sit too close; the motion
@@ -315,7 +378,11 @@ whatever recipe the resolver stack yields (the production config today).
 - **SwiftUI timeline UI is the largest desktop view yet.** Keep the model pure and tested;
   keep the canvas a thin renderer.
 - **IC-LoRA weights and licence.** Obtain and check before WP8.
-- **GPL-3.0 upstream.** Behaviour only; no code, no assets.
+- **GPL-3.0 upstream.** Behaviour only; no code, no assets. Applies to both Director and the
+  BBox Animator idea in §4.6.
+- **Regions without a tracking adapter may be weak.** An additive bias shapes attention; it
+  does not force a subject into a box. The upstream pairs the bias with an IC-LoRA for a
+  reason. WP10's first rung is the go/no-go, and small boxes are expected to underperform.
 
 ## 8. Codex review (2026-09-16, `codex exec`, read-only against the engine source)
 
