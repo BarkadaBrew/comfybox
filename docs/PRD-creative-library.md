@@ -231,6 +231,21 @@ Order matters: the store and the API first, then the surfaces that make it compo
 - **Scope.** Ten work packages is a programme, not a sprint. L1, L2 and L4 alone deliver most of
   the daily value; the rest can follow.
 
+## 11. Decisions (Todd, 2026-09-17)
+
+1. **Generate first, tab second.** L1, L2 and L4 ship as release one: slot fields, wardrobe,
+   outfit and component pickers, and the Looks row. The Library tab (L3) follows. A tab with
+   nothing generating from it is a museum.
+2. **Studio Packs migrate and retire in v1** (L8 moves into release one's tail). There is one
+   built-in pack and no in-app editing, so two template systems cost more than they protect.
+3. **Import the reference pack's wardrobe, then prune.** Its 336 garments and 10 categories are
+   the starting vocabulary; Todd deletes what does not fit. An empty wardrobe never gets filled.
+4. **Kira reads, Todd writes.** Kira and Bree consume the library; they may *propose* additions
+   from their own good renders, queued for Todd's approval, but never write directly. The library
+   is curated taste, which is where its value comes from.
+
+**Release one = L1 + L2 + L4 + L7 (import) + L8 (Studio Pack migration).**
+Release two = L3 (tab) + L5 (provenance loop) + L6 (packs out) + L7b + L9 + L10.
 ## 11. Open questions
 
 1. **Ship order.** L1+L2+L4 (slots and pickers in Generate, no tab) first, with the tab in a
