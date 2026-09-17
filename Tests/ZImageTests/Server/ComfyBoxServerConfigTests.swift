@@ -82,6 +82,49 @@ final class ComfyBoxServerConfigTests: XCTestCase {
     XCTAssertEqual(loaded.port, 7870)
   }
 
+  /// 2026-09-16: a save dropped the file's `video` block (the LTX-2
+  /// production recipe the resolver reads from disk). Unknown top-level keys
+  /// must survive; owned keys still follow `self`.
+  func testSavePreservesUnknownTopLevelKeysLikeTheVideoRecipe() throws {
+    let dir = try makeTempDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let path = dir.appendingPathComponent("config.json")
+    let onDisk = Data(#"""
+    { "port": 7870, "host": "127.0.0.1", "modelSpec": "old",
+      "replicate": { "apiKey": "sk-old" },
+      "video": { "sampler": "euler", "nag_scale": "5", "stage1_sigmas": "1,0.9953,0" },
+      "someFutureBlock": { "x": 1 } }
+    """#.utf8)
+    try onDisk.write(to: path)
+
+    var config = ComfyBoxServerConfig.loadOrMigrate(at: path)
+    config.modelSpec = "kroma-v0.3-base"
+    config.replicate = nil
+    try config.save(to: path)
+
+    let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: path)) as? [String: Any])
+    let video = try XCTUnwrap(root["video"] as? [String: Any], "the video recipe block survives a save")
+    XCTAssertEqual(video["sampler"] as? String, "euler")
+    XCTAssertEqual(video["stage1_sigmas"] as? String, "1,0.9953,0")
+    XCTAssertNotNil(root["someFutureBlock"], "any unmodelled key survives")
+    XCTAssertEqual(root["modelSpec"] as? String, "kroma-v0.3-base", "owned keys follow self")
+    XCTAssertNil(root["replicate"], "clearing an owned optional still removes it")
+    XCTAssertEqual(ComfyBoxServerConfig.loadOrMigrate(at: path).modelSpec, "kroma-v0.3-base")
+  }
+
+  func testOwnedTopLevelKeysCoverEveryEncodedKey() throws {
+    let full = ComfyBoxServerConfig(port: 1, host: "h", modelSpec: "m")
+    var withOptionals = full
+    withOptionals.allowedOutputDirectory = "/x"
+    withOptionals.seedvr2WeightsPath = "/y"
+    withOptionals.replicate = ReplicateProviderConfig(apiKey: "k", baseUrl: nil, model: nil, imageModel: nil, videoModel: nil)
+    let root = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(withOptionals)) as? [String: Any])
+    for key in root.keys {
+      XCTAssertTrue(ComfyBoxServerConfig.ownedTopLevelKeys.contains(key),
+                    "encoded key '\(key)' must be listed as owned, or a save would let a stale on-disk copy shadow it")
+    }
+  }
+
   // MARK: - Migration (non-destructive)
 
   func testMigrateFoldsReplicateAndEnhancerLeavingOriginalsUntouched() throws {
