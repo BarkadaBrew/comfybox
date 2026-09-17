@@ -225,6 +225,31 @@ final class DirectorRouteTests: XCTestCase {
     XCTAssertEqual(left, ["director-abc.mp4"])
   }
 
+  /// Production passes the configured output directory verbatim
+  /// ("~/Pictures/ComfyBox"). Cleanup used to list the unexpanded path, fail
+  /// silently, and leave every chunk mp4, sidecar and last-frame PNG behind.
+  func testCleanupAndMaterializeExpandTildeDirectory() throws {
+    let home = NSHomeDirectory()
+    let name = "director-tilde-\(UUID().uuidString)"
+    let real = URL(fileURLWithPath: home).appendingPathComponent("Library/Caches/\(name)")
+    try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: real) }
+    let tilde = "~/Library/Caches/\(name)"
+
+    var t = DirectorTimeline(
+      settings: .init(width: 576, height: 896, lengthFrames: 289),
+      globalPrompt: "x",
+      keyframes: [.init(id: "k1", imageBase64: Data([1, 2, 3]).base64EncodedString(), frame: 0)])
+    let written = try WarmServer.directorMaterializeAssets(&t, session: "tl", directory: tilde)
+    XCTAssertEqual(written, [real.appendingPathComponent("director-tl-asset-k1.png").path])
+
+    try Data("final".utf8).write(to: real.appendingPathComponent("director-tl.mp4"))
+    try Data("chunk".utf8).write(to: real.appendingPathComponent("director-tl-chunk0.mp4"))
+    try Data("carry".utf8).write(to: real.appendingPathComponent("director-tl-chunk0-lastframe.png"))
+    WarmServer.directorRemoveIntermediates(session: "tl", directory: tilde, extra: [])
+    XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: real.path), ["director-tl.mp4"])
+  }
+
   func testMaterializeRejectsInvalidBase64() {
     var t = DirectorTimeline(
       settings: .init(width: 576, height: 896, lengthFrames: 289),
