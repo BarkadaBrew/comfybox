@@ -111,6 +111,24 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeEnhancePrompt(arguments)
       case "list_characters":
         return try await executeGet("/v1/characters")
+      case "library_search":
+        return try await executeLibrarySearch(arguments)
+      case "library_get":
+        return try await executeLibraryGet(arguments)
+      case "library_facets":
+        return try await executeGet("/v1/library/facets")
+      case "library_fill_template":
+        return try await executeLibraryFill(arguments)
+      case "library_upsert":
+        return try await executeLibraryUpsert(arguments)
+      case "library_mark_used":
+        return try await executeLibraryMarkUsed(arguments)
+      case "library_delete":
+        return try await executeLibraryDelete(arguments)
+      case "library_collection_upsert":
+        return try await executeLibraryCollectionUpsert(arguments)
+      case "library_collection_delete":
+        return try await executeLibraryCollectionDelete(arguments)
       case "list_presets":
         return try await executeGet("/v1/presets")
       case "import_legacy_presets":
@@ -1252,6 +1270,109 @@ public final class MCPToolExecutor: @unchecked Sendable {
   // MARK: - Helpers
 
   /// Generic GET endpoint handler.
+  // MARK: - Creative Library
+
+  /// library_search -> GET /v1/library/items with the filter params flattened
+  /// onto the query string (`facets` becomes `facet.<axis>=a,b`).
+  private func executeLibrarySearch(_ params: MCPParams?) async throws -> MCPToolResult {
+    var query: [String: String] = [:]
+    for key in ["kind", "q", "collection", "component_kind", "category", "order"] {
+      if let value = params?.string(key), !value.isEmpty { query[key] = value }
+    }
+    if let rating = params?.integer("min_rating") { query["min_rating"] = String(rating) }
+    if let limit = params?.integer("limit") { query["limit"] = String(limit) }
+    if params?.bool("favorites") == true { query["favorites"] = "true" }
+    if let facets = params?.dict("facets") {
+      for (axis, value) in facets {
+        guard let text = value.stringValue, !text.isEmpty else { continue }
+        query["facet.\(axis)"] = text
+      }
+    }
+    let encoded = query
+      .sorted { $0.key < $1.key }
+      .map { key, value in
+        let k = key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? key
+        let v = value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? value
+        return "\(k)=\(v)"
+      }
+      .joined(separator: "&")
+    let path = encoded.isEmpty ? "/v1/library/items" : "/v1/library/items?\(encoded)"
+    return try await executeGet(path)
+  }
+
+  private func executeLibraryGet(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let id = params?.string("id"), !id.isEmpty else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+    return try await executeGet("/v1/library/items/\(encoded)")
+  }
+
+  private func executeLibraryFill(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let params, let templateId = params.string("template_id"), !templateId.isEmpty else {
+      return MCPToolResult(error: "Error: 'template_id' is required")
+    }
+    let body = try JSONEncoder().encode(params.raw)
+    let (status, data) = try await client.post("/v1/library/fill", body: body)
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  /// library_upsert -> POST /v1/library/items. Params ARE the wire payload,
+  /// like create_character and create_preset.
+  private func executeLibraryUpsert(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let params, let id = params.string("id"), !id.isEmpty else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    guard params.string("kind")?.isEmpty == false else {
+      return MCPToolResult(error: "Error: 'kind' is required")
+    }
+    guard params.string("name")?.isEmpty == false else {
+      return MCPToolResult(error: "Error: 'name' is required")
+    }
+    let body = try JSONEncoder().encode(params.raw)
+    let (status, data) = try await client.post("/v1/library/items", body: body)
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  private func executeLibraryMarkUsed(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let id = params?.string("id"), !id.isEmpty else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+    let (status, data) = try await client.post("/v1/library/used/\(encoded)", body: Data("{}".utf8))
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  private func executeLibraryDelete(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let id = params?.string("id"), !id.isEmpty else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+    let (status, data) = try await client.delete("/v1/library/items/\(encoded)")
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  private func executeLibraryCollectionUpsert(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let params, params.string("id")?.isEmpty == false else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    guard params.string("name")?.isEmpty == false else {
+      return MCPToolResult(error: "Error: 'name' is required")
+    }
+    let body = try JSONEncoder().encode(params.raw)
+    let (status, data) = try await client.post("/v1/library/collections", body: body)
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  private func executeLibraryCollectionDelete(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let id = params?.string("id"), !id.isEmpty else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+    let (status, data) = try await client.delete("/v1/library/collections/\(encoded)")
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
   private func executeGet(_ path: String) async throws -> MCPToolResult {
     let (status, data) = try await client.get(path)
     return Self.mapHTTPResponse(status: status, data: data)

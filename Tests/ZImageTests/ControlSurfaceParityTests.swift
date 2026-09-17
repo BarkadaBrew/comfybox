@@ -50,8 +50,9 @@ final class ControlSurfaceParityTests: XCTestCase {
   /// Director WP2c added POST /v1/video/director + /validate: 99 → 101.
   /// FDD-glimmer-gpu-slot added the inference-slot protocol (POST/GET
   /// /v1/queue/inference-slot, GET/DELETE …/{id}, POST …/{id}/renew) to BOTH
-  /// dispatch switches — sync control plane + async arm, five tuples each: 101 → 111.
-  private static let expectedWarmServerTuples = 111
+  /// dispatch switches — sync control plane + async arm, five tuples each: 101 → 111,
+  /// then → 123 with the Creative Library routes (PRD-creative-library L2).
+  private static let expectedWarmServerTuples = 123
   private static let expectedBridgeTuples = 17
 
   private static let repoRoot: URL = {

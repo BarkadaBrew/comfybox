@@ -34,8 +34,10 @@ final class MCPParityPhase1ToolTests: XCTestCase {
   /// (comfybox#289): get_job. Bumped 56 -> 57 by #273: nearline_anchor.
   /// Bumped 57 -> 59 by #447 (Local mode): set_admission_mode, get_admission_mode.
   /// Bumped 59 -> 61 by Director WP2c: generate_director_video, validate_director_timeline.
+  /// Bumped 61 -> 70 by the Creative Library (PRD-creative-library L2): library_search, _get,
+  /// _facets, _fill_template, _upsert, _mark_used, _delete, _collection_upsert, _collection_delete.
   func testTotalToolCountIncludesGapSet() {
-    XCTAssertEqual(MCPToolRegistry.tools.count, 61, "Expected 61 registered MCP tools after Phase 1 + Phase 3 + get_job + #273 + #447 + Director WP2c")
+    XCTAssertEqual(MCPToolRegistry.tools.count, 70, "Expected 70 registered MCP tools after Phase 1 + Phase 3 + get_job + #273 + #447 + Director WP2c + the Creative Library")
   }
 
   /// Every tool added in this session declares its route(s) (FDD §3.5 D5:

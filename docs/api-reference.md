@@ -46,6 +46,18 @@ or carry a reasoned exemption (§3.5 assertion 3).
 | POST | `/v1/generate/async` | generate_image |  |
 | GET | `/v1/generate/preview` |  |  |
 | GET | `/v1/generate/status/{id}` | get_job |  |
+| GET | `/v1/library/collections` |  |  |
+| POST | `/v1/library/collections` | library_collection_upsert |  |
+| PUT | `/v1/library/collections` | library_collection_upsert |  |
+| DELETE | `/v1/library/collections/{id}` | library_collection_delete |  |
+| GET | `/v1/library/facets` | library_facets |  |
+| POST | `/v1/library/fill` | library_fill_template |  |
+| GET | `/v1/library/items` | library_search |  |
+| POST | `/v1/library/items` | library_upsert |  |
+| PUT | `/v1/library/items` | library_upsert |  |
+| DELETE | `/v1/library/items/{id}` | library_delete |  |
+| GET | `/v1/library/items/{id}` | library_get |  |
+| POST | `/v1/library/used/{id}` | library_mark_used |  |
 | POST | `/v1/lora/swap` | swap_loras |  |
 | GET | `/v1/loras` |  |  |
 | POST | `/v1/loras/import` |  | Desktop drag-and-drop import (local file paths on the server host); agent flows discover LoRAs via lora_scan / nearline_stage instead. |

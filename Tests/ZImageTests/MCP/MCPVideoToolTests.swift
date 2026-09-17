@@ -45,8 +45,10 @@ final class MCPVideoToolTests: XCTestCase {
     // + get_job (one job model, comfybox#289, 2026-09-04) = 56;
     // + nearline_anchor (#273, 2026-09-04) = 57;
     // + set_admission_mode/get_admission_mode (Local mode, #447, 2026-09-15) = 59.
-    // + generate_director_video/validate_director_timeline (Director WP2c) = 61.
-    XCTAssertEqual(MCPToolRegistry.tools.count, 61, "Expected 61 registered MCP tools")
+    // + generate_director_video/validate_director_timeline (Director WP2c) = 61,
+    // + 9 Creative Library tools (PRD-creative-library L2) = 70.
+    XCTAssertEqual(
+      MCPToolRegistry.tools.count, 70, "Expected 70 registered MCP tools")
   }
 
   // MARK: - generate_video Schema (Story A1)
