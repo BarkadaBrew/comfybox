@@ -254,10 +254,15 @@ public enum LTX2BeatScheduleBuilder {
   /// One beat's frame-space midpoint/window for the CURRENT stage's frame
   /// count (never cached across stages — refine's frame count/resolution
   /// can differ from the base pass, so this is recomputed fresh every call).
-  private static func frameGeometry(_ beat: LTX2ResolvedBeat, frames: Int) -> (midpoint: Float, window: Float) {
+  /// PromptRelay's window margin (frames on the axis being biased).
+  public static let defaultWindowMargin: Float = 2
+
+  private static func frameGeometry(
+    _ beat: LTX2ResolvedBeat, frames: Int, margin: Float = defaultWindowMargin
+  ) -> (midpoint: Float, window: Float) {
     let midpoint = (beat.startFrac + beat.endFrac) * 0.5 * Float(frames)
     let span = max(beat.endFrac - beat.startFrac, 0) * Float(frames)
-    let window = max(span * 0.5 - 2, 0)
+    let window = max(span * 0.5 - max(margin, 0), 0)
     return (midpoint, window)
   }
 
@@ -277,7 +282,10 @@ public enum LTX2BeatScheduleBuilder {
     timelineFrames: Int? = nil,
     /// Query-frame rows that must receive no temporal penalty. I2V supplies
     /// its source/keyframe indices plus appended reference-frame indices.
-    unbiasedFrameIndices: Set<Int> = []
+    unbiasedFrameIndices: Set<Int> = [],
+    /// Latent frames trimmed off each side of every beat window
+    /// (`beat_window_margin`, default PromptRelay's 2).
+    windowMargin: Float = defaultWindowMargin
   ) -> MLXArray? {
     guard !resolved.isEmpty, frames > 0, tokensPerFrame > 0, textLen > 0 else { return nil }
     let geometryFrames = min(max(timelineFrames ?? frames, 1), frames)
@@ -287,7 +295,7 @@ public enum LTX2BeatScheduleBuilder {
 
     for beat in resolved {
       guard beat.tokenEnd > beat.tokenStart, beat.tokenStart >= 0, beat.tokenEnd <= textLen else { continue }
-      let (midpoint, window) = frameGeometry(beat, frames: geometryFrames)
+      let (midpoint, window) = frameGeometry(beat, frames: geometryFrames, margin: windowMargin)
       for q in 0..<videoTokens {
         let frameIndex = q / tokensPerFrame
         guard !unbiasedFrameIndices.contains(frameIndex) else { continue }

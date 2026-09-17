@@ -152,6 +152,34 @@ final class LTX2BeatScheduleBuilderTests: XCTestCase {
       "conditioning fps is a motion dial and must not move audio beat timing")
   }
 
+  // MARK: window margin
+
+  /// Two beats split at the midpoint of a 25-latent clip (the R5 ladder
+  /// geometry). With PromptRelay's margin 2 the latents next to the boundary
+  /// are penalised for BOTH beats; with margin 0 the windows meet, so the
+  /// latent just inside each beat's half carries no penalty for that beat.
+  func testWindowMarginZeroMakesBeatWindowsMeetAtTheBoundary() {
+    let beats = [
+      LTX2ResolvedBeat(tokenStart: 0, tokenEnd: 1, startFrac: 0, endFrac: 0.5, strength: 1),
+      LTX2ResolvedBeat(tokenStart: 1, tokenEnd: 2, startFrac: 0.5, endFrac: 1, strength: 1),
+    ]
+    func row(_ margin: Float, frame: Int) -> [Float] {
+      let bias = LTX2BeatScheduleBuilder.buildVideoBias(
+        resolved: beats, frames: 25, tokensPerFrame: 1, textLen: 2, windowMargin: margin)!
+      let flat = bias.asArray(Float.self)
+      return [flat[frame * 2], flat[frame * 2 + 1]]
+    }
+    // Default margin: latent 12 (just inside beat A's half) is penalised for A.
+    XCTAssertLessThan(row(2, frame: 12)[0], -1)
+    XCTAssertEqual(row(LTX2BeatScheduleBuilder.defaultWindowMargin, frame: 12), row(2, frame: 12))
+    // Margin 0: beat A is free at latent 12, beat B is free at latent 13.
+    XCTAssertEqual(row(0, frame: 12)[0], 0)
+    XCTAssertEqual(row(0, frame: 13)[1], 0)
+    // Each beat is still penalised deep inside the other beat's half.
+    XCTAssertLessThan(row(0, frame: 20)[0], -1)
+    XCTAssertLessThan(row(0, frame: 4)[1], -1)
+  }
+
   // MARK: I2V conditioning isolation
 
   func testI2VSourceAndReferenceFramesRemainUnbiased() {

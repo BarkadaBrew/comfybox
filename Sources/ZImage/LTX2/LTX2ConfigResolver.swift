@@ -103,6 +103,12 @@ public enum LTX2ConfigResolver {
     // nothing regardless of this switch; it exists to kill the feature
     // globally without a request-shape change if it misbehaves live.
     Entry(name: "beat_schedule_enabled", envKey: "LTX2_BEAT_SCHEDULE", tier: "A", kind: .boolNotZero, builtin: "true"),
+    // Beat window margin in LATENT frames: each beat's unpenalised window is
+    // `span/2 - margin` around its midpoint (PromptRelay's constant is 2).
+    // At 2 the four latents around every boundary are penalised for BOTH
+    // beats, so the outgoing beat carries through them and the switch
+    // midpoint lands ~0.6 s late (Director ladder R5, 2026-09-17).
+    Entry(name: "beat_window_margin", envKey: "LTX2_BEAT_WINDOW_MARGIN", tier: "A", kind: .float(0...8), builtin: "2"),
     // Tier B — machine-shaped
     Entry(name: "plain_decode_max_vol", envKey: "LTX2_PLAIN_DECODE_MAX_VOL", tier: "B", kind: .int(1...1_000_000), builtin: "4500"),
     Entry(name: "refine_max_vol", envKey: "LTX2_REFINE_MAX_VOL", tier: "B", kind: .int(1...1_000_000), builtin: "12000"),
@@ -294,6 +300,7 @@ public struct LTX2VideoTuning: Codable, Sendable, Equatable {
   public var nagTau: Float?
   public var reanchorInterval: Int?
   public var reanchorStrength: Float?
+  public var beatWindowMargin: Float?
   public init() {}
 
   /// comfybox#307: merge the video routes' top-level `two_pass` convenience
@@ -356,6 +363,8 @@ public struct LTX2ResolvedVideoConfig: Sendable {
   /// request/preset override — `beat_schedule` presence/absence on the
   /// request is the per-render knob; this is only the emergency-off env.
   public let beatScheduleEnabled: Bool
+  /// Latent-frame margin trimmed off each beat's window (`beat_window_margin`).
+  public let beatWindowMargin: Float
   // Tier B
   public let plainDecodeMaxVol: Int
   public let refineMaxVol: Int
@@ -422,6 +431,7 @@ public struct LTX2ResolvedVideoConfig: Sendable {
     case "reanchor_interval": return String(reanchorInterval)
     case "reanchor_strength": return fmt(reanchorStrength)
     case "beat_schedule_enabled": return beatScheduleEnabled ? "true" : "false"
+    case "beat_window_margin": return fmt(beatWindowMargin)
     default: return nil
     }
   }
@@ -523,6 +533,7 @@ extension LTX2ConfigResolver {
       reanchorInterval: pick("reanchor_interval", i("reanchor_interval"), preset?.reanchorInterval, request?.reanchorInterval),
       reanchorStrength: pick("reanchor_strength", f("reanchor_strength"), preset?.reanchorStrength, request?.reanchorStrength),
       beatScheduleEnabled: b("beat_schedule_enabled"),
+      beatWindowMargin: pick("beat_window_margin", f("beat_window_margin"), preset?.beatWindowMargin, request?.beatWindowMargin),
       plainDecodeMaxVol: i("plain_decode_max_vol"),
       refineMaxVol: i("refine_max_vol"),
       maxLongEdge: i("max_long_edge"),

@@ -121,6 +121,17 @@ final class LTX2ConfigResolverTests: XCTestCase {
     XCTAssertEqual(sigmas?.source, .builtin)
   }
 
+  func testBeatWindowMarginDefaultsToPromptRelayAndAcceptsRequestOverride() throws {
+    let base = LTX2ConfigResolver.resolveTyped(request: nil, preset: nil, environment: [:], configFile: [:])
+    XCTAssertEqual(base.beatWindowMargin, 2)
+    XCTAssertEqual(base.provenance["beat_window_margin"], .builtin)
+    let dec = JSONDecoder(); dec.keyDecodingStrategy = .convertFromSnakeCase
+    let req = try dec.decode(LTX2VideoTuning.self, from: Data(#"{"beat_window_margin": 0.5}"#.utf8))
+    let r = LTX2ConfigResolver.resolveTyped(request: req, preset: nil, environment: [:], configFile: [:])
+    XCTAssertEqual(r.beatWindowMargin, 0.5)
+    XCTAssertEqual(r.provenance["beat_window_margin"], .request)
+  }
+
   func testEveryTierAAndBParamIsPresent() {
     let params = LTX2ConfigResolver.resolveEffective(environment: [:], configFile: [:])
     let names = Set(params.map(\.name))
@@ -129,7 +140,7 @@ final class LTX2ConfigResolverTests: XCTestCase {
       "two_stage", "cond_fps", "img_compression", "sampler", "stg_scale", "stg_head_boost",
       "face_anchor_strength", "ic_control", "nag_scale", "nag_alpha", "nag_tau",
       "plain_decode_max_vol", "refine_max_vol", "decode_mode", "upsampler_path",
-      "video_bits_per_px",
+      "video_bits_per_px", "beat_window_margin",
     ] {
       XCTAssertTrue(names.contains(expected), "registry missing \(expected)")
     }
