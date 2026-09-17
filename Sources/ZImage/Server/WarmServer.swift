@@ -365,6 +365,8 @@ public final class WarmServer {
   let lifecycleLedger = QueueLifecycleLedger()
   /// Generation presets (~/.comfybox/presets.json). Seeds defaults on first run.
   let presetStore = PresetStore()
+  /// The Creative Library (PRD docs/PRD-creative-library.md): reusable material.
+  let libraryStore = LibraryStore()
   /// Content-mode definitions (~/.comfybox/content-modes.json). Built-ins ship in-code.
   let contentModeStore = ContentModeStore.loadOrCreate()
   /// Append-only audit trail (~/.comfybox/audit-log.jsonl).
@@ -2016,6 +2018,40 @@ public final class WarmServer {
 
     case ("DELETE", _) where request.path.hasPrefix("/v1/presets/"):
       return deletePresetResponse(rawId: String(request.path.dropFirst("/v1/presets/".count)))
+
+    // MARK: - Creative Layer: the Library (PRD-creative-library L2)
+
+    case ("GET", "/v1/library/items"):
+      return Self.libraryList(store: libraryStore, query: request.queryParameters)
+
+    case ("POST", "/v1/library/items"), ("PUT", "/v1/library/items"):
+      return libraryUpsertResponse(body: request.body)
+
+    case ("POST", "/v1/library/fill"):
+      return Self.libraryFill(store: libraryStore, body: request.body)
+
+    case ("GET", "/v1/library/facets"):
+      return .json(status: 200, payload: libraryStore.facetCounts())
+
+    case ("GET", "/v1/library/collections"):
+      return .json(status: 200, payload: libraryStore.allCollections())
+
+    case ("POST", "/v1/library/collections"), ("PUT", "/v1/library/collections"):
+      return libraryUpsertCollectionResponse(body: request.body)
+
+    case ("DELETE", _) where request.path.hasPrefix("/v1/library/collections/"):
+      return libraryDeleteCollectionResponse(
+        rawId: String(request.path.dropFirst("/v1/library/collections/".count)))
+
+    case ("POST", _) where request.path.hasPrefix("/v1/library/used/"):
+      return libraryMarkUsedResponse(
+        rawId: String(request.path.dropFirst("/v1/library/used/".count)))
+
+    case ("GET", _) where request.path.hasPrefix("/v1/library/items/"):
+      return libraryGetResponse(rawId: String(request.path.dropFirst("/v1/library/items/".count)))
+
+    case ("DELETE", _) where request.path.hasPrefix("/v1/library/items/"):
+      return libraryDeleteResponse(rawId: String(request.path.dropFirst("/v1/library/items/".count)))
 
     // MARK: - Creative Layer: Content modes
 
@@ -4881,6 +4917,171 @@ public final class WarmServer {
   }
 
   // Presets ------------------------------------------------------------------
+
+
+  // MARK: - Library routes (PRD-creative-library L2)
+
+  /// `GET /v1/library/items` — the one read every picker and the Library tab
+  /// use. Filters: `kind` (comma-separated), `facet.<axis>` (comma-separated,
+  /// ORed within an axis and ANDed across axes), `collection`, `component_kind`,
+  /// `category`, `q`, `min_rating`, `favorites`, `include_archived`, `order`,
+  /// `limit`.
+  static func libraryList(store: LibraryStore, query: [String: String]) -> RoutedResponse {
+    func list(_ raw: String?) -> [String] {
+      (raw ?? "").split(separator: ",").map {
+        $0.trimmingCharacters(in: .whitespaces)
+      }.filter { !$0.isEmpty }
+    }
+    var q = LibraryQuery()
+    q.kinds = list(query["kind"]).compactMap(LibraryItemKind.init(rawValue:))
+    for (key, value) in query where key.hasPrefix("facet.") {
+      let axis = String(key.dropFirst("facet.".count))
+      guard !axis.isEmpty else { continue }
+      q.facets[axis, default: []].append(contentsOf: list(value))
+    }
+    q.collection = query["collection"]
+    q.componentKind = query["component_kind"]
+    q.category = query["category"]
+    q.text = query["q"]
+    q.minRating = query["min_rating"].flatMap(Int.init)
+    q.favoritesOnly = boolQueryFlag(query["favorites"])
+    q.includeArchived = boolQueryFlag(query["include_archived"])
+    if let order = query["order"] { q.order = order }
+    if let limit = query["limit"].flatMap(Int.init) { q.limit = min(max(limit, 1), 1000) }
+    return .json(status: 200, payload: store.search(q))
+  }
+
+  private static func boolQueryFlag(_ raw: String?) -> Bool {
+    guard let raw else { return false }
+    return ["1", "true", "yes"].contains(raw.lowercased())
+  }
+
+  private func libraryGetResponse(rawId: String) -> RoutedResponse {
+    guard let id = Self.pathIdComponent(rawId) else {
+      return .error(.error(status: 400, message: "Invalid library item id"))
+    }
+    guard let item = libraryStore.item(id: id) else {
+      return .error(.error(status: 404, message: "Library item not found: \(id)"))
+    }
+    return .json(status: 200, payload: item)
+  }
+
+  private func libraryUpsertResponse(body: Data) -> RoutedResponse {
+    let (response, saved) = Self.libraryUpsert(store: libraryStore, body: body)
+    if let saved {
+      auditLog.append(
+        kind: "library.upsert", message: "Upserted library \(saved.kind.rawValue) \(saved.id)",
+        metadata: ["id": saved.id, "kind": saved.kind.rawValue])
+    }
+    return response
+  }
+
+  static func libraryUpsert(store: LibraryStore, body: Data) -> (RoutedResponse, saved: LibraryEntry?) {
+    do {
+      let item = try JSONDecoder().decode(LibraryEntry.self, from: body)
+      let saved = try store.upsert(item)
+      return (.json(status: 200, payload: saved), saved)
+    } catch let error as LibraryError {
+      return (.error(.error(status: 400, message: error.localizedDescription)), nil)
+    } catch {
+      return (.error(.error(
+        status: 400,
+        message: "Invalid library item payload: \(error.localizedDescription)")), nil)
+    }
+  }
+
+  private func libraryDeleteResponse(rawId: String) -> RoutedResponse {
+    guard let id = Self.pathIdComponent(rawId) else {
+      return .error(.error(status: 400, message: "Invalid library item id"))
+    }
+    do {
+      let deleted = try libraryStore.delete(id: id)
+      if deleted {
+        auditLog.append(kind: "library.delete", message: "Deleted library item \(id)", metadata: ["id": id])
+      }
+      return .json(
+        status: deleted ? 200 : 404, payload: DeleteResult(success: deleted, id: id, deleted: deleted))
+    } catch {
+      return .error(.error(status: 500, message: "Failed to delete library item: \(error.localizedDescription)"))
+    }
+  }
+
+  private func libraryMarkUsedResponse(rawId: String) -> RoutedResponse {
+    guard let id = Self.pathIdComponent(rawId) else {
+      return .error(.error(status: 400, message: "Invalid library item id"))
+    }
+    do {
+      return .json(status: 200, payload: try libraryStore.markUsed(id: id))
+    } catch let error as LibraryError {
+      return .error(.error(status: 404, message: error.localizedDescription))
+    } catch {
+      return .error(.error(status: 500, message: error.localizedDescription))
+    }
+  }
+
+  private func libraryUpsertCollectionResponse(body: Data) -> RoutedResponse {
+    do {
+      let collection = try JSONDecoder().decode(LibraryCollection.self, from: body)
+      return .json(status: 200, payload: try libraryStore.upsertCollection(collection))
+    } catch let error as LibraryError {
+      return .error(.error(status: 400, message: error.localizedDescription))
+    } catch {
+      return .error(.error(status: 400, message: "Invalid collection payload: \(error.localizedDescription)"))
+    }
+  }
+
+  private func libraryDeleteCollectionResponse(rawId: String) -> RoutedResponse {
+    guard let id = Self.pathIdComponent(rawId) else {
+      return .error(.error(status: 400, message: "Invalid collection id"))
+    }
+    do {
+      let deleted = try libraryStore.deleteCollection(id: id)
+      return .json(
+        status: deleted ? 200 : 404, payload: DeleteResult(success: deleted, id: id, deleted: deleted))
+    } catch {
+      return .error(.error(status: 500, message: error.localizedDescription))
+    }
+  }
+
+  /// `POST /v1/library/fill` — `{template_id | template, values{}, outfit_id?}`
+  /// returns the filled prompt. An unfilled slot stays visible as `{SLOT}`
+  /// (the Studio Pack contract). `outfit_id` resolves that outfit's phrase and
+  /// offers it as the `OUTFIT` value when the caller did not supply one.
+  static func libraryFill(store: LibraryStore, body: Data) -> RoutedResponse {
+    struct FillRequest: Decodable {
+      var templateId: String?
+      var values: [String: String]?
+      var outfitId: String?
+      enum CodingKeys: String, CodingKey {
+        case templateId = "template_id"
+        case values
+        case outfitId = "outfit_id"
+      }
+    }
+    struct FillResult: Encodable {
+      let prompt: String
+      let unfilled: [String]
+    }
+    do {
+      let req = try JSONDecoder().decode(FillRequest.self, from: body)
+      guard let templateId = req.templateId, let template = store.item(id: templateId) else {
+        return .error(.error(status: 404, message: "Template not found"))
+      }
+      guard template.kind == .template else {
+        return .error(.error(status: 400, message: "Item \(templateId) is not a template"))
+      }
+      var values = req.values ?? [:]
+      if let outfitId = req.outfitId, let outfit = store.item(id: outfitId) {
+        let phrase = store.renderOutfit(outfit)
+        if !phrase.isEmpty, values["OUTFIT"] == nil { values["OUTFIT"] = phrase }
+      }
+      let prompt = LibraryStore.fill(template: template, values: values)
+      let unfilled = LibraryStore.slotMarkers(in: prompt).sorted()
+      return .json(status: 200, payload: FillResult(prompt: prompt, unfilled: unfilled))
+    } catch {
+      return .error(.error(status: 400, message: "Invalid fill payload: \(error.localizedDescription)"))
+    }
+  }
 
   private func presetsListResponse() -> RoutedResponse {
     Self.presetsList(store: presetStore)

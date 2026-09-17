@@ -51,6 +51,15 @@ public enum MCPToolRegistry {
     enhancePrompt.annotated(.additive),
     listCharacters.annotated(.readOnly),
     listPresets.annotated(.readOnly),
+    librarySearch.annotated(.readOnly),
+    libraryGet.annotated(.readOnly),
+    libraryFacets.annotated(.readOnly),
+    libraryFillTemplate.annotated(.readOnly),
+    libraryUpsert.annotated(.additive),
+    libraryMarkUsed.annotated(.additive),
+    libraryDelete.annotated(.destructive),
+    libraryCollectionUpsert.annotated(.additive),
+    libraryCollectionDelete.annotated(.destructive),
     importLegacyPresets.annotated(.additive),
     queueList.annotated(.readOnly),
     interruptRender.annotated(.destructive),
@@ -1013,6 +1022,162 @@ public enum MCPToolRegistry {
     name: "list_characters",
     description: "List creative characters and scenes (name, kind, tiered descriptions, default LoRAs, tags).",
     inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+  )
+
+  // MARK: - Creative Library (PRD-creative-library L2)
+
+  static let librarySearch = MCPToolDefinition(
+    name: "library_search",
+    description: """
+      Search the Creative Library: reusable templates (with slots), scene/pose/lighting \
+      components, wardrobe items, outfits, looks and recipes. Use this before writing a prompt \
+      from scratch — it is Todd's curated material.
+      """,
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "kind": ["type": "string", "description": "Comma-separated: template, component, wardrobe_item, outfit, look, recipe"],
+        "q": ["type": "string", "description": "Free text over name, value, notes, category"],
+        "facets": [
+          "type": "object",
+          "description": "Axis -> comma-separated values, e.g. {\"mood\": \"Calm,Soft\"}. Values within an axis are ORed; axes are ANDed.",
+        ] as [String: Any],
+        "collection": ["type": "string"],
+        "component_kind": ["type": "string", "description": "scene | pose | lighting | camera | expression | styling | negative"],
+        "category": ["type": "string", "description": "Wardrobe category, e.g. Tops"],
+        "min_rating": ["type": "integer"],
+        "favorites": ["type": "boolean"],
+        "order": ["type": "string", "description": "recent | rating | use_count | name"],
+        "limit": ["type": "integer"],
+      ] as [String: Any],
+    ] as [String: Any],
+    routes: [RouteRef(method: "GET", path: "/v1/library/items")]
+  )
+
+  static let libraryGet = MCPToolDefinition(
+    name: "library_get",
+    description: "Read one Creative Library item by id.",
+    inputSchema: [
+      "type": "object",
+      "properties": ["id": ["type": "string"]] as [String: Any],
+      "required": ["id"],
+    ] as [String: Any],
+    routes: [RouteRef(method: "GET", path: "/v1/library/items/{id}")]
+  )
+
+  static let libraryFacets = MCPToolDefinition(
+    name: "library_facets",
+    description: "The Creative Library's facet vocabulary with counts (axis -> value -> count).",
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any],
+    routes: [RouteRef(method: "GET", path: "/v1/library/facets")]
+  )
+
+  static let libraryFillTemplate = MCPToolDefinition(
+    name: "library_fill_template",
+    description: """
+      Fill a Creative Library template's slots and get the prompt back. An unfilled slot stays \
+      visible as {SLOT} and is listed in `unfilled`. Pass `outfit_id` to drop an outfit's phrase \
+      into the OUTFIT slot.
+      """,
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "template_id": ["type": "string"],
+        "values": ["type": "object", "description": "Slot id -> text"] as [String: Any],
+        "outfit_id": ["type": "string"],
+      ] as [String: Any],
+      "required": ["template_id"],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/library/fill")]
+  )
+
+  static let libraryUpsert = MCPToolDefinition(
+    name: "library_upsert",
+    description: """
+      Create or replace a Creative Library item. WRITE ACCESS: Bree curates on Todd's behalf; \
+      Kira proposes rather than writes. Required: id, kind, name. Kinds: template (with slots), \
+      component, wardrobe_item, outfit, look, recipe.
+      """,
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string"],
+        "kind": ["type": "string"],
+        "name": ["type": "string"],
+        "value": ["type": "string", "description": "The text this item contributes to a prompt"],
+        "facets": ["type": "object"] as [String: Any],
+        "collections": ["type": "array", "items": ["type": "string"]] as [String: Any],
+        "rating": ["type": "integer"],
+        "favorite": ["type": "boolean"],
+        "notes": ["type": "string"],
+        "category": ["type": "string"],
+        "subtype": ["type": "string"],
+        "item_type": ["type": "string"],
+        "component_kind": ["type": "string"],
+        "items": ["type": "array", "items": ["type": "string"], "description": "Outfit: ordered wardrobe item ids"] as [String: Any],
+        "slots": ["type": "array", "description": "Template: [{id, label, default, options}]"] as [String: Any],
+        "source": ["type": "string"],
+      ] as [String: Any],
+      "required": ["id", "kind", "name"],
+    ] as [String: Any],
+    routes: [
+      RouteRef(method: "POST", path: "/v1/library/items"),
+      RouteRef(method: "PUT", path: "/v1/library/items"),
+    ]
+  )
+
+  static let libraryDelete = MCPToolDefinition(
+    name: "library_delete",
+    description: "Delete a Creative Library item by id. Bree curates on Todd's behalf; Kira proposes rather than deletes.",
+    inputSchema: [
+      "type": "object",
+      "properties": ["id": ["type": "string"]] as [String: Any],
+      "required": ["id"],
+    ] as [String: Any],
+    routes: [RouteRef(method: "DELETE", path: "/v1/library/items/{id}")]
+  )
+
+  static let libraryCollectionUpsert = MCPToolDefinition(
+    name: "library_collection_upsert",
+    description: "Create or replace a Creative Library collection (id, name, colour, parent, order).",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string"],
+        "name": ["type": "string"],
+        "color": ["type": "string", "description": "Hex, e.g. #35d7ff"],
+        "parent_id": ["type": "string"],
+        "display_order": ["type": "integer"],
+        "membership": ["type": "string", "description": "manual | derived | pack"],
+      ] as [String: Any],
+      "required": ["id", "name"],
+    ] as [String: Any],
+    routes: [
+      RouteRef(method: "POST", path: "/v1/library/collections"),
+      RouteRef(method: "PUT", path: "/v1/library/collections"),
+    ]
+  )
+
+  static let libraryCollectionDelete = MCPToolDefinition(
+    name: "library_collection_delete",
+    description: "Delete a Creative Library collection. Its items are unfiled, never deleted.",
+    inputSchema: [
+      "type": "object",
+      "properties": ["id": ["type": "string"]] as [String: Any],
+      "required": ["id"],
+    ] as [String: Any],
+    routes: [RouteRef(method: "DELETE", path: "/v1/library/collections/{id}")]
+  )
+
+  static let libraryMarkUsed = MCPToolDefinition(
+    name: "library_mark_used",
+    description: "Record that a library item was used in a render. Feeds the use-count ranking.",
+    inputSchema: [
+      "type": "object",
+      "properties": ["id": ["type": "string"]] as [String: Any],
+      "required": ["id"],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/library/used/{id}")]
   )
 
   static let listPresets = MCPToolDefinition(
