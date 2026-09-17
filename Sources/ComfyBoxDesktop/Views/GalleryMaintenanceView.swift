@@ -62,7 +62,7 @@ struct GalleryMaintenanceView: View {
 
     // MARK: - Missing assets
 
-    @State private var missingCount: Int?
+    @State private var missingReport: DAMStore.MissingFileReport?
     @State private var missingScanning = false
     @State private var missingRemoving = false
     @State private var missingRemoved: Int?
@@ -198,12 +198,23 @@ struct GalleryMaintenanceView: View {
 
     private var missingSection: some View {
         Section("Missing Assets") {
-            if let missingCount {
-                Text(Self.missingAssetsLine(count: missingCount))
+            if let missingReport {
+                Text(Self.missingAssetsLine(orphans: missingReport.orphans.count,
+                                            unattached: missingReport.unattached.count))
                     .foregroundStyle(.secondary)
+                if let unattached = Self.unattachedLine(
+                    volumes: Self.volumeNames(paths: missingReport.unattached.map(\.absolutePath)),
+                    count: missingReport.unattached.count) {
+                    Text(unattached).font(.caption).foregroundStyle(.secondary)
+                }
             }
             if let missingRemoved {
                 Text(Self.missingRemovedLine(count: missingRemoved))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let staleLocationsRemoved {
+                Text("Also cleaned \(staleLocationsRemoved) stale location row\(staleLocationsRemoved == 1 ? "" : "s")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -211,16 +222,16 @@ struct GalleryMaintenanceView: View {
                 Text(missingError).font(.caption).foregroundStyle(.red)
             }
             HStack {
-                Button(missingCount == nil ? "Scan" : "Rescan") {
+                Button(missingReport == nil ? "Scan" : "Rescan") {
                     Task { await scanMissing() }
                 }
                 .disabled(missingScanning)
 
-                if let missingCount, self.missingRemoved == nil {
-                    Button("Remove") {
+                if let missingReport, self.missingRemoved == nil {
+                    Button("Remove \(missingReport.orphans.count)") {
                         Task { await removeMissing() }
                     }
-                    .disabled(missingRemoving || missingCount == 0)
+                    .disabled(missingRemoving || missingReport.orphans.isEmpty)
                 }
 
                 if missingScanning || missingRemoving {
@@ -236,7 +247,7 @@ struct GalleryMaintenanceView: View {
         missingRemoved = nil
         defer { missingScanning = false }
         do {
-            missingCount = try await Self.countMissingAssets(store: store)
+            missingReport = try await maintenance.scanMissingFiles()
         } catch {
             missingError = error.localizedDescription
         }
@@ -246,12 +257,20 @@ struct GalleryMaintenanceView: View {
         missingRemoving = true
         defer { missingRemoving = false }
         do {
-            missingRemoved = try await ingestor.pruneOrphans()
-            missingCount = nil
+            // The REVIEWED path: the operator has seen the list, so the
+            // unattended sweep's circuit breaker does not apply. Unattached
+            // rows are never included.
+            let ids = missingReport?.orphans.map(\.id) ?? []
+            missingRemoved = try await maintenance.purgeMissingFiles(ids: ids)
+            let stale = (try? await maintenance.vacuumStaleLocations()) ?? 0
+            staleLocationsRemoved = stale > 0 ? stale : nil
+            missingReport = nil
         } catch {
             missingError = error.localizedDescription
         }
     }
+
+    @State private var staleLocationsRemoved: Int?
 
     /// Page size for the paged walk below. Bounds how many `(id, path)`
     /// pairs are held in memory at once regardless of library size (#265).
@@ -483,8 +502,33 @@ struct GalleryMaintenanceView: View {
         return "Delete \(count) orphan \(word) (\(byteString(bytes)))?"
     }
 
-    static func missingAssetsLine(count: Int) -> String {
-        "\(count) asset\(count == 1 ? "" : "s") whose file is gone"
+    /// The headline: how many rows name a file that was deleted. Rows on a
+    /// drive that is not attached are NOT counted here — see `unattachedLine`.
+    static func missingAssetsLine(orphans: Int, unattached: Int) -> String {
+        guard orphans > 0 || unattached > 0 else { return "No missing files" }
+        guard orphans > 0 else { return "No deleted files" }
+        return "\(orphans) asset\(orphans == 1 ? "" : "s") whose file is gone"
+    }
+
+    /// The second line: rows waiting on a drive, with the drive names. There
+    /// is deliberately no action offered for these.
+    static func unattachedLine(volumes: [String], count: Int) -> String? {
+        guard count > 0, !volumes.isEmpty else { return nil }
+        let list = volumes.joined(separator: ", ")
+        return "\(count) more on a drive that is not attached (\(list)) — left alone"
+    }
+
+    /// Volume names, in order, from a set of `/Volumes/<name>/…` paths.
+    static func volumeNames(paths: [String]) -> [String] {
+        var seen = Set<String>()
+        var names: [String] = []
+        for path in paths {
+            let parts = (path as NSString).pathComponents
+            guard parts.count >= 3, parts[0] == "/", parts[1] == "Volumes" else { continue }
+            let name = parts[2]
+            if seen.insert(name).inserted { names.append(name) }
+        }
+        return names.sorted()
     }
 
     static func missingRemovedLine(count: Int) -> String {
