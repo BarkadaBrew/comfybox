@@ -542,6 +542,11 @@ public actor DAMStore {
     /// needs (a restore's live-row lookup, a folder's member set, a
     /// crash-recovery sweep) instead of fetching the whole table to filter
     /// in memory (#265). Chunks the `IN (...)` list at `idChunkSize`.
+    /// One asset by id, or nil.
+    public func fetchAsset(id: String) throws -> DAMAsset? {
+        try assets(withIDs: [id]).first
+    }
+
     public func assets(withIDs ids: Set<String>) throws -> [DAMAsset] {
         guard !ids.isEmpty else { return [] }
         var results: [DAMAsset] = []

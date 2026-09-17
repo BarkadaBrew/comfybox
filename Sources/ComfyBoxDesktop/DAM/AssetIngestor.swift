@@ -101,6 +101,14 @@ public final class AssetIngestor {
         knownPaths.insert(path)
     }
 
+    /// Forget a path that has left this Mac — a remote-gallery send moves the
+    /// file away (FDD-remote-galleries §3.3). Without this the poller keeps it
+    /// in `knownPaths` forever, and a file that later reappears under the same
+    /// name would never be noticed.
+    public func forgetKnownPath(_ path: String) {
+        knownPaths.remove(path)
+    }
+
     /// Manually ingest a single file at the given path. Returns the stored
     /// asset (which keeps its original id if the path was already tracked).
     @discardableResult
