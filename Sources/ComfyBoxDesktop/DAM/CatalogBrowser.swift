@@ -37,6 +37,16 @@ public final class CatalogBrowser {
     /// (`GalleryServer.swift`, `host: "mac"`). A row with no `mac` location has
     /// never been copied here, so its bytes have to stream.
     public static let localHost = "mac"
+    /// `asset_locations.host` for an asset that lives in a remote gallery:
+    /// "remote:<config id>" (FDD-remote-galleries §3.1).
+    public static let remoteHostPrefix = "remote:"
+
+    /// Where each REACHABLE remote gallery is mounted right now, keyed by
+    /// location host. A host missing from this map is absent, and its assets
+    /// are hidden rather than shown as broken.
+    public var remoteGalleryRoots: [String: String] = [:] {
+        didSet { if oldValue != remoteGalleryRoots { Task { await reload() } } }
+    }
 
     private let store: CatalogStore
     private let engineBaseURL: String
@@ -172,6 +182,18 @@ public final class CatalogBrowser {
         for row in rows {
             guard !hiddenAssetIDs.contains(row.id) else { continue }
             let locations = (try? await store.locations(of: row.id, scope: nil)) ?? []
+
+            // A remote gallery (FDD-remote-galleries §3.5). Its assets show
+            // like any other while the drive is attached, and vanish when it
+            // is not — Todd's choice: "hide it until the drive is back".
+            if let remoteLocation = locations.first(where: { $0.host.hasPrefix(Self.remoteHostPrefix) }) {
+                guard let root = remoteGalleryRoots[remoteLocation.host] else { continue }
+                let path = (root as NSString).appendingPathComponent(remoteLocation.path)
+                guard fm.fileExists(atPath: path) else { continue }
+                local[row.id] = path
+                kept.append(row)
+                continue
+            }
             // The row's own path first: it is the primary spelling and is what a
             // freshly ingested asset has before any location is recorded.
             let here = [row.absolutePath]

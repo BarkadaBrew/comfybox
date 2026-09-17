@@ -426,6 +426,9 @@ struct GalleryView: View {
             let remotes = DesktopSettings.load().remoteGalleries ?? []
             remoteRegistry.update(remotes: remotes)
             await remoteRegistry.refresh()
+            // Assets on an attached drive read from that drive; assets on one
+            // that is not attached are hidden (FDD-remote-galleries §3.5).
+            b.remoteGalleryRoots = remoteGalleryRootsByHost()
             if !remotes.isEmpty {
                 await RemoteGalleryTransfer(store: store, catalog: catalog, ingestor: ingestor)
                     .recoverPending(remotes: remotes)
@@ -1817,12 +1820,24 @@ struct GalleryView: View {
         return "Moved \(sent) to \(remoteName); \(failed) failed and kept their local copies"
     }
 
+    /// Where each reachable remote gallery is, keyed by its location host.
+    private func remoteGalleryRootsByHost() -> [String: String] {
+        var roots: [String: String] = [:]
+        for remote in remoteRegistry.reachable {
+            if let root = remoteRegistry.resolvedRoots[remote.id] {
+                roots[remote.locationHost] = root
+            }
+        }
+        return roots
+    }
+
     private func sendToRemote(_ assets: [DAMAsset], remote: RemoteGalleryConfig) async {
         guard let catalog = catalogStore, !assets.isEmpty else { return }
         remoteSendInFlight = true
         defer { remoteSendInFlight = false }
         let transfer = RemoteGalleryTransfer(store: store, catalog: catalog, ingestor: ingestor)
         let outcome = await transfer.send(assets: assets, to: remote)
+        browser?.remoteGalleryRoots = remoteGalleryRootsByHost()
         remoteSendResult = Self.sendResultLine(sent: outcome.sent.count,
                                                failed: outcome.failed.count,
                                                remoteName: remote.name)
