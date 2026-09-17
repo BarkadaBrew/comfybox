@@ -23,6 +23,12 @@
 import Foundation
 
 public enum DirectorCompiler {
+  /// Tuning sent on every chunk whose prompt changes inside the chunk.
+  /// Colour anchor only: margin 0 sharpened a lighting switch (R5) but made an
+  /// action switch later on R3 (wave +4.0 s vs +2.8 s at margin 2), so the
+  /// beat window margin stays at the engine default.
+  static let promptSwitchTuning: [String: Any] = ["color_anchor": 0.0]
+
 
   /// Compile a validation result. Throws `DirectorError.invalid` when the
   /// validation failed, or when a keyframe still has no `image_path` (the
@@ -135,6 +141,14 @@ public enum DirectorCompiler {
         body["beat_schedule"] = cond.segments.map { seg -> [String: Any] in
           ["text": seg.segment.prompt, "start_frac": jsonNumber(seg.startFrac), "end_frac": jsonNumber(seg.endFrac)]
         }
+      }
+      // A chunk that switches prompts mid-render turns the colour anchor off
+      // (ladder R5, 2026-09-17): the anchor renormalises every frame to frame
+      // 0 and erased a red-to-blue lighting change entirely. Exposure at
+      // chunk seams is DirectorToneMatch's job. Request tuning outranks preset
+      // and config, so this applies only to these chunks.
+      if cond.segments.count >= 2 {
+        body["tuning"] = Self.promptSwitchTuning
       }
       if !cond.keyframes.isEmpty {
         body["keyframes"] = cond.keyframes.map { kf -> [String: Any] in
