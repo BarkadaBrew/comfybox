@@ -42,19 +42,11 @@ public final class VisionService {
     No prose, no code fences.
     """
 
+    /// Shared with the engine's MCP repair path (ZImage.VisionChat): 1200 tokens +
+    /// reasoning_budget 256, so a reasoning vision model (Glimmer) answers instead
+    /// of spending a 320-token budget thinking.
     public nonisolated static func requestBody(model: String, base64PNG: String) -> [String: Any] {
-        [
-            "model": model,
-            "temperature": 0.2,
-            "max_tokens": 320,
-            "messages": [[
-                "role": "user",
-                "content": [
-                    ["type": "text", "text": instruction],
-                    ["type": "image_url", "image_url": ["url": "data:image/png;base64,\(base64PNG)"]],
-                ] as [Any],
-            ]],
-        ]
+        VisionChat.body(model: model, prompt: instruction, base64PNG: base64PNG)
     }
 
     /// Parse a chat-completions reply into a Description (tolerant of fences/prose).
@@ -117,10 +109,7 @@ public final class VisionService {
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw VisionError.requestFailed((response as? HTTPURLResponse)?.statusCode ?? -1)
         }
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = obj["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any],
-              let content = message["content"] as? String,
+        guard case .text(let content) = VisionChat.parseReply(data),
               let desc = Self.parseDescription(from: content)
         else { throw VisionError.emptyReply }
         return desc
