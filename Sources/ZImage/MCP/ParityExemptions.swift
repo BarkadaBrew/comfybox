@@ -25,6 +25,18 @@ public struct ParityExemption: Sendable {
 public enum ParityExemptions {
   public static let all: [ParityExemption] = [
     ParityExemption(
+      method: "POST", path: "/v1/queue/inference-slot",
+      reason: "Daemon-internal GPU slot protocol (FDD-glimmer-gpu-slot): Bree/Kira acquire a"
+        + " top-priority slot around each Glimmer call. Not an operator or agent action."),
+    ParityExemption(
+      method: "POST", path: "/v1/queue/inference-slot/{id}/renew",
+      reason: "Daemon-internal GPU slot protocol (FDD-glimmer-gpu-slot): lease heartbeat for a"
+        + " long Glimmer call. Not an operator or agent action."),
+    ParityExemption(
+      method: "DELETE", path: "/v1/queue/inference-slot/{id}",
+      reason: "Daemon-internal GPU slot protocol (FDD-glimmer-gpu-slot): releases a slot when the"
+        + " Glimmer call ends. Not an operator or agent action."),
+    ParityExemption(
       method: "POST", path: "/v1/video/generate",
       reason: "Synchronous variant; the generate_video tool proxies POST /v1/video/generate/async"
         + " (job-based) so an agent is never blocked for a whole video render."),

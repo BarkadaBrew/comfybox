@@ -250,6 +250,14 @@ enum ControlPlaneClassifier {
       return true
     case ("POST", _) where path.hasPrefix("/v1/queue/") && path.hasSuffix("/move"):
       return true
+    // FDD-glimmer-gpu-slot: slot protocol is lock-based (InferenceSlotTable /
+    // InferenceHold / LiveHealthState reads) — it must answer during a render.
+    case ("POST", "/v1/queue/inference-slot"), ("GET", "/v1/queue/inference-slot"):
+      return true
+    case ("POST", _) where path.hasPrefix("/v1/queue/inference-slot/") && path.hasSuffix("/renew"):
+      return true
+    case ("GET", _) where path.hasPrefix("/v1/queue/inference-slot/"):
+      return true
     case ("DELETE", _) where path.hasPrefix("/v1/queue/"):
       return true
     default:
