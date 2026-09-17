@@ -1,6 +1,6 @@
 # FDD: "Director" — a timeline editor tab for LTX-2.3 in CoffeeShop Desktop
 
-Status: v1.3 (2026-09-17) — codex-reviewed (v1.1); v1.2 adds Phase 2 regional prompting (§4.6, WP10) adapted from ComfyUI-LTX-BBox-Animator; v1.3 adds audio-driven chunks for long dialogue (§4.7, WP11) animated GIF export (§4.8, WP12), and Sequences with presets and AI-assisted drafting (§4.9, WP13–15), and agent access through API, MCP and a skill (§4.9.5, WP16); v1.4 adds Phase 3 Programs, long-form video on request with no human in the loop (§4.10, WP17–WP22). Requested by Todd: "clone this product as a tab for
+Status: v1.3 (2026-09-17) — codex-reviewed (v1.1); v1.2 adds Phase 2 regional prompting (§4.6, WP10) adapted from ComfyUI-LTX-BBox-Animator; v1.3 adds audio-driven chunks for long dialogue (§4.7, WP11) animated GIF export (§4.8, WP12), and Sequences with presets and AI-assisted drafting (§4.9, WP13–15), and agent access through API, MCP and a skill (§4.9.5, WP16); v1.4 adds Phase 3 Programs, long-form video on request with no human in the loop (§4.10, WP17–WP22); v1.5 adds GPU priority lanes, hold-until and the overnight window (§4.10.9, WP23). Requested by Todd: "clone this product as a tab for
 desktop app and make an FDD for the initiative" — the product being
 [WhatDreamsCost-ComfyUI](https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI), whose
 flagship node **LTX Director 2.0** is "A Complete Timeline Editor For LTX 2.3".
@@ -761,8 +761,8 @@ shots go straight to Flag.
   - The estimate is checked against it before work starts, and live spend is checked
     after every shot.
 - **Schedule.**
-  - Program renders go through the normal queue in a `program` owner lane under the QoS credit
-    governor (#1485), so interactive work still preempts.
+  - Program renders run in the **batch** tier with a hold-until disposition (§4.10.9), so
+    interactive work and Glimmer inference always go first.
   - A declared soak or `local` admission pauses Program rendering. Planning, reference
     selection and verification can continue.
   - The agent is told the new finish estimate whenever it moves by more than 1 h.
@@ -770,6 +770,104 @@ shots go straight to Flag.
 - **Progress.** `program_status` returns the state, shots done and total, GPU hours spent and
   the estimate, the current step, and flags so far. Bree can answer "how's my video going" from
   it.
+
+#### 4.10.9 GPU priority lanes, hold-until and the overnight window (WP23)
+
+**Problem.** A Program or any long Sequence render occupies the GPU for hours (about 25 min per
+chunk, about 60 chunks for 12 min). Under pure FIFO it blocks daytime interactive work, and
+nothing keeps overnight work overnight. Written up by Bree from Todd's request "write up
+priority lanes" (2026-09-17). Corrected here against what is already deployed.
+
+**What exists (do not rebuild).**
+
+| Mechanism | Where | What it does |
+|---|---|---|
+| Single-flight render loop | engine job queue | One render at a time. Pause, resume, reorder and source attribution. |
+| Step-boundary preemption | engine, #1479 / comfybox#322 | An LTX-2 render checks for interrupt and preempt signals at every denoise step, checkpoints, and resumes. |
+| Inference slots | engine #465 + #468, daemon #1878 | A Glimmer call takes a TTL-leased top-priority slot. The job loop starts no render while one is held, and an in-flight video parks at its next step and resumes after. |
+| Owner lanes + credit governor | daemon, #1485 | Fairness between daemon owners (chat, content stream, and so on) before work reaches the engine. |
+| Active-hours windows | daemon, Kira scheduler tiers | Per-tier hours for Kira's own content. |
+
+**Tiers.** Strict priority, highest first. A higher tier always goes next.
+
+1. **Inference.** Glimmer chat, tools, vision and authoring through the inference slot. This
+   already exists (#465). It parks renders at the next denoise step.
+2. **Interactive.** Image renders, single clips, desktop Generate and Motion, and Director
+   renders of one chunk. These start as soon as the GPU is free of inference. An in-flight
+   **batch** render is preempted at its next denoise step, not at the next segment. Waiting
+   for a segment boundary would make an image wait up to a whole chunk (25–40 min). The
+   batch render checkpoints and resumes from its step (#1479). Nothing is lost except the
+   step in progress.
+3. **Batch.** Sequence and Program renders, multi-chunk Director timelines, bulk re-renders,
+   and Kira's scheduled clips. These fill idle GPU time.
+   - **Order:** batch jobs run in submission order among themselves.
+   - **Segment boundaries:** between chunks the runner re-checks the queue, so a newly
+     eligible batch job with an earlier `hold_until` does not leapfrog a running Sequence.
+     Sequences finish chunk by chunk in order.
+
+**Disposition at submit (batch only).** Every batch job carries `hold_until`.
+
+| Disposition | `hold_until` | Behaviour |
+|---|---|---|
+| `now` | null | Eligible immediately. Runs whenever no inference slot or interactive job is pending. |
+| `tonight` | the next window opening (default 23:00 America/New_York) | Never touches the GPU before that time, however idle the GPU is. Daytime GPU time stays free. |
+| `at` | an explicit timestamp | As `tonight`, at a chosen time. |
+
+- **Carried by requests:** the Sequence, Program and multi-chunk Director requests.
+  Interactive requests reject a `hold_until` field (400), so a lane cannot be misused.
+- **Persisted:** holds live in the durable job ledger (WP9), so a held job survives restarts
+  and still waits for its time.
+
+**Overnight window.**
+- **Config:** engine-side `batch_window` `{ start: "23:00", end: "07:00", tz: "America/New_York" }`,
+  in `~/.comfybox/config.json`, readable through `/v1/queue`.
+- **Inside the window:** all eligible batch work drains in submission order. Interactive and
+  inference still preempt.
+- **Spill policy per job** (`spill`):
+  - `wait`: the default for `tonight`. Work left at 07:00 pauses at the next segment boundary
+    and resumes the next night.
+  - `idle`: after the window, keep running batch as a `now` job, still below interactive.
+  - `strict`: hold at 07:00 regardless.
+- **The capacity is small, so the estimate must say so.** An 8 h window holds about 19 chunks
+  at the production recipe, roughly 4 min of video. A 12-min Program at `tonight` + `wait` is
+  about three nights. The Program estimate (§4.10.2) states `nights` and `finish_by` from the
+  window, the spill policy and the batch jobs already queued ahead, before work starts.
+
+**Delivery.** A batch job that completes posts through the requester's channel as soon as it
+finishes, even at night. Bree through Telegram, Claude through its session. Each Program also
+gets a morning digest at window end (07:00 by default): what finished overnight, what is still
+held, and new finish estimates.
+
+**Relationship to the daemon lanes.** #1485's owner lanes stay the daemon's fairness layer
+between owners. The engine tier is the GPU layer. A daemon submission states its tier
+(`interactive` or `batch`) and its disposition. The daemon never implements its own overnight
+hold for engine work, so there is one clock and one queue. Kira's active-hours tiers keep
+deciding *what* Kira authors and when. The render itself is submitted as batch with a
+disposition.
+
+**API.**
+- `POST` bodies gain `lane: "interactive" | "batch"`, plus `hold_until`, `disposition` and
+  `spill` for batch. The default is `interactive` for single renders and `batch` for Sequence,
+  Program and multi-chunk Director.
+- `/v1/queue` reports each job's tier, `hold_until`, disposition and eligibility, plus the
+  window and whether it is open.
+- `PUT /v1/queue/batch-window` changes the window.
+- `POST /v1/queue/jobs/{id}/disposition` moves a job between `now`, `tonight` and `at`.
+- MCP `queue_status` shows the same fields. The `comfybox-director` skill teaches choosing
+  `tonight` for anything over about 1 GPU hour unless the requester asks for now.
+
+**Acceptance (WP23).**
+- A `tonight` job submitted at 14:00 does not start before 23:00 with the GPU idle all
+  afternoon. The ledger shows `held` until 23:00.
+- During a running batch chunk, an image request starts within one denoise step, about 30 s
+  at the production recipe, not after the chunk. The batch render resumes and produces
+  output identical to an uninterrupted run within the #1479 tolerance.
+- A Glimmer slot request during an interactive image parks nothing that is not a video, and
+  queues ahead of the next job.
+- A `wait` job still running at 07:00 stops at the next segment boundary and resumes at
+  23:00. An engine restart at 03:00 resumes it without re-rendering finished chunks.
+- A 12-min Program estimate at `tonight` + `wait` reports `nights ≥ 3` and a `finish_by` that
+  the ladder run lands within +20%.
 
 #### 4.10.7 Agent access
 
@@ -851,6 +949,7 @@ Each rung must pass before the next starts, at the production recipe.
 | WP20 (Phase 3) | Automatic assembly (§4.10.5): rule-derived EDL, composition passthrough + transition-only re-encode with tone match, beds/narration/music mix with ducking and equal-power joins, loudness normalisation, final exports | WP17, WP12 | M |
 | WP21 (Phase 3) | Durable execution (§4.10.6): persisted Program state machine + ledger resume, `program` QoS lane, budgets, soak/admission awareness, cancel, progress | WP9, WP17 | M |
 | WP22 (Phase 3) | Agent access + delivery (§4.10.7): `/v1/programs` routes, MCP tools, skill Programs section, Bree Telegram delivery with report; ladder rungs 2–5 | WP17–WP21 | M |
+| WP23 (Phase 3, can ship before WP17) | GPU priority lanes (§4.10.9): inference > interactive > batch tiers in the engine queue, step-boundary preemption of batch by interactive, `hold_until` with `now`/`tonight`/`at` dispositions and `wait`/`idle`/`strict` spill in the durable ledger, engine `batch_window` config, window-aware estimates, completion posts + morning digest, queue/MCP readout | WP9, #465 | M |
 
 Phase 1 = WP1, WP2a–d, WP3, WP4, WP5. It ships a usable Director: FFLF and middle keyframes,
 prompt relay via the beat schedule, long timelines, imported audio, project files, at
@@ -860,7 +959,8 @@ Phase 3 = WP17–WP22, **Programs**: long-form video on request, planned, render
 verified, assembled and delivered by the engine with no human in the loop (§4.10). It
 depends on Phase 2's Sequences, presets, drafting, agent access (WP13–WP16), audio-driven
 chunks (WP11), GIF export (WP12) and durable jobs (WP9). Its ladder (§4.10.8) runs 1-minute
-before 3-minute before 12-minute.
+before 3-minute before 12-minute. WP23 (priority lanes, hold-until, overnight window) has no
+Program dependency and ships first, so Director and Kira batch work benefit immediately.
 
 ## 6. Validation ladder (each rung a real render, Todd's read, same seed where possible)
 
