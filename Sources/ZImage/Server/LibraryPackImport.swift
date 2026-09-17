@@ -118,6 +118,12 @@ public enum LibraryPackImporter {
       return array
     }
 
+    // Collected, then written ONCE at the end: a pack is ~1,400 items, and
+    // persisting per item rewrites the whole file every time (quadratic — it
+    // wedged the first real import of the reference pack).
+    var pendingItems: [LibraryEntry] = []
+    var pendingCollections: [LibraryCollection] = []
+
     // Collections first: items reference them by name.
     var collectionIdByName: [String: String] = [:]
     for file in ["component-collections.json", "prompt-showcase-collections.json",
@@ -126,17 +132,12 @@ public enum LibraryPackImporter {
         guard let name = row["name"] as? String, !name.isEmpty else { continue }
         let id = collectionId(packId: packId, name: name)
         collectionIdByName[name] = id
-        guard !dryRun else { report.collections += 1; continue }
         let parentName = row["parent_name"] as? String
         let parent = (parentName?.isEmpty == false) ? collectionId(packId: packId, name: parentName!) : nil
-        do {
-          try store.upsertCollection(LibraryCollection(
-            id: id, name: name, color: row["color"] as? String, parentId: parent,
-            displayOrder: report.collections, membership: "pack"))
-          report.collections += 1
-        } catch {
-          report.skipped.append(.init(what: "collection \(name)", reason: error.localizedDescription))
-        }
+        pendingCollections.append(LibraryCollection(
+          id: id, name: name, color: row["color"] as? String, parentId: parent,
+          displayOrder: report.collections, membership: "pack"))
+        report.collections += 1
       }
     }
 
@@ -161,16 +162,8 @@ public enum LibraryPackImporter {
     }
 
     func add(_ item: LibraryEntry, what: String) {
-      guard !dryRun else {
-        report.imported[item.kind.rawValue, default: 0] += 1
-        return
-      }
-      do {
-        try store.upsert(item)
-        report.imported[item.kind.rawValue, default: 0] += 1
-      } catch {
-        report.skipped.append(.init(what: what, reason: error.localizedDescription))
-      }
+      pendingItems.append(item)
+      report.imported[item.kind.rawValue, default: 0] += 1
     }
 
     // Prompts: `template` rows carry slots; `prompt` rows are finished prompts,
@@ -278,6 +271,17 @@ public enum LibraryPackImporter {
         item.rawPayload = text
       }
       add(item, what: "recipe \(sourceId)")
+    }
+
+    if !dryRun {
+      try store.upsertCollections(pendingCollections)
+      let (_, rejected) = try store.upsert(contentsOf: pendingItems)
+      for (item, error) in rejected {
+        report.imported[item.kind.rawValue, default: 0] -= 1
+        report.skipped.append(
+          .init(what: "\(item.kind.rawValue) \(item.id)", reason: error.localizedDescription))
+      }
+      report.imported = report.imported.filter { $0.value > 0 }
     }
 
     // Previews: content-addressed already, so a copy is idempotent.

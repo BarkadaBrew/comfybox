@@ -53,18 +53,12 @@ public enum LibraryStudioPackImporter {
     }
     report.collections += 1
 
+    var pending: [LibraryEntry] = []
     func add(_ item: LibraryEntry, what: String) {
-      guard !dryRun else {
-        report.imported[item.kind.rawValue, default: 0] += 1
-        return
-      }
-      do {
-        try store.upsert(item)
-        report.imported[item.kind.rawValue, default: 0] += 1
-      } catch {
-        report.skipped.append(.init(what: what, reason: error.localizedDescription))
-      }
+      pending.append(item)
+      report.imported[item.kind.rawValue, default: 0] += 1
     }
+
 
     // Templates: `{slotId}` markers and slot defaults already match ours.
     for template in pack.templates {
@@ -138,6 +132,14 @@ public enum LibraryStudioPackImporter {
         width: pack.width,
         height: pack.height)
       add(recipe, what: "recipe for \(pack.id)")
+    }
+
+    guard !dryRun else { return }
+    let rejected = try store.upsert(contentsOf: pending).rejected
+    for (item, error) in rejected {
+      report.imported[item.kind.rawValue, default: 0] -= 1
+      report.skipped.append(
+        .init(what: "\(item.kind.rawValue) \(item.id)", reason: error.localizedDescription))
     }
   }
 
