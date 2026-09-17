@@ -207,3 +207,21 @@ enum TestData {
         return CGImageDestinationFinalize(destination)
     }
 }
+
+// MARK: - Engine with a fake transport
+
+/// An `EngineService` wired to a scripted `FakeEngineTransport` (defined in
+/// EngineServiceAsyncGenerateTests.swift) — no engine, no weights. `/health`
+/// and `/v1/generate/preview` are stubbed so the connection state never flips
+/// mid-test. Same shape as that file's private `makeEngine`, lifted here for
+/// suites that need it (Director, WP3).
+@MainActor
+func makeTestEngine(transport: FakeEngineTransport, outputDirectory: String) -> EngineService {
+    let engine = EngineService()
+    engine.outputDirectory = outputDirectory
+    engine.imageStatusPollInterval = 0.01
+    transport.always("/health", .init(200, #"{"status":"ok","is_rendering":true,"progress_percent":40,"pending_count":0}"#))
+    transport.always("/v1/generate/preview", .init(204, ""))
+    engine.attachTransportForTesting(transport)
+    return engine
+}

@@ -70,6 +70,7 @@ struct ComfyBoxDesktopApp: App {
         case prompts = "Prompts"
         case assistant = "Assistant"
         case motion = "Motion"
+        case director = "Director"
         case mflux = "mflux"
         case decoupage = "Découpage"
         case face = "Face"
@@ -97,7 +98,7 @@ struct ComfyBoxDesktopApp: App {
 
         var section: Section {
             switch self {
-            case .generate, .motion, .mflux, .decoupage, .face, .inpaint, .edit, .canvas, .assistant: return .create
+            case .generate, .motion, .director, .mflux, .decoupage, .face, .inpaint, .edit, .canvas, .assistant: return .create
             case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models, .remoteGallery, .archives: return .library
             case .dashboard, .applications, .queue: return .operate
             case .bree, .kira: return .suite
@@ -118,6 +119,7 @@ struct ComfyBoxDesktopApp: App {
             case .prompts: return "text.book.closed"
             case .assistant: return "sparkles"
             case .motion: return "film.stack"
+            case .director: return "timeline.selection"
             case .mflux: return "cube.transparent"
             case .decoupage: return "square.3.layers.3d"
             case .face: return "person.crop.circle.badge.checkmark"
@@ -149,6 +151,7 @@ struct ComfyBoxDesktopApp: App {
             case .canvas: return "y"
             case .assistant: return "i"
             case .motion: return "m"
+            case .director: return "t"
             case .mflux: return "x"
             case .bree: return "b"
             case .kira: return "k"
@@ -560,6 +563,9 @@ struct ComfyBoxDesktopApp: App {
 
         case .motion:
             MotionView(engine: engine, pendingMotionReference: $pendingMotionReference)
+
+        case .director:
+            DirectorView(engine: engine)
 
         case .mflux:
             MfluxView(mflux: mfluxService, ingestor: ingestor)
