@@ -93,7 +93,7 @@ final class LTX2BeatScheduleLocatorRealTokenizerTests: XCTestCase {
     guard resolved.count == 4 else { return }
 
     // Ranges must be monotonic, non-overlapping, and inside the padded axis.
-    let padOffset = tokenizer.maxLength - fullIds.count
+    let padOffset = 0  // columns are front-indexed (connector register reorder)
     var prevEnd = padOffset
     for r in resolved {
       XCTAssertGreaterThanOrEqual(r.tokenStart, prevEnd, "beat ranges must be ordered left-to-right")

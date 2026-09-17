@@ -1846,7 +1846,8 @@ public final class LTX2Pipeline {
       tokensPerFrame: latents.dim(3) * latents.dim(4),
       textLen: textEmbeddings.dim(1),
       timelineFrames: beatTimelineFrameCount,
-      unbiasedFrameIndices: beatUnbiasedFrameIndices)?.asType(dtype)
+      unbiasedFrameIndices: beatUnbiasedFrameIndices,
+      windowMargin: resolvedConfig.beatWindowMargin)?.asType(dtype)
     let audioBeatBias: MLXArray? = {
       guard !beatSchedule.isEmpty, let av = avState else { return nil }
       let audioFrames = av.audioLatents.dim(2)

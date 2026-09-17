@@ -278,6 +278,24 @@ final class DirectorCompilerTests: XCTestCase {
     XCTAssertEqual(explicit.settings.seed, 7)
   }
 
+  func testChunksThatSwitchPromptsSendPromptSwitchTuning() throws {
+    let t = timeline(length: 577, prompt: "a woman walks through a market", segments: [
+      .init(id: "p1", startFrame: 0, lengthFrames: 200, prompt: "she inspects the fruit"),
+      .init(id: "p2", startFrame: 200, lengthFrames: 377, prompt: "she turns toward the camera"),
+    ])
+    let c = try compile(t)
+    // Chunk 0 holds both segments: colour anchor off, margin left to the
+    // engine default, and the tuning decodes onto the request.
+    let r0 = try decodeLocal(c.chunks[0].body)
+    XCTAssertEqual(r0.tuning?.colorAnchor, 0)
+    XCTAssertNil(r0.tuning?.beatWindowMargin)
+    // Chunk 1 holds one segment: no switch inside it, so no tuning.
+    XCTAssertNil(c.chunks[1].body["tuning"])
+    // No segments at all: no tuning.
+    let plain = try compile(timeline(length: 577, prompt: "a still lake at dawn"))
+    XCTAssertTrue(plain.chunks.allSatisfy { $0.body["tuning"] == nil })
+  }
+
   func testNoSegmentsOmitsBeatScheduleAndUsesGlobalPromptOnly() throws {
     let c = try compile(timeline(length: 577, prompt: "  a still lake at dawn"))
     for chunk in c.chunks {

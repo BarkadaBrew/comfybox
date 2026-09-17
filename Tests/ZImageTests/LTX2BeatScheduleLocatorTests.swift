@@ -27,12 +27,12 @@ final class LTX2BeatScheduleLocatorTests: XCTestCase {
     BeatSegment(text: text, startFrac: s, endFrac: e)
   }
 
-  // MARK: left-pad offset
+  // MARK: front-indexed columns (connector register reorder)
 
-  func testLeftPadOffsetShiftsTokenRanges() {
+  func testRangesAreFrontIndexedDespiteLeftPadding() {
     let tokenize = makeTokenizer()
     let full = tokenize("she walks closer she sways slowly")  // 6 tokens
-    let maxLength = 16  // padOffset = 16 - 6 = 10
+    let maxLength = 16  // left-padded by 10, but the connector moves valid tokens to the front
 
     let resolved = LTX2BeatScheduleLocator.locate(
       beats: [beat("she walks closer", 0, 0.5), beat("she sways slowly", 0.5, 1)],
@@ -40,11 +40,11 @@ final class LTX2BeatScheduleLocatorTests: XCTestCase {
 
     XCTAssertEqual(resolved.count, 2)
     guard resolved.count == 2 else { return }
-    // Beat 1 sits at local 0..<3 → padded 10..<13; beat 2 local 3..<6 → 13..<16.
-    XCTAssertEqual(resolved[0].tokenStart, 10)
-    XCTAssertEqual(resolved[0].tokenEnd, 13)
-    XCTAssertEqual(resolved[1].tokenStart, 13)
-    XCTAssertEqual(resolved[1].tokenEnd, 16)
+    // Beat 1 sits at 0..<3 and beat 2 at 3..<6: the pad offset must NOT be added.
+    XCTAssertEqual(resolved[0].tokenStart, 0)
+    XCTAssertEqual(resolved[0].tokenEnd, 3)
+    XCTAssertEqual(resolved[1].tokenStart, 3)
+    XCTAssertEqual(resolved[1].tokenEnd, 6)
   }
 
   // MARK: monotonic left-to-right re-match
@@ -180,9 +180,9 @@ final class LTX2BeatScheduleLocatorTests: XCTestCase {
     XCTAssertEqual(dropped, [], "verbatim mid-prompt beat must locate (comfybox#335)")
     XCTAssertEqual(resolved.count, 1)
     guard resolved.count == 1 else { return }
-    // padOffset = 16 - 14 = 2, local 8..<14 → padded 10..<16.
-    XCTAssertEqual(resolved[0].tokenStart, 10)
-    XCTAssertEqual(resolved[0].tokenEnd, 16)
+    // Front-indexed: 8..<14.
+    XCTAssertEqual(resolved[0].tokenStart, 8)
+    XCTAssertEqual(resolved[0].tokenEnd, 14)
   }
 
   func testGemmaLikeBeatAtPromptStartLocates() {
@@ -200,12 +200,11 @@ final class LTX2BeatScheduleLocatorTests: XCTestCase {
     XCTAssertEqual(resolved.count, 2)
     guard resolved.count == 2 else { return }
     // Prompt: BOS + [She][ walks][ closer.][ She][ sways][ slowly.] = 7 ids,
-    // padOffset 9. Beat 1 (bare form) local 1..<4 → 10..<13; beat 2 (leading-
-    // space form) local 4..<7 → 13..<16.
-    XCTAssertEqual(resolved[0].tokenStart, 10)
-    XCTAssertEqual(resolved[0].tokenEnd, 13)
-    XCTAssertEqual(resolved[1].tokenStart, 13)
-    XCTAssertEqual(resolved[1].tokenEnd, 16)
+    // Front-indexed. Beat 1 (bare form) 1..<4; beat 2 (leading-space form) 4..<7.
+    XCTAssertEqual(resolved[0].tokenStart, 1)
+    XCTAssertEqual(resolved[0].tokenEnd, 4)
+    XCTAssertEqual(resolved[1].tokenStart, 4)
+    XCTAssertEqual(resolved[1].tokenEnd, 7)
   }
 
   func testGemmaLikeNewlineBoundaryBeatLocates() {
@@ -225,9 +224,9 @@ final class LTX2BeatScheduleLocatorTests: XCTestCase {
     XCTAssertEqual(resolved.count, 1)
     guard resolved.count == 1 else { return }
     // BOS + [A][ sunlit][ kitchen.][\n][She][ walks][ closer.] = 8 ids,
-    // padOffset 8; beat local 5..<8 → 13..<16.
-    XCTAssertEqual(resolved[0].tokenStart, 13)
-    XCTAssertEqual(resolved[0].tokenEnd, 16)
+    // Front-indexed: 5..<8.
+    XCTAssertEqual(resolved[0].tokenStart, 5)
+    XCTAssertEqual(resolved[0].tokenEnd, 8)
   }
 
   func testGemmaLikeQuotedBeatLocates() {
