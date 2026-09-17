@@ -490,12 +490,35 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     return migrated
   }
 
+  /// Top-level keys this struct owns (its `CodingKeys`, incl. legacy
+  /// aliases). Anything else in the file belongs to another reader and must
+  /// survive a save.
+  static let ownedTopLevelKeys: Set<String> = [
+    "port", "host", "modelSpec", "allowedOutputDirectory", "seedvr2WeightsPath", "providers",
+    "replicate", "contentModeDefaultPresets", "krea2Models", "renderDefaults", "videoDefaults",
+    "imageMemoryCaps", "serverPort", "serverHost", "outputDirectory",
+  ]
+
+  /// Save, PRESERVING top-level keys this struct does not model.
+  ///
+  /// 2026-09-16: the LTX-2 production recipe lives in the file's `video`
+  /// block, which `LTX2ConfigResolver` reads straight from disk — this struct
+  /// has no `video` field. A save that only encoded `self` dropped it (an
+  /// 18:43 config write wiped the recipe; the deploy preflight caught it).
+  /// Keys this struct owns are written from `self` (so clearing an optional
+  /// still removes it); unknown keys already on disk are carried over.
   public func save(to path: URL = ComfyBoxServerConfig.defaultPath(), fileManager: FileManager = .default) throws {
     let dir = path.deletingLastPathComponent()
     try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    let data = try encoder.encode(self)
+    let encoded = try JSONEncoder().encode(self)
+    var root = (try JSONSerialization.jsonObject(with: encoded) as? [String: Any]) ?? [:]
+    if let existingData = try? Data(contentsOf: path),
+       let existing = try? JSONSerialization.jsonObject(with: existingData) as? [String: Any] {
+      for (key, value) in existing where !Self.ownedTopLevelKeys.contains(key) && root[key] == nil {
+        root[key] = value
+      }
+    }
+    let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
     try data.write(to: path, options: .atomic)
   }
 
