@@ -1,6 +1,6 @@
 # FDD: Director projects and pickers
 
-Status: draft v0.1 (2026-09-17). Nothing here is built.
+Status: v0.2 (2026-09-17). §8 decisions made by Todd. Nothing here is built.
 Requested by Todd: "we should design the ui to include projects and pickers to make assembly for the user to be intuitive and easy, refer to the github for design language."
 Design reference: [WhatDreamsCost-ComfyUI](https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI) `js/ltx_director.js` (LTX Director 2.0). Copy its behaviour and look, not its code (GPL-3.0, same rule as `docs/FDD-ltx-director-tab.md` §4.5).
 Builds on: `docs/FDD-ltx-director-tab.md` v1.2 plus its §10 Phase 1 deltas. Engine Phase 1 is merged in `~/Projects/zimage-temporal`.
@@ -343,8 +343,8 @@ Order: model first, then pickers, then canvas, then polish. Every WP is desktop-
   - Restore creates a version and never overwrites the head.
 - Tests: timeline diff function (settings, prompts, keyframes); restore and continue produce the expected versions.
 
-## 8. Open questions (Todd's call)
+## 8. Decisions (Todd, 2026-09-17)
 
-1. **Project root.** Should projects live under the output directory (proposed, keeps renders inside engine containment) or somewhere else, such as `~/Documents/Director`? Somewhere else means renders stay in the output directory and the project only references them.
-2. **Gallery picks.** Reference them (proposed, no duplication) or copy them into `assets/` so a project folder is fully portable?
-3. **Shortcut remap.** Adopt upstream's S = snap and ⌘B = split, which changes today's S = split?
+1. **Project root: the output directory.** Projects live under `<outputDirectory>/Director/`, so renders stay inside engine output containment.
+2. **Gallery picks are referenced, not copied.** A still picked from the gallery is stored by absolute path plus catalog id. Archiving or moving that still in the gallery breaks the reference, so the project shows the clip as "missing" and offers Replace with…. Finder imports, pastes and extracted frames are still copied into `assets/`.
+3. **Shortcuts follow upstream.** S toggles snapping and ⌘B splits at the playhead. This replaces today's S = split.
