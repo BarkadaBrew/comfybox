@@ -855,16 +855,62 @@ public enum MCPToolRegistry {
     routes: [RouteRef(method: "POST", path: "/v1/storyboard/render")]
   )
 
+  /// Shared JSON Schema for the DirectorTimeline v1 object both director
+  /// tools take (docs/FDD-ltx-director-tab.md §4.1 + Phase 1 deltas §10).
+  /// Documents the shape an agent authors; the engine's validator is the
+  /// authority (unknown keys are ignored, defaults applied server-side).
+  static let directorTimelineSchema: [String: Any] = [
+    "type": "object",
+    "description": "DirectorTimeline v1, snake_case (same bytes as a .cbdirector file). Frames are the unit: length_frames is snapped UP to 1+8k (>= 97, <= 4609 = 16 chunks); every keyframe frame must be a multiple of 8 (the latent grid) — is_end_frame: true pins that keyframe to the last frame and its `frame` is ignored (at most one). prompt_segments are appended to global_prompt for every chunk they overlap and become that chunk's beat schedule, so each segment steers its own frame span; segments shorter than 32 frames get no flat attention window. audio_clips are only honoured when audio.mode is \"imported\" (mixed at 48 kHz and muxed; generated audio is suppressed); in \"generated\" mode each chunk generates its own audio, so timelines longer than one chunk have audio seams. audio.mode \"inpaint\", reference_clips and retake are Phase 2 and rejected. Keyframe images: image_path (absolute, readable by the engine) or image_base64. character null (default) disables character injection.",
+    "properties": [
+      "version": ["type": "integer", "description": "1 (default). Newer versions are rejected."] as [String: Any],
+      "settings": [
+        "type": "object",
+        "properties": [
+          "width": ["type": "integer", "description": "Multiple of 32."] as [String: Any],
+          "height": ["type": "integer", "description": "Multiple of 32."] as [String: Any],
+          "length_frames": ["type": "integer", "description": "Timeline length in frames; snapped up to 1+8k, >= 97."] as [String: Any],
+          "fps": ["type": "integer", "description": "1-120 (default 24)."] as [String: Any],
+          "seed": ["type": "integer", "description": "Base seed (default 42); chunk k renders with seed + k."] as [String: Any],
+          "preset": ["type": "string", "description": "Server video preset id (list_presets)."] as [String: Any],
+          "loras": ["type": "array", "description": "[{path, scale, role?}]; empty = the preset's LoRAs.", "items": ["type": "object"] as [String: Any]] as [String: Any],
+          "negative_prompt": ["type": "string", "description": "null = the preset negative."] as [String: Any],
+          "steps": ["type": "integer", "description": "null = preset/config default."] as [String: Any],
+          "character": ["type": "string", "description": "Character id to inject; null (default) = none."] as [String: Any],
+        ] as [String: Any],
+        "required": ["width", "height", "length_frames"] as [String],
+      ] as [String: Any],
+      "global_prompt": ["type": "string", "description": "Required, non-empty; conditions every chunk."] as [String: Any],
+      "keyframes": [
+        "type": "array",
+        "description": "[{id (unique), image_path | image_base64, frame (multiple of 8, 0..length-1), strength? (0,1] default 1.0, is_end_frame? (pins to the last frame)}]. A keyframe exactly on a chunk boundary conditions the earlier chunk's last frame only; the next chunk starts from the rendered carry-over frame. Keyframes < 24 frames apart warn (jump cuts).",
+        "items": ["type": "object"] as [String: Any],
+      ] as [String: Any],
+      "prompt_segments": [
+        "type": "array",
+        "description": "[{id, start_frame, length_frames, prompt}] — timed prompt text; must fit inside the timeline.",
+        "items": ["type": "object"] as [String: Any],
+      ] as [String: Any],
+      "audio_clips": [
+        "type": "array",
+        "description": "[{id, audio_path (WAV/AIFF/MP3/M4A/AAC), start_frame, length_frames, trim_start_frames? (0), gain? (1.0)}] — used only when audio.mode is \"imported\"; overlapping clips sum.",
+        "items": ["type": "object"] as [String: Any],
+      ] as [String: Any],
+      "audio": [
+        "type": "object",
+        "description": "{mode: \"generated\" (default) | \"imported\"}.",
+      ] as [String: Any],
+    ] as [String: Any],
+    "required": ["settings", "global_prompt"] as [String],
+  ]
+
   static let generateDirectorVideo = MCPToolDefinition(
     name: "generate_director_video",
-    description: "Render a Director timeline (LTX-2): one global prompt, image keyframes pinned to frames (multiples of 8; is_end_frame pins the last frame), timed prompt segments and optional imported audio clips. The engine validates, splits the timeline into single-pass chunks (<= 289 frames each, chained on the previous chunk's rendered last frame) and stitches them frame-accurately. Long-running: returns a job_id plus the chunk plan immediately — poll video_status (stage_index/stage_count name the chunk). Run validate_director_timeline first to see issues and the plan without rendering.",
+    description: "Render a Director timeline (LTX-2): one global prompt, image keyframes pinned to frames (each frame a multiple of 8; is_end_frame pins one to the last frame), timed prompt_segments and optional imported audio_clips. The engine validates, splits the timeline into single-pass chunks (<= 289 frames each, chained on the previous chunk's rendered last frame), dry-runs every chunk against the resolved preset (400 before any render on a conflict) and stitches the chunks frame-accurately. Long-running and non-durable (an engine restart loses the job): returns a job_id plus the chunk plan immediately — poll video_status (stage_index/stage_count name the chunk; stage_index == stage_count while stitching). Run validate_director_timeline first to see issues and the plan without rendering.",
     inputSchema: [
       "type": "object",
       "properties": [
-        "timeline": [
-          "type": "object",
-          "description": "DirectorTimeline v1 (snake_case): {version?: 1, settings: {width, height (multiples of 32), length_frames (snapped up to 1+8k, >= 97), fps? (24), seed? (42), preset?, loras?: [{path, scale}], negative_prompt?, steps?, character?}, global_prompt, keyframes?: [{id, image_path | image_base64, frame, strength? (1.0), is_end_frame?}], prompt_segments?: [{id, start_frame, length_frames, prompt}], audio_clips?: [{id, audio_path, start_frame, length_frames, trim_start_frames?, gain?}], audio?: {mode: generated | imported}}.",
-        ] as [String: Any],
+        "timeline": directorTimelineSchema,
         "output_path": [
           "type": "string",
           "description": "Output .mp4 name or absolute path under the engine's output directory (default director-<session>.mp4).",
@@ -881,14 +927,11 @@ public enum MCPToolRegistry {
 
   static let validateDirectorTimeline = MCPToolDefinition(
     name: "validate_director_timeline",
-    description: "Validate a Director timeline without rendering: returns ok, snapped_length_frames, the chunk plan (chunk spans, per-chunk keyframes and beat schedule, boundary frames) and every issue (errors block rendering, warnings do not). No weights are loaded.",
+    description: "Validate a Director timeline without rendering: returns ok, snapped_length_frames, the chunk plan (chunk spans and seeds, per-chunk keyframes with local frames, prompt_segments ids and beat schedule, boundary_frames, keyframe_ticks) and every issue {severity, code, message, ids} — errors (e.g. keyframe_off_grid, keyframes_collide, multiple_end_frames, audio_clip_missing) block rendering, warnings (e.g. keyframes_close, keyframe_on_chunk_boundary, generated_audio_seams, audio_clips_ignored when audio_clips are sent without audio.mode \"imported\") do not. Pure: no weights are loaded and it works while the engine is busy.",
     inputSchema: [
       "type": "object",
       "properties": [
-        "timeline": [
-          "type": "object",
-          "description": "DirectorTimeline v1 (snake_case) — same shape as generate_director_video's timeline.",
-        ] as [String: Any],
+        "timeline": directorTimelineSchema,
       ] as [String: Any],
       "required": ["timeline"] as [String],
     ] as [String: Any],

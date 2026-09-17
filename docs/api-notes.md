@@ -124,6 +124,136 @@ an mp4 and a png share a basename in the same output directory — the engine
 never names its own outputs that way, so this is a latent risk for a
 hand-placed file, not an observed failure.
 
+## Director timeline (LTX-2) — POST /v1/video/director
+
+A Director timeline is one LTX-2 clip authored on a frame ruler: a global
+prompt, image keyframes pinned to frames, timed prompt segments, and optional
+imported audio. The engine validates it, splits it into single-pass chunks,
+renders the chunks in order (each continuation chunk starts from the previous
+chunk's rendered last frame) and stitches them into one MP4. Design:
+`docs/FDD-ltx-director-tab.md` (§4 design; §10 records where Phase 1 differs from it).
+
+### Routes
+
+| Route | What it does |
+|---|---|
+| `POST /v1/video/director/validate` | Pure. Loads no weights, works without LTX-2 configured, and is not blocked by queue recovery. Probes audio files without fully decoding them. Any timeline that decodes gets a 200 (a body that fails to decode, including `version > 1`, is a 400): `{ok, snapped_length_frames, plan \| null, issues[]}`. `ok` is false when any issue is an error, and then `plan` is null. |
+| `POST /v1/video/director` | Submits a render job. Returns 202 with a `VideoJobStatus` (`mode: "director"`, `plan`, `stage_count`, `resolved_config`, `recipe_hash`). |
+| `GET /v1/video/status/{id}` | The existing status route. Director jobs add `plan`, `stage_index` and `stage_count`. |
+
+Request envelopes (snake_case):
+
+```jsonc
+// validate
+{ "timeline": <DirectorTimeline> }
+// render
+{ "timeline": <DirectorTimeline>,
+  "output_path": "pier.mp4",   // optional; a name or an absolute path under the allowed output directory
+                               // (default director-<session>.mp4); checked before the 202, so a bad path is a 400
+  "source": "api" }            // optional queue attribution (default "api")
+```
+
+The render route runs these checks in order, and stops at the first failure:
+
+1. LTX-2 must be configured, else 503 `Director rendering needs local LTX-2 (--ltx2-weights/--ltx2-gemma)`.
+2. The queue must not be recovering (the same 503 local video gets).
+3. The body must decode. A timeline with `version > 1` is a 400.
+4. The validator must find no errors, else 400 `{"error": "timeline invalid", "issues": [...]}`.
+5. Any `image_base64` keyframes are written to `director-<session>-asset-<id>.png`, then the timeline compiles.
+6. Every compiled chunk is **dry-run** through the same `prepareLocalVideo` path as `/v1/video/generate/async`, which applies the preset, resolver, LoRAs and `validate()`. The 400 message reads `chunk <k>/<n>: <code>: <detail>`, where `<code>` is one of:
+   - `temporal_upscale_unsupported`: the resolved config enables the temporal upscaler. Phase 1 stitches at `settings.fps`.
+   - `chunk_not_single_pass`: a preset's extend/duration setting turned the chunk into a continuation render, or the chunk's beat schedule was dropped.
+   - `chunk_frames_mismatch`: the prepared chunk's frame count or fps differs from the plan.
+   - Any `LTX2VideoError`, such as `invalid_keyframe` or bad dimensions.
+
+   Every preset conflict therefore fails at submit, before any GPU time is spent.
+
+### Timeline (summary — full schema in the FDD and `DirectorTypes.swift`)
+
+```jsonc
+{ "version": 1,
+  "settings": { "width": 576, "height": 896,        // multiples of 32 (required)
+                "length_frames": 289,                // required; snapped UP to 1+8k; >= 97; <= 4609 (16 chunks)
+                "fps": 24, "seed": 42,               // chunk k renders with seed + k
+                "preset": null, "loras": [], "negative_prompt": null, "steps": null,
+                "character": null },                 // null => skip_character_injection on every chunk
+  "global_prompt": "…",                              // required, non-empty
+  "keyframes": [ { "id": "k1", "image_path": "/abs.png", "image_base64": null,
+                   "frame": 0,                       // multiple of 8 (latent grid)
+                   "strength": 1.0,                  // (0, 1]
+                   "is_end_frame": false } ],        // true pins to length-1 (frame ignored); at most one
+  "prompt_segments": [ { "id": "p1", "start_frame": 0, "length_frames": 96, "prompt": "…" } ],
+  "audio_clips": [ { "id": "a1", "audio_path": "/abs.wav", "start_frame": 0, "length_frames": 120,
+                     "trim_start_frames": 0, "gain": 1.0 } ],
+  "audio": { "mode": "generated" },                  // generated | imported  (inpaint = Phase 2, rejected)
+  "reference_clips": [], "retake": { "enabled": false } }   // Phase 2 placeholders; non-empty/enabled is rejected
+```
+
+Decoding rules:
+- Omitted fields take the defaults shown above.
+- Unknown keys are ignored.
+- A missing `version` reads as 1.
+- A `.cbdirector` project file holds the same bytes as the wire timeline: sorted keys, pretty-printed.
+
+Frames are the unit throughout. Seconds are only a UI readout (`frames / fps`).
+
+### Chunking and the plan
+
+- **Chunk sizes.** A timeline of L frames is split into `ceil(S/36)` near-equal chunks, where S = (L-1)/8 latent steps. Every chunk is 1+8k frames and at most 289. Adjacent chunks share one boundary frame, and the stitcher keeps it only once.
+- **Prompts.** Each chunk's prompt is `global_prompt` followed by the text of every segment overlapping that chunk, in time order. The same segments become that chunk's `beat_schedule`, with fractions relative to the chunk. A segment that crosses a boundary appears in both chunks.
+- **Plan shape.** The `plan` (on validate, the 202, every status poll, and the trace as `director_plan`) is `{length_frames, fps, width, height, audio_mode, chunks[{index, start_frame, end_frame, frames, seed, carry_over, keyframes[{id, local_frame, strength}], prompt_segments[ids], beat_schedule[{text, start_frac, end_frac}], audio}], keyframe_ticks[{id, frame}], boundary_frames[], warnings[]}`.
+- **Status during a job.** `stage_index` is null before the first chunk starts, then the 0-based chunk being rendered. It equals `stage_count` during the audio mix and stitch. Chunks share 0–96 % of progress; the stitch takes 96–100 %.
+- **Failure messages.** A failed job's `error` reads `chunk <k>/<n> (<stage>): <message>`, where the stage is `render`, `lastframe`, `fps`, `audio`, `stitch` or `server`. An interrupt still surfaces as `interrupted: true`.
+
+### Issue codes
+
+Every issue is `{severity, code, message, ids}`. `ids` names the keyframes, segments or clips involved, so a client can select them.
+
+- **Errors** (block rendering): `missing_global_prompt`, `invalid_fps`, `invalid_dimensions`, `timeline_too_short`, `timeline_too_long`, `keyframe_off_grid`, `keyframe_out_of_range`, `keyframes_collide`, `multiple_end_frames`, `keyframe_image_missing`, `keyframe_image_unreadable`, `invalid_strength`, `invalid_gain`, `segment_empty_prompt`, `segment_out_of_range`, `audio_clip_missing`, `audio_clip_undecodable`, `audio_mode_unsupported`, `reference_clips_unsupported`, `retake_unsupported`, `duplicate_id` (ids are unique across all tracks).
+- **Warnings** (never block): `length_snapped`, `keyframes_close` (< 24 frames apart, which risks a jump cut), `keyframe_on_chunk_boundary`, `keyframe_partial_strength_on_boundary`, `segment_shorter_than_latent_frame` (< 8 f), `segment_shorter_than_bias_window` (< 32 f, so no flat attention window), `segments_overlap`, `audio_clip_past_end`, `audio_trim_past_end`, `audio_clips_ignored` (clips sent in `generated` mode), `generated_audio_seams`, `no_keyframes` (no keyframe at frame 0, so chunk 0 renders T2V).
+
+### Generic `keyframes` on `/v1/video/generate` and `/v1/video/generate/async`
+
+The compiled chunk bodies use a field any caller can send:
+
+```jsonc
+"keyframes": [ { "image_path": "/abs.png", "frame": 0, "strength": 1.0 },
+               { "image_path": "/end.png", "frame": 288 } ]
+```
+
+- **Mutually exclusive with the single-image fields.** When `keyframes` is present, `image_path`, `image_base64` and top-level `strength` must be absent, or the request is a 400 `keyframe_conflict: keyframes replaces image_path/image_base64/strength`. Nothing silently takes precedence.
+- **Frame 0.** At most one entry may sit at frame 0; it becomes the init image and strength. If it is the *only* entry, the render takes the ordinary i2v path, with face/refine anchors and audio.
+- **Other entries.** Each needs `0 < frame < frames`, `frame % 8 == 0`, a unique `frame/8` bucket and strength in (0, 1]. They also require a single-pass render (no extend beyond one chunk) and `identity_anchor_strength` 0. Otherwise the request is a 400 `invalid_keyframe`. `audio: true` is allowed alongside keyframes.
+
+### Behaviour to know about (Phase 1)
+
+- **Chunk-0 asymmetry.** The generator sees every director chunk as its own chunk 0. A continuation chunk whose only keyframe is the carry-over frame takes the i2v path: face/refine anchoring and audio generation run on that carry-over frame. A continuation chunk that also carries a user end keyframe takes the multi-keyframe path, which has no face/refine anchoring. Suspect this first if quality steps from one chunk to the next.
+- **Carry-over is lossy twice.** Chunk k+1 is conditioned on chunk k's last frame read back from the H.264 mp4 into a PNG, which then goes through the conditioning H.264 round-trip again. Extend, by contrast, uses the VAE-decoded frame inside the generator. A keyframe exactly on a boundary conditions chunk k's last frame only; chunk k+1 sees the rendered carry-over, not the user's image.
+- **Audio.**
+  - `generated`: each chunk generates its own audio from noise. The chunk tracks are decoded, placed on the timeline (each continuation chunk's first frame of audio is dropped with its video frame), mixed and muxed. With more than one chunk there are seams (`generated_audio_seams`).
+  - `imported`: every chunk renders with `audio: false`. The clips are decoded with AVFoundation, resampled to 48 kHz stereo, trimmed, padded, gain-scaled and summed, then muxed. No mastering is applied to user audio.
+- **Stitching** always decodes and re-encodes (`stitch_path: "reencode"`). It checks each chunk's fps and frame count before it writes anything.
+- **Output record.** The final MP4 gets an aggregate generation-record sidecar: `model: "ltx2-director"`, `kind: "director"`, plus `audio_source` (`generated` | `imported` | `none`), `chunk_count` and `stitch_path`.
+- **Intermediates** (`director-<session>-chunk<k>.mp4` and its `.json`, `-lastframe.png`, `-asset-<id>.png`) are deleted on success and on failure. A crash mid-job can leave `director-*` files behind. The daemon's orphan reconciler ignores them by the same non-`ltx2-` prefix convention `storyboard-*` relies on; that convention was inherited, not re-verified against coffeeshop-server.
+- **Non-durable.** Like every local video job today, a Director job does not survive an engine restart (see FDD WP9), and status for it will 404 afterwards.
+- **Not in Phase 1:** temporal upscale (rejected), `GET/PUT /v1/director/timelines/{id}`, `wait: true`, audio inpainting, reference clips, retake.
+
+### MCP and CLI
+
+- MCP `generate_director_video {timeline, output_path?, source?}` → `POST /v1/video/director` (retries a queue-recovery 503 like other local video tools). Poll with `video_status`.
+- MCP `validate_director_timeline {timeline}` → `POST /v1/video/director/validate` (read-only).
+- CLI, an HTTP client of the **running** server that never renders in-process:
+
+  ```
+  comfybox director-render <file.cbdirector> [--server http://127.0.0.1:7870] [--output <path>]
+                           [--source cli] [--validate-only] [--wait] [--poll-seconds 2]
+  ```
+
+  - `--validate-only` prints the validate response and exits 1 when `ok` is false.
+  - Without `--wait`, the command prints the 202 and exits.
+  - `--wait` polls status, printing `processing · chunk 2/3 · 40%` / `processing · stitching · 97%`. It exits 0 on `succeeded` and 1 on `failed` or any non-200 poll.
+  - A `.cbdirector` with a newer `version` exits 64 (usage) without contacting the server.
+
 ## Prompt enhancement
 
 `POST /v1/enhance` body: `{prompt, character?, character_description?, content_mode?}`

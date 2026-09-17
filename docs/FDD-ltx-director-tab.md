@@ -345,3 +345,133 @@ file:line evidence. Five Majors and three Minors, all folded into v1.1 above:
 3. The desktop gets its own timeline tab (this reverses "no custom desktop UI" for
    storyboards only insofar as Director is not a storyboard tool).
 4. Upstream import shim (their `timeline_data` → ours) in Phase 1, or later.
+
+## 10. Phase 1 implementation deltas (2026-09-16)
+
+Phase 1 was built on `claude/director-phase1`: WP1, WP2a–d and WP4 are done; WP3 (the desktop tab) is in progress. Where the build
+differs from §4–§6 above, the build is authoritative and the difference is recorded here.
+The API contract as built is in `docs/api-notes.md` → "Director timeline (LTX-2)".
+
+**Timeline document (§4.1)**
+- `settings.seconds` → `settings.length_frames`. Frames are the source of truth and seconds
+  (`frames / fps`) are only a UI readout. The length is snapped UP to `1 + 8k` and must be
+  ≥ 97 after the snap (the production floor) and ≤ 4609 (16 chunks).
+- `settings.resize` dropped. Every keyframe goes through the engine's existing i2v loader
+  (center-crop + resize to width × height + H.264 conditioning round-trip).
+- Per-keyframe `compression` dropped. The resolved `img_compression` applies.
+- In/out points dropped. The desktop has no I/O keys in Phase 1.
+- Added `settings.negative_prompt`, `settings.steps` and `settings.character`. With
+  `character: null` (the default) every chunk sends `skip_character_injection`, so a
+  keyframe-less chunk 0 (T2V) never silently becomes a character render.
+- Decoding is explicit and lenient: unknown keys are ignored, a missing `version` reads as 1,
+  and `version > 1` is rejected (`DirectorError.unsupportedVersion`, HTTP 400 on both routes).
+- Keyframe frames must be multiples of 8 (`keyframe_off_grid` otherwise). The latent index is
+  **floor**(frame / 8), matching `LTX2Pipeline.generateMultiKeyframeResumable`, not the
+  ceiling division §4.1 describes. Because keyframes are grid-snapped, floor and ceil agree.
+  The desktop ruler snaps to the same grid, rounding ties down (100 → 96).
+- Added the `invalid_gain` error code. `duplicate_id` is checked across all tracks.
+  `no_keyframes` fires whenever there is no keyframe at frame 0.
+
+**Compiler (§4.2)**
+- One single-pass `/v1/video/generate` body per chunk: `extend_to_seconds: 0` and
+  `identity_anchor_strength: 0` are sent explicitly, plus `enhance: false`, seed + k, and a
+  generic `keyframes[]`.
+- Chunks are balanced: `ceil(S/36)` chunks of near-equal latent steps, each ≤ 289 frames. They
+  are not the fixed-289 continuation layout.
+- **Rule 1 wording changed:** a keyframe exactly on a chunk boundary conditions **chunk k's
+  last frame only**. Chunk k+1 starts from the rendered carry-over frame, not the user image.
+  The validator warns with `keyframe_on_chunk_boundary`, and adds
+  `keyframe_partial_strength_on_boundary` when the keyframe's strength is < 1.
+- Rule 1's "else the existing i2v path" holds per chunk: a body whose only keyframe is at
+  frame 0 takes the untouched i2v arm. Any keyframe at frame > 0 takes the multi-keyframe
+  arm, which now also generates audio (WP2a).
+- **Chunk-0 asymmetry.** Every director chunk is chunk 0 to the generator, so continuation
+  chunks get face/refine anchors and audio on the carry-over frame. A continuation chunk that
+  carries an end keyframe gets no face/refine anchoring. With the double-lossy carry-over
+  (mp4 → PNG → H.264 conditioning round-trip), this is the first suspect for a chunk-to-chunk
+  quality step.
+- **Imported audio is mixed at 48 kHz stereo, not 44.1 kHz.** 48 kHz matches the generated
+  lane and the tested AAC mux. Imported clips are not mastered: overlapping clips sum, then
+  hard-clip at ±1.
+- **Generated audio across chunks.** Each chunk generates its own audio. Chunk k > 0's audio
+  is placed at `start_k + 1` with its first frame's worth trimmed, matching the dropped video
+  boundary frame. With more than one chunk there are seams (`generated_audio_seams`).
+- The imported-audio track is not handed to `writeMP4` per chunk. Chunks render with
+  `audio: false`, and the timeline mix is muxed once by the stitcher.
+- **The stitcher always decodes and re-encodes** (`stitch_path: "reencode"`). There is no
+  passthrough concat. Before writing, it verifies each chunk's fps and frame count.
+
+**Server API (§4.3)**
+- `wait: true` dropped; the route uses the 202 job model only.
+- `GET/PUT /v1/director/timelines/{id}` (the server-side timeline store) deferred. The desktop
+  (WP3) is planned to save `.cbdirector` files locally and autosave to
+  `~/.comfybox/director-autosave.cbdirector`, not Application Support.
+- **Submit-time dry run.** Every chunk body is prepared and validated before the 202. A preset
+  that forces multi-chunk (`chunk_not_single_pass`), enables temporal upscale
+  (`temporal_upscale_unsupported`) or changes frames/fps (`chunk_frames_mismatch`) is a 400.
+  Temporal upscale is rejected in Phase 1 because the stitcher runs at `settings.fps`.
+- The status route is unchanged, with additive `plan`, `stage_index` and `stage_count`.
+  Failures read `chunk k/n (stage): message`.
+- Durability: non-durable, as §4.3 already stated (WP9).
+- Intermediates are deleted on success and on failure. `director-*` names follow the
+  storyboard's non-`ltx2-` prefix, which the orchestration assumes the daemon's orphan
+  reconciler ignores; that was not re-verified against coffeeshop-server.
+- MCP: `generate_director_video` (additive) and `validate_director_timeline` (read-only),
+  bringing the registry to 61 tools.
+- CLI: `comfybox director-render <file.cbdirector> [--server URL] [--output path]
+  [--source name] [--validate-only] [--wait] [--poll-seconds n]`. It is an HTTP client of the
+  running server and never renders in-process.
+
+**WP5 validation ladder — handed to Todd.** The Phase 1 house rules forbid touching the
+production engine from the build sessions: no second engine, no `/v1/video*` calls against
+:7870, no pausing the soak. The WP5 ladder is therefore a Todd-run follow-up. Each rung is one
+`.cbdirector` file plus one command. Validate first; it costs nothing and runs while the soak
+renders. Then submit when the queue allows. Use the production preset, the same seed across
+re-runs, and 576×896 @ 24 fps unless noted.
+
+1. **FFLF, 10 s.** `length_frames: 241`; keyframes `k1` at 0 and `k2` with
+   `is_end_frame: true` (strength 1.0); one global prompt, no segments.
+   ```
+   comfybox director-render ~/Director/rung1-fflf.cbdirector --validate-only
+   comfybox director-render ~/Director/rung1-fflf.cbdirector --output rung1-fflf.mp4 --wait
+   ```
+   Pass = both frames honoured and no jump cut (they are 240 frames apart, well over 48).
+2. **Three keyframes across two chunks, one on the boundary.** `length_frames: 577`, which
+   gives chunks [0..288] and [288..576]; keyframes at 0, 288 and end. Expect the warning
+   `keyframe_on_chunk_boundary` for the keyframe at 288.
+   ```
+   comfybox director-render ~/Director/rung2-boundary.cbdirector --validate-only
+   comfybox director-render ~/Director/rung2-boundary.cbdirector --output rung2-boundary.mp4 --wait
+   ```
+   Pass = continuity across frame 288 at least as good as Extend today. Watch for the
+   chunk-0-asymmetry and double-lossy carry-over effects noted above.
+3. **Prompt schedule.** `length_frames: 289` (a single chunk, 12 s); keyframe at 0;
+   `prompt_segments` p1 [0, 144) and p2 [144, 289) with contradictory actions.
+   ```
+   comfybox director-render ~/Director/rung3-beats.cbdirector --validate-only
+   comfybox director-render ~/Director/rung3-beats.cbdirector --output rung3-beats.mp4 --wait
+   ```
+   Pass = the action changes near frame 144, not before. Phase 1 compiles segments to the beat
+   schedule inside one chunk, so this rung measures the change within a chunk. To test the §6
+   wording (change at a chunk boundary), repeat with `length_frames: 577` and the segments
+   split at 288.
+4. **Imported audio.** `length_frames: 241`; a talking-head keyframe pair (0 and end);
+   `audio: {mode: "imported"}`; `audio_clips: [{id: a1, audio_path: <10 s voice clip>,
+   start_frame: 0, length_frames: 240}]`.
+   ```
+   comfybox director-render ~/Director/rung4-voice.cbdirector --validate-only
+   comfybox director-render ~/Director/rung4-voice.cbdirector --output rung4-voice.mp4 --wait
+   ```
+   Pass = lip motion plausible and no generated audio (the sidecar reads
+   `audio_source: "imported"`).
+5. **Retake (Phase 2, not runnable in Phase 1).** A timeline with `retake.enabled: true`
+   validates to the error `retake_unsupported`, and the render route returns 400:
+   `comfybox director-render ~/Director/rung5-retake.cbdirector --validate-only`. Run it only
+   to confirm the refusal. The real rung waits for WP6.
+6. **Reference guide (Phase 2, not runnable in Phase 1).** Non-empty `reference_clips`
+   validates to the error `reference_clips_unsupported`:
+   `comfybox director-render ~/Director/rung6-reference.cbdirector --validate-only`. The real
+   rung waits for WP6/WP8.
+
+The file paths above are placeholders: author the files in the desktop Director tab (Save)
+or by hand. `--server` defaults to `http://127.0.0.1:7870`.
