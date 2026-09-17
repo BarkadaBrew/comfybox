@@ -110,7 +110,7 @@ final class MCPJobToolSchemaTests: XCTestCase {
 
   func testToolCountGrewByExactlyOne() {
     XCTAssertEqual(
-      MCPToolRegistry.tools.count, 70,
+      MCPToolRegistry.tools.count, 71,
       "55 tools + get_job (#289) + nearline_anchor (#273) + set/get_admission_mode (#447) + generate_director_video/validate_director_timeline (Director WP2c). Update this pin and the two other pins in the same review.")
   }
 }

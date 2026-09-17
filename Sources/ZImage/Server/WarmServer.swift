@@ -2027,6 +2027,9 @@ public final class WarmServer {
     case ("POST", "/v1/library/items"), ("PUT", "/v1/library/items"):
       return libraryUpsertResponse(body: request.body)
 
+    case ("POST", "/v1/library/import-pack"):
+      return libraryImportPackResponse(body: request.body)
+
     case ("POST", "/v1/library/fill"):
       return Self.libraryFill(store: libraryStore, body: request.body)
 
@@ -5040,6 +5043,44 @@ public final class WarmServer {
         status: deleted ? 200 : 404, payload: DeleteResult(success: deleted, id: id, deleted: deleted))
     } catch {
       return .error(.error(status: 500, message: error.localizedDescription))
+    }
+  }
+
+  /// `POST /v1/library/import-pack` — `{path, dry_run?}`. Imports a
+  /// third-party creative library pack (PRD-creative-library §7, L7) and
+  /// returns the report: what landed, per kind, and what was skipped and why.
+  private func libraryImportPackResponse(body: Data) -> RoutedResponse {
+    struct ImportRequest: Decodable {
+      let path: String
+      let dryRun: Bool?
+      enum CodingKeys: String, CodingKey {
+        case path
+        case dryRun = "dry_run"
+      }
+    }
+    do {
+      let request = try JSONDecoder().decode(ImportRequest.self, from: body)
+      let expanded = (request.path as NSString).expandingTildeInPath
+      let url = URL(fileURLWithPath: expanded)
+      var isDirectory: ObjCBool = false
+      guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory) else {
+        return .error(.error(status: 404, message: "No pack at \(expanded)"))
+      }
+      let dryRun = request.dryRun ?? false
+      let report = isDirectory.boolValue
+        ? try LibraryPackImporter.importDirectory(url, into: libraryStore, dryRun: dryRun)
+        : try LibraryPackImporter.importPack(at: url, into: libraryStore, dryRun: dryRun)
+      if !dryRun {
+        auditLog.append(
+          kind: "library.import",
+          message: "Imported \(report.total) item(s) from pack \(report.packId)",
+          metadata: ["pack": report.packId])
+      }
+      return .json(status: 200, payload: report)
+    } catch let error as LibraryPackError {
+      return .error(.error(status: 400, message: error.localizedDescription))
+    } catch {
+      return .error(.error(status: 400, message: "Invalid import payload: \(error.localizedDescription)"))
     }
   }
 

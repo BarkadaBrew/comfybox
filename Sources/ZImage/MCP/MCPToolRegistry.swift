@@ -60,6 +60,7 @@ public enum MCPToolRegistry {
     libraryDelete.annotated(.destructive),
     libraryCollectionUpsert.annotated(.additive),
     libraryCollectionDelete.annotated(.destructive),
+    libraryImportPack.annotated(.additive),
     importLegacyPresets.annotated(.additive),
     queueList.annotated(.readOnly),
     interruptRender.annotated(.destructive),
@@ -1167,6 +1168,24 @@ public enum MCPToolRegistry {
       "required": ["id"],
     ] as [String: Any],
     routes: [RouteRef(method: "DELETE", path: "/v1/library/collections/{id}")]
+  )
+
+  static let libraryImportPack = MCPToolDefinition(
+    name: "library_import_pack",
+    description: """
+      Import a third-party creative library pack (.soslibrary) into the Creative Library. \
+      Pass dry_run true first to see what would land. Pack items are marked with their source \
+      and keep pack collection membership separate from Todd's own filing.
+      """,
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "path": ["type": "string", "description": "Path to the .soslibrary file or an unpacked pack directory"],
+        "dry_run": ["type": "boolean"],
+      ] as [String: Any],
+      "required": ["path"],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/library/import-pack")]
   )
 
   static let libraryMarkUsed = MCPToolDefinition(

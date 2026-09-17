@@ -52,6 +52,7 @@ or carry a reasoned exemption (§3.5 assertion 3).
 | DELETE | `/v1/library/collections/{id}` | library_collection_delete |  |
 | GET | `/v1/library/facets` | library_facets |  |
 | POST | `/v1/library/fill` | library_fill_template |  |
+| POST | `/v1/library/import-pack` | library_import_pack |  |
 | GET | `/v1/library/items` | library_search |  |
 | POST | `/v1/library/items` | library_upsert |  |
 | PUT | `/v1/library/items` | library_upsert |  |
