@@ -1,6 +1,6 @@
 # FDD — Remote galleries: portable drives and Immich
 
-**Status:** draft for review · **Owner:** ComfyBox Desktop · **Date:** 2026-09-17
+**Status:** implemented (PR #472); §7 open questions still open · **Owner:** ComfyBox Desktop · **Date:** 2026-09-17
 
 ## 1. Requirement
 
@@ -162,3 +162,11 @@ Three changes, smallest first:
 ## 8. Review
 
 Codex (read-only, 2026-09-17) reviewed the draft against the code and raised ten findings. Two criticals (delete-before-relocate; `absolute_path` cannot be surrendered) and five highs/mediums (secured rows, backfill re-adoption, relocate-not-delete, media resolver, ingestor concurrency, Immich API details) are folded into §3.3–§3.5 above. Its remaining note, that `DesktopSettings` lives inside `Views/SettingsView.swift` and that `ComfyBoxGallery` on :7871 is a catalog search service rather than a byte service, is corrected in §2 and §3.1.
+
+## 9. Implementation notes (2026-09-17)
+
+Built and tested as specified, with two deliberate gaps recorded in the plan:
+the Remote Gallery tab is not yet scoped to a remote picker, and Immich-hosted
+assets are hidden from the grid rather than rendered, because Immich requires
+its API key as a request header and SwiftUI's image loading cannot send one.
+Folder remotes render exactly like local assets while their drive is attached.
