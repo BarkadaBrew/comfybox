@@ -211,6 +211,24 @@ final class LibraryPackImportTests: XCTestCase {
     XCTAssertEqual(after.createdAt, mine.createdAt, "createdAt survives, so history is intact")
   }
 
+  // MARK: unreadable paths
+
+  func testAMissingArchiveFailsFastWithAnActionableMessage() throws {
+    let missing = root.appendingPathComponent("nope.soslibrary")
+    XCTAssertThrowsError(try LibraryPackImporter.importPack(at: missing, into: store)) { error in
+      guard case .unreadable(let message)? = error as? LibraryPackError else {
+        return XCTFail("expected .unreadable, got \(error)")
+      }
+      XCTAssertTrue(message.contains("nope.soslibrary"))
+    }
+  }
+
+  func testReadProbeAcceptsAReadableFile() throws {
+    let file = root.appendingPathComponent("readable.bin")
+    try Data("hello".utf8).write(to: file)
+    XCTAssertNoThrow(try LibraryPackImporter.probeReadable(file))
+  }
+
   // MARK: helpers
 
   func testPlaceholderRewriteIsWholeTokenOnly() {
