@@ -399,16 +399,9 @@ public final class WarmServer {
     // claimed (it would otherwise strand the preemption flag), then wake any
     // render that parked behind the slots.
     let coordinatorForSlots = self.coordinator
-    let holdForSlots = self.inferenceHold
-    let signalForSlots = self.ltx2PreemptionSignal
-    let inFlightForSlots = self.preemptionInFlight
-    self.inferenceSlots.onEmpty = {
-      if holdForSlots.cancelIfRequested() {
-        signalForSlots.clear()
-        inFlightForSlots.clear()
-      }
-      Task { await coordinatorForSlots.wakeAfterInferenceRelease() }
-    }
+    self.inferenceSlots.onEmpty = InferenceSlotWiring.onEmpty(
+      hold: self.inferenceHold, signal: self.ltx2PreemptionSignal, inFlight: self.preemptionInFlight,
+      wake: { Task { await coordinatorForSlots.wakeAfterInferenceRelease() } })
     self.seedvr2WeightsPath = configuration.seedvr2WeightsPath
 
     self.comfyBridge = ComfyBridge(logger: logger)
@@ -4521,42 +4514,20 @@ public final class WarmServer {
   private func inferenceSlotContext() -> InferenceSlotRouteContext {
     let live = liveHealth
     let video = videoHolder
-    let hold = inferenceHold
-    let signal = ltx2PreemptionSignal
-    let inFlight = preemptionInFlight
     let telemetry = ltx2Telemetry
-    let log = logger
-    return InferenceSlotRouteContext(
-      table: inferenceSlots, hold: hold,
+    return InferenceSlotWiring.routeContext(
+      table: inferenceSlots, hold: inferenceHold,
+      signal: ltx2PreemptionSignal, inFlight: preemptionInFlight,
       gpuBusy: { live.read().0.isRendering || video.isRendering() },
       videoRendering: { video.isRendering() },
       progress: {
         let (snap, pct) = live.read()
         return (pct, snap.activeRenderStartedAt)
       },
-      raiseHold: {
-        // One preemption at a time: an image job's #1479 episode already owns it.
-        guard inFlight.trySet() else { return }
-        guard hold.request() else { inFlight.clear(); return }
-        guard video.isRendering() else {
-          _ = hold.cancelIfRequested()
-          inFlight.clear()
-          return
-        }
-        log.info("inference slot: asking the in-flight LTX-2 video to checkpoint (top priority)")
-        signal.raise()
-        // Same fallback window as #1479: if the render never yields (deep in an
-        // uninterruptible phase, or it simply finishes first), withdraw the
-        // request — the slots then wait for the render to end.
-        let windowSec = telemetry.view().meanStepSec.map { $0 * 2 + 30 } ?? 120
-        DispatchQueue.global().asyncAfter(deadline: .now() + windowSec) {
-          if hold.cancelIfRequested() {
-            signal.clear()
-            inFlight.clear()
-            log.warning("inference slot: video did not yield within \(Int(windowSec))s — slots wait for the render to finish")
-          }
-        }
-      })
+      // Same fallback window as #1479: if the render never yields (deep in an
+      // uninterruptible phase, or it simply finishes first), withdraw the request.
+      watchdogSec: { telemetry.view().meanStepSec.map { $0 * 2 + 30 } ?? 120 },
+      logger: logger)
   }
 
   private func inferenceSlotHTTPResponse(_ request: HTTPRequest) -> HTTPResponse {
@@ -17200,6 +17171,9 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// FDD-glimmer-gpu-slot: the probe's own slot table + hold, wired to the coordinator.
   let inferenceSlots = InferenceSlotTable()
   let inferenceHold = InferenceHold()
+  /// The #1479 state the coordinator shares with the slot wiring.
+  let preemptionSignal = PreemptionSignal()
+  let preemptionInFlight = LockedFlag()
   private let liveHealth = LiveHealthState()
   /// comfybox#283/#217: same `COMFYBOX_STATE_DIR` override every other piece
   /// of this probe's state honors (see `stateDirectory`'s doc comment on
@@ -17234,16 +17208,34 @@ final class WarmServerQueueProbe: @unchecked Sendable {
       liveHealth: liveHealth,
       videoJobTracker: VideoJobTracker(),
       ltx2Telemetry: LTX2PhaseTelemetry(),
-      ltx2PreemptionSignal: PreemptionSignal(),
+      ltx2PreemptionSignal: preemptionSignal,
       ltx2StepPosition: LTX2StepPosition(),
       ltx2EvictMean: RollingMeanSec(),
       ltx2ReloadMean: RollingMeanSec(),
-      preemptionInFlight: LockedFlag(),
+      preemptionInFlight: preemptionInFlight,
       pendingPreemptorBox: PendingPreemptorBox(),
       lifecycleLedger: lifecycleLedger,
       inferenceSlots: inferenceSlots, inferenceHold: inferenceHold)
     let coordinatorForSlots = self.coordinator
-    inferenceSlots.onEmpty = { Task { await coordinatorForSlots.wakeAfterInferenceRelease() } }
+    inferenceSlots.onEmpty = InferenceSlotWiring.onEmpty(
+      hold: inferenceHold, signal: preemptionSignal, inFlight: preemptionInFlight,
+      wake: { Task { await coordinatorForSlots.wakeAfterInferenceRelease() } })
+  }
+
+  /// Codex review of #465 (finding 2): the PRODUCTION slot route context —
+  /// same raiseHold/watchdog closures WarmServer uses — over this probe's
+  /// coordinator state, with the video-rendering read and watchdog window
+  /// injected.
+  func slotRouteContext(
+    videoRendering: @escaping @Sendable () -> Bool, watchdogSec: TimeInterval
+  ) -> InferenceSlotRouteContext {
+    InferenceSlotWiring.routeContext(
+      table: inferenceSlots, hold: inferenceHold,
+      signal: preemptionSignal, inFlight: preemptionInFlight,
+      gpuBusy: videoRendering, videoRendering: videoRendering,
+      progress: { (nil, nil) },
+      watchdogSec: { watchdogSec },
+      logger: Logger(label: "z-image.queue-probe"))
   }
 
   /// comfybox#283/#217: the lifecycle events recorded for one job id, for a
