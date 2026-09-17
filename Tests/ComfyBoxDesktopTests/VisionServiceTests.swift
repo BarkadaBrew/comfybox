@@ -12,6 +12,7 @@ final class VisionServiceTests: XCTestCase {
         let imageBlock = content?.first(where: { ($0["type"] as? String) == "image_url" })
         let url = (imageBlock?["image_url"] as? [String: Any])?["url"] as? String
         XCTAssertEqual(url, "data:image/png;base64,AAAA")
+        XCTAssertGreaterThanOrEqual(body["max_tokens"] as? Int ?? 0, 1200, "a reasoning vision model needs headroom (was 320)")
     }
 
     func testParseCleanJSON() {

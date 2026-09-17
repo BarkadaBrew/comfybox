@@ -177,46 +177,54 @@ public final class MCPToolExecutor: @unchecked Sendable {
 
   // MARK: - Tool Implementations
 
-  /// generate_image -> POST /v1/generate
-  /// Ask the local vision model (LM Studio / OpenAI-compatible /chat/completions
-  /// on the Mac) to diagnose RENDER defects in an image. Fully on-device — no
+  /// Ask the configured local vision model (ComfyBox config `providers.vision`,
+  /// falling back to `providers.captioning`; COMFYBOX_VISION_URL + _MODEL override
+  /// both) to diagnose RENDER defects in an image. Fully on-device — no
   /// coffeeshop-server reliance. Returns a concise defect description, "CLEAN",
-  /// or nil if vision is unreachable.
+  /// or nil when no provider is configured or the model gives no answer; the
+  /// reason is written to stderr so a blind repair is visible.
   private func diagnoseDefects(imagePath: String) async -> String? {
-    let visionURL = ProcessInfo.processInfo.environment["COMFYBOX_VISION_URL"] ?? "http://127.0.0.1:1234/v1"
-    var model = ProcessInfo.processInfo.environment["COMFYBOX_VISION_MODEL"] ?? ""
-    if model.isEmpty, let mu = URL(string: visionURL + "/models"),
-       let (md, _) = try? await URLSession.shared.data(from: mu),
-       let mo = try? JSONSerialization.jsonObject(with: md) as? [String: Any],
-       let arr = mo["data"] as? [[String: Any]] {
-      let ids = arr.compactMap { $0["id"] as? String }
-      model = ids.first(where: { $0.lowercased().contains("vl") || $0.lowercased().contains("vision") }) ?? ids.first ?? "local-model"
+    let configJSON: Data?
+    if let (status, data) = try? await client.get("/v1/config"), status == 200 {
+      configJSON = data
+    } else {
+      configJSON = nil
     }
-    if model.isEmpty { model = "local-model" }
+    guard let endpoint = VisionChat.resolveEndpoint(
+      environment: ProcessInfo.processInfo.environment, configJSON: configJSON)
+    else {
+      FileHandle.standardError.write(Data("[repair_image] no vision provider configured (providers.vision / providers.captioning) — diagnosing blind\n".utf8))
+      return nil
+    }
     let resolved = (imagePath as NSString).expandingTildeInPath
     guard let imgData = try? Data(contentsOf: URL(fileURLWithPath: resolved)),
-          let url = URL(string: visionURL + "/chat/completions") else { return nil }
-    let b64 = imgData.base64EncodedString()
+          let url = URL(string: endpoint.baseURL + "/chat/completions") else { return nil }
     let question = "You are inspecting an AI-generated adult photo for RENDER defects only (not content or subject matter). List concise, concrete defects and WHERE each is located. Look for: mottled/blotchy/damaged skin, disfigured or deformed anatomy, extra/missing/fused fingers or limbs, warped or melted face, mesh/cross-hatch texture artifacts, color banding. Report locations using: face, hands, torso, legs, background. If there are NO render defects, reply with exactly the single word CLEAN."
-    let payload: [String: Any] = [
-      "model": model,
-      "messages": [["role": "user", "content": [
-        ["type": "text", "text": question],
-        ["type": "image_url", "image_url": ["url": "data:image/png;base64,\(b64)"]],
-      ] as [Any]] as [String: Any]],
-      "max_tokens": 300, "temperature": 0.2,
-    ]
+    let payload = VisionChat.body(model: endpoint.model, prompt: question, base64PNG: imgData.base64EncodedString())
     guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
     var req = URLRequest(url: url); req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    req.httpBody = body; req.timeoutInterval = 90
+    if let key = endpoint.apiKey { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+    req.httpBody = body; req.timeoutInterval = 120
     guard let (data, resp) = try? await URLSession.shared.data(for: req),
-          let http = resp as? HTTPURLResponse, http.statusCode == 200,
-          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let choices = obj["choices"] as? [[String: Any]],
-          let msg = choices.first?["message"] as? [String: Any],
-          let content = msg["content"] as? String else { return nil }
-    return content.trimmingCharacters(in: .whitespacesAndNewlines)
+          let http = resp as? HTTPURLResponse else {
+      FileHandle.standardError.write(Data("[repair_image] vision request to \(endpoint.baseURL) failed (unreachable)\n".utf8))
+      return nil
+    }
+    guard http.statusCode == 200 else {
+      FileHandle.standardError.write(Data("[repair_image] vision HTTP \(http.statusCode) from \(endpoint.model)\n".utf8))
+      return nil
+    }
+    switch VisionChat.parseReply(data) {
+    case .text(let answer):
+      return answer
+    case .emptyAfterReasoning(let chars):
+      FileHandle.standardError.write(Data("[repair_image] \(endpoint.model) returned no answer after \(chars) chars of reasoning — raise VisionChat.maxTokens\n".utf8))
+      return nil
+    case .malformed:
+      FileHandle.standardError.write(Data("[repair_image] vision reply from \(endpoint.model) was not a chat completion\n".utf8))
+      return nil
+    }
   }
 
   /// Repair a defective image on-device: local VLM diagnoses -> targeted img2img
