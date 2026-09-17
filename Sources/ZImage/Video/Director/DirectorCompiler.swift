@@ -58,7 +58,8 @@ public enum DirectorCompiler {
         audio: generated ? "generated" : "none")
     }
     return DirectorPlan(
-      lengthFrames: snapped.settings.lengthFrames, fps: snapped.settings.fps,
+      lengthFrames: snapped.settings.lengthFrames,
+      fps: snapped.settings.fps ?? DirectorTimeline.Settings.defaultFps,
       width: snapped.settings.width, height: snapped.settings.height,
       audioMode: snapped.audio.mode.rawValue,
       chunks: chunks,
@@ -100,13 +101,11 @@ public enum DirectorCompiler {
         "prompt": prompt,
         "width": settings.width,
         "height": settings.height,
-        "fps": settings.fps,
         "frames": span.frames,
         // Explicit single pass: wins over any preset extend/duration so the
         // chunk never becomes a continuation render (which would strip
         // beat_schedule and re-anchor at 0.5).
         "extend_to_seconds": 0.0,
-        "seed": seed(for: snapped, chunk: span.index),
         "identity_anchor_strength": 0.0,
         "audio": generated,
         // Enhancement rewrites the prompt and the beats would fail to locate.
@@ -117,6 +116,10 @@ public enum DirectorCompiler {
         "output_path": outputName,
         "source": source,
       ]
+      // fps/seed: nil => omitted, so the preset/config value applies
+      // (request > preset > config > builtin), like steps/negative below.
+      if let fps = settings.fps { body["fps"] = fps }
+      if let seed = seed(for: snapped, chunk: span.index) { body["seed"] = seed }
       if let negative = settings.negativePrompt { body["negative_prompt"] = negative }
       if let steps = settings.steps { body["steps"] = steps }
       if let preset = settings.preset { body["preset"] = preset }
@@ -188,15 +191,30 @@ public enum DirectorCompiler {
       .sorted { ($0.startFrame, $0.id) < ($1.startFrame, $1.id) }
       .compactMap { seg -> PlacedSegment? in
         guard let fracs = DirectorMath.beatFractions(
-          segmentStart: seg.startFrame, segmentLength: seg.lengthFrames, chunk: span)
+          segmentStart: seg.startFrame, segmentLength: seg.lengthFrames, chunk: span,
+          sharesEndFrame: span.endFrame < snapped.settings.lengthFrames - 1)
         else { return nil }
         return PlacedSegment(segment: seg, startFrac: fracs.startFrac, endFrac: fracs.endFrac)
       }
     return ChunkConditioning(keyframes: keyframes, segments: segments)
   }
 
-  static func seed(for snapped: DirectorTimeline, chunk: Int) -> UInt64 {
-    snapped.settings.seed &+ UInt64(chunk)
+  static func seed(for snapped: DirectorTimeline, chunk: Int) -> UInt64? {
+    snapped.settings.seed.map { $0 &+ UInt64(chunk) }
+  }
+
+  /// The timeline with `fps`/`seed` pinned to the values the server resolved
+  /// for chunk 0 (preset/config/builtin when the timeline named none).
+  /// Recompiling this makes every chunk body, the plan and the sidecar agree
+  /// with what actually renders; a timeline that already named both is
+  /// returned unchanged.
+  public static func resolvingDefaults(
+    _ snapped: DirectorTimeline, fps: Int, seed: UInt64
+  ) -> DirectorTimeline {
+    var out = snapped
+    if out.settings.fps == nil { out.settings.fps = fps }
+    if out.settings.seed == nil { out.settings.seed = seed }
+    return out
   }
 
   /// Float -> the shortest Double that round-trips the same decimal text, so

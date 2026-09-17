@@ -79,6 +79,21 @@ final class DirectorDocumentTests: XCTestCase {
     XCTAssertNil(back2.keyframes[1].imageBase64)
   }
 
+  func testPortableFileKeepsEmbeddedImageOnResave() throws {
+    let bytes = Data((0..<32).map { UInt8($0) })
+    var t = sample(imagePath: "/Users/someone-else/Pictures/k1.png")  // not on this machine
+    t.keyframes[0].imageBase64 = bytes.base64EncodedString()
+    for embed in [true, false] {
+      let url = dir.appendingPathComponent("portable-\(embed).cbdirector")
+      try DirectorDocument.write(t, to: url, embedAssets: embed)
+      let back = try DirectorDocument.read(from: url)
+      XCTAssertEqual(back.keyframes[0].imagePath, "/Users/someone-else/Pictures/k1.png")
+      XCTAssertEqual(
+        back.keyframes[0].imageBase64.flatMap { Data(base64Encoded: $0) }, bytes,
+        "embed \(embed): the payload is the only copy of the image and must survive a re-save")
+    }
+  }
+
   func testUnreadableThrowsFileUnreadable() {
     let url = dir.appendingPathComponent("missing.cbdirector")
     XCTAssertThrowsError(try DirectorDocument.read(from: url)) { error in

@@ -55,21 +55,37 @@ extension EngineService {
         let issues: [DirectorIssue]?
     }
 
-    /// `{timeline, output_path, source: "desktop"}`. The desktop never sends
-    /// `image_base64` (the engine reads keyframe images by path); embedding is
-    /// only for portable .cbdirector files.
-    nonisolated static func directorRequestBody(timeline: DirectorTimeline, outputPath: String) throws -> Data {
+    /// `{timeline, output_path, source: "desktop"}`. The engine reads a
+    /// keyframe image by path whenever that path exists, so `image_base64` is
+    /// stripped for those keyframes; a keyframe whose path does not exist here
+    /// (a portable .cbdirector saved with "Embed assets" on another machine)
+    /// keeps its payload, which the server materializes to a file.
+    nonisolated static func directorRequestBody(
+        timeline: DirectorTimeline, outputPath: String,
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) throws -> Data {
         try DirectorJSON.encoder(pretty: false).encode(
-            DirectorEnvelope(timeline: strippingEmbeddedAssets(timeline), outputPath: outputPath, source: "desktop"))
+            DirectorEnvelope(timeline: strippingEmbeddedAssets(timeline, fileExists: fileExists), outputPath: outputPath, source: "desktop"))
     }
 
-    nonisolated static func directorValidateBody(timeline: DirectorTimeline) throws -> Data {
-        try DirectorJSON.encoder(pretty: false).encode(DirectorValidateEnvelope(timeline: strippingEmbeddedAssets(timeline)))
+    nonisolated static func directorValidateBody(
+        timeline: DirectorTimeline,
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) throws -> Data {
+        try DirectorJSON.encoder(pretty: false).encode(
+            DirectorValidateEnvelope(timeline: strippingEmbeddedAssets(timeline, fileExists: fileExists)))
     }
 
-    private nonisolated static func strippingEmbeddedAssets(_ timeline: DirectorTimeline) -> DirectorTimeline {
+    /// Drop `image_base64` only where the path it duplicates exists locally;
+    /// without a readable path the payload is the image.
+    nonisolated static func strippingEmbeddedAssets(
+        _ timeline: DirectorTimeline, fileExists: (String) -> Bool
+    ) -> DirectorTimeline {
         var t = timeline
-        for i in t.keyframes.indices { t.keyframes[i].imageBase64 = nil }
+        for i in t.keyframes.indices {
+            guard let path = t.keyframes[i].imagePath, !path.isEmpty, fileExists(path) else { continue }
+            t.keyframes[i].imageBase64 = nil
+        }
         return t
     }
 

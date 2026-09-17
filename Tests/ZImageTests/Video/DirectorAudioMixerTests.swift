@@ -120,4 +120,27 @@ final class DirectorAudioMixerTests: XCTestCase {
     let placed = DirectorAudioMixer.chunkPlacement(chunkPCM: [tone(seconds: 1)], spans: spans, fps: 24)
     XCTAssertEqual(placed.count, 1)
   }
+
+  func testNegativeStartTrimsTheHeadInsteadOfShifting() {
+    // A ramp so each sample is identifiable: sample i has value i / n.
+    let n = 480000  // 10 s
+    let ramp = (0..<n).map { Float($0) / Float(n) }
+    let pcm = StereoPCM(left: ramp, right: ramp, sampleRate: sr)
+    // start -48 (2 s before the timeline), 120 frames: only 72 frames
+    // (3 s) are on the timeline, and they are the file's seconds 2..5.
+    let clip = PlacedAudio(pcm: pcm, startFrame: -48, lengthFrames: 120)
+    let out = DirectorAudioMixer.mix([clip], fps: 24, lengthFrames: 289, sampleRate: sr)
+    XCTAssertEqual(out.left[0], ramp[96000], accuracy: 1e-6, "timeline 0 is the file at 2 s")
+    XCTAssertEqual(out.left[143999], ramp[239999], accuracy: 1e-6, "last sample of the 72-frame slot")
+    XCTAssertEqual(out.left[144000], 0, "nothing past the shortened slot")
+    // Equivalent to the explicitly normalised clip.
+    let normalised = DirectorAudioMixer.mix(
+      [PlacedAudio(pcm: pcm, startFrame: 0, lengthFrames: 72, trimStartFrames: 48)],
+      fps: 24, lengthFrames: 289, sampleRate: sr)
+    XCTAssertEqual(out.left, normalised.left)
+    // Entirely before the timeline: silence.
+    let gone = DirectorAudioMixer.mix(
+      [PlacedAudio(pcm: pcm, startFrame: -200, lengthFrames: 100)], fps: 24, lengthFrames: 289, sampleRate: sr)
+    XCTAssertEqual(maxAbs(gone.left[...]), 0)
+  }
 }

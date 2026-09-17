@@ -35,6 +35,24 @@ final class LocalVideoKeyframeRequestTests: XCTestCase {
     XCTAssertEqual(kfs[1].strength, 0.8)
   }
 
+  func testFrameZeroKeyframeStrengthIsRangeChecked() throws {
+    for bad in ["0", "-0.5", "7", "1.0001"] {
+      let req = try decode(#"{"prompt":"x","keyframes":[{"image_path":"/a.png","frame":0,"strength":"# + bad + "}]}")
+      XCTAssertThrowsError(try WarmServer.resolveKeyframes(req), "strength \(bad)") { error in
+        guard case LTX2VideoError.invalidKeyframe(let why) = error else {
+          return XCTFail("expected invalidKeyframe, got \(error)")
+        }
+        XCTAssertTrue(why.contains("frame 0"), why)
+      }
+    }
+    let ok = try WarmServer.resolveKeyframes(
+      try decode(#"{"prompt":"x","keyframes":[{"image_path":"/a.png","frame":0,"strength":1.0}]}"#))
+    XCTAssertEqual(ok.strength, 1.0)
+    let partial = try WarmServer.resolveKeyframes(
+      try decode(#"{"prompt":"x","keyframes":[{"image_path":"/a.png","frame":0,"strength":0.4}]}"#))
+    XCTAssertEqual(partial.strength, 0.4)
+  }
+
   func testAbsentKeyframesPassesLegacyFieldsThrough() throws {
     let req = try decode(#"{"prompt":"x","image_path":"/init.png","strength":0.6}"#)
     let resolved = try WarmServer.resolveKeyframes(req)

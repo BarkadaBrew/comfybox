@@ -16,8 +16,8 @@ import ZImage
 @MainActor
 final class DirectorDocumentModel {
 
-    /// Undo depth. Timelines never carry base64 in memory, so whole-document
-    /// snapshots are cheap.
+    /// Undo depth. Only a portable .cbdirector opened on another machine
+    /// carries base64 in memory, so whole-document snapshots are cheap.
     static let undoLimit = 100
 
     /// A fresh document: portrait 576x896, 289 frames (12 s @ 24 fps).
@@ -63,7 +63,9 @@ final class DirectorDocumentModel {
     // MARK: - Derived
 
     var lengthFrames: Int { timeline.settings.lengthFrames }
-    var fps: Int { timeline.settings.fps }
+    /// The timeline fps, or the builtin the server would fall back to when
+    /// the document names none (a hand-written or MCP timeline).
+    var fps: Int { timeline.settings.fps ?? DirectorTimeline.Settings.defaultFps }
     var canUndo: Bool { !undoStack.isEmpty }
     var canRedo: Bool { !redoStack.isEmpty }
 
@@ -84,7 +86,7 @@ final class DirectorDocumentModel {
     }
 
     var timelineSeconds: Double {
-        DirectorMath.seconds(frames: timeline.settings.lengthFrames, fps: timeline.settings.fps)
+        DirectorMath.seconds(frames: timeline.settings.lengthFrames, fps: fps)
     }
 
     // MARK: - Commit / undo
@@ -403,6 +405,24 @@ final class DirectorDocumentModel {
             t.keyframes.removeAll { !$0.isEndFrame && $0.frame > length - 1 }
             for i in t.keyframes.indices where t.keyframes[i].isEndFrame {
                 t.keyframes[i].frame = length - 1
+            }
+            // A regular keyframe left in the end frame's latent bucket would
+            // collide with it (keyframes_collide): move it to the nearest free
+            // earlier grid frame, as toggleEndFrame does, or drop it.
+            if let endIndex = t.keyframes.firstIndex(where: \.isEndFrame) {
+                let stride = DirectorMath.latentStride
+                let lastBucket = (length - 1) / stride
+                for j in t.keyframes.indices where j != endIndex && t.keyframes[j].frame / stride == lastBucket {
+                    let occupied = Set(t.keyframes.enumerated().filter { $0.offset != j }.map { $0.element.frame / stride })
+                    var candidate = lastBucket * stride - stride
+                    while candidate >= 0 && occupied.contains(candidate / stride) { candidate -= stride }
+                    if candidate >= 0 {
+                        t.keyframes[j].frame = candidate
+                    } else {
+                        removed.append(t.keyframes[j].id)
+                    }
+                }
+                t.keyframes.removeAll { !$0.isEndFrame && removed.contains($0.id) }
             }
             removed += t.promptSegments.filter { $0.startFrame >= length }.map(\.id)
             t.promptSegments.removeAll { $0.startFrame >= length }

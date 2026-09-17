@@ -142,6 +142,10 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
   public let chunkCount: Int?
   /// Director: how the chunks were joined (`"reencode"` in Phase 1).
   public let stitchPath: String?
+  /// Director, generated audio: 0-based indices of chunks whose own audio
+  /// failed or could not be decoded and so contributed silence. nil (omitted)
+  /// when none were skipped and on every non-director record.
+  public let audioSkippedChunks: [Int]?
 
   public struct LoRAEntry: Codable, Sendable, Equatable {
     public let name: String
@@ -166,7 +170,8 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     nagApplied: Bool? = nil, audioRefine: Bool? = nil, recipeHash: String? = nil,
     kind: String, source: String? = nil, contentMode: String? = nil, truncated: Bool = false,
     loras: [LoRAEntry] = [],
-    audioSource: String? = nil, chunkCount: Int? = nil, stitchPath: String? = nil
+    audioSource: String? = nil, chunkCount: Int? = nil, stitchPath: String? = nil,
+    audioSkippedChunks: [Int]? = nil
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -210,6 +215,7 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     self.audioSource = audioSource
     self.chunkCount = chunkCount
     self.stitchPath = stitchPath
+    self.audioSkippedChunks = audioSkippedChunks
   }
 }
 

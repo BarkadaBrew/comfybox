@@ -141,6 +141,23 @@ struct DirectorDocumentModelTests {
         #expect(model.issues.contains { $0.severity == .warning && $0.ids.contains(late) })
     }
 
+    @Test("setLengthFrames moves a regular keyframe out of the end frame's latent bucket")
+    func setLengthFramesResolvesEndBucketCollision() throws {
+        let model = DirectorDocumentModel(timeline: directorTestTimeline(length: 145))
+        let k1 = try #require(model.addKeyframe(imagePath: "/tmp/k1.png", atFrame: 96))
+        let k2 = try #require(model.addKeyframe(imagePath: "/tmp/k2.png", atFrame: 0))
+        model.toggleEndFrame(id: k2)
+        #expect(model.timeline.keyframes.first { $0.id == k2 }?.frame == 144)
+        model.setLengthFrames(97)
+        #expect(model.timeline.settings.lengthFrames == 97)
+        #expect(model.timeline.keyframes.first { $0.id == k2 }?.frame == 96)
+        let moved = try #require(model.timeline.keyframes.first { $0.id == k1 })
+        #expect(moved.frame == 88)
+        #expect(!DirectorMath.keyframeBucketsCollide(model.timeline.keyframes.map(\.frame)))
+        let v = DirectorValidator.validate(model.timeline, fileExists: { _ in true }, audioProbe: { _ in nil })
+        #expect(!v.issues.contains { $0.code == "keyframes_collide" })
+    }
+
     @Test("undo and redo restore whole-timeline snapshots")
     func undoRedoRestoresSnapshots() throws {
         let model = DirectorDocumentModel(timeline: directorTestTimeline())

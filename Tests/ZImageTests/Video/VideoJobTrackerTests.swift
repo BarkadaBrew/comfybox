@@ -333,6 +333,32 @@ final class VideoJobTrackerTests: XCTestCase {
     tracker.markFailed(plainId, error: DirectorError.chunkFailed(chunk: 1, stage: "render", message: "x"))
     XCTAssertEqual(tracker.status(jobId: plainId)?.error, "chunk 2 (render): x")
   }
+
+  func testDirectorNamedInterruptThroughChunkWrappingEndsInterrupted() {
+    let tracker = VideoJobTracker()
+    let done = expectation(description: "orchestration finished")
+    let status = tracker.submitOrchestrated(
+      source: "api", mode: .director, plan: directorPlan(), stageCount: 2
+    ) { _, _ in
+      defer { done.fulfill() }
+      do {
+        // What `coordinator.enqueueLocalVideo` throws on /v1/queue/interrupt.
+        throw WarmServerError.renderInterrupted
+      } catch {
+        // runDirector's per-chunk catch.
+        throw WarmServer.directorChunkError(error, chunk: 1, stage: "render")
+      }
+    }
+    wait(for: [done], timeout: 5)
+    let deadline = Date().addingTimeInterval(5)
+    while tracker.status(jobId: status.jobId)?.status != .failed, Date() < deadline {
+      RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+    }
+    let s = tracker.status(jobId: status.jobId)
+    XCTAssertEqual(s?.status, .failed)
+    XCTAssertEqual(s?.interrupted, true, "an operator interrupt is not a chunk failure (comfybox#322)")
+    XCTAssertFalse(s?.error?.hasPrefix("chunk ") == true, s?.error ?? "")
+  }
 }
 
 private final class LockedBox<T>: @unchecked Sendable {

@@ -43,8 +43,15 @@ public struct DirectorTimeline: Codable, Sendable, Equatable {
   }
 
   public struct Settings: Codable, Sendable, Equatable {
-    /// Timeline frame rate, 1...120.
-    public var fps: Int
+    /// The builtin frame rate a timeline without `fps` is displayed and
+    /// planned at until the server resolves the real one (request > preset >
+    /// config > builtin, via `prepareLocalVideo`).
+    public static let defaultFps = 24
+
+    /// Timeline frame rate, 1...120. nil (omitted on the wire) => the preset /
+    /// config / builtin fps applies; the submit route resolves it from chunk
+    /// 0's prepared request before compiling the bodies it renders.
+    public var fps: Int?
     /// Output width, multiple of 32.
     public var width: Int
     /// Output height, multiple of 32.
@@ -52,8 +59,9 @@ public struct DirectorTimeline: Codable, Sendable, Equatable {
     /// Timeline length in frames; the validator snaps UP to 1+8k and requires
     /// >= 97 after the snap (the production floor) and <= 16 chunks.
     public var lengthFrames: Int
-    /// Base seed; chunk k renders with `seed + k`.
-    public var seed: UInt64
+    /// Base seed; chunk k renders with `seed + k`. nil (omitted on the wire)
+    /// => the preset / builtin seed applies (resolved at submit from chunk 0).
+    public var seed: UInt64?
     /// Server video preset id, resolved per chunk by prepareLocalVideo.
     public var preset: String?
     /// Empty => the preset's LoRAs apply.
@@ -67,7 +75,7 @@ public struct DirectorTimeline: Codable, Sendable, Equatable {
     public var character: String?
 
     public init(
-      fps: Int = 24, width: Int, height: Int, lengthFrames: Int, seed: UInt64 = 42,
+      fps: Int? = 24, width: Int, height: Int, lengthFrames: Int, seed: UInt64? = 42,
       preset: String? = nil, loras: [LoRARef] = [], negativePrompt: String? = nil,
       steps: Int? = nil, character: String? = nil
     ) {
@@ -85,11 +93,13 @@ public struct DirectorTimeline: Codable, Sendable, Equatable {
 
     public init(from decoder: Decoder) throws {
       let c = try decoder.container(keyedBy: CodingKeys.self)
-      fps = try c.decodeIfPresent(Int.self, forKey: .fps) ?? 24
+      // No decode defaults for fps/seed: an absent value must stay absent so
+      // the preset/config value wins (request > preset > config > builtin).
+      fps = try c.decodeIfPresent(Int.self, forKey: .fps)
       width = try c.decode(Int.self, forKey: .width)
       height = try c.decode(Int.self, forKey: .height)
       lengthFrames = try c.decode(Int.self, forKey: .lengthFrames)
-      seed = try c.decodeIfPresent(UInt64.self, forKey: .seed) ?? 42
+      seed = try c.decodeIfPresent(UInt64.self, forKey: .seed)
       preset = try c.decodeIfPresent(String.self, forKey: .preset)
       loras = try c.decodeIfPresent([LoRARef].self, forKey: .loras) ?? []
       negativePrompt = try c.decodeIfPresent(String.self, forKey: .negativePrompt)
@@ -445,7 +455,9 @@ public struct DirectorPlan: Codable, Sendable, Equatable {
     /// Inclusive; shared with chunk index+1's start.
     public var endFrame: Int
     public var frames: Int
-    public var seed: UInt64
+    /// `settings.seed + index`; nil (omitted) when the timeline names no
+    /// seed and the plan was built before the server resolved one (/validate).
+    public var seed: UInt64?
     /// true for every chunk after the first: frame 0 is the previous chunk's
     /// rendered last frame, not a user image.
     public var carryOver: Bool
@@ -459,7 +471,7 @@ public struct DirectorPlan: Codable, Sendable, Equatable {
     public var audio: String
 
     public init(
-      index: Int, startFrame: Int, endFrame: Int, frames: Int, seed: UInt64, carryOver: Bool,
+      index: Int, startFrame: Int, endFrame: Int, frames: Int, seed: UInt64?, carryOver: Bool,
       keyframes: [ChunkKeyframe] = [], promptSegments: [String] = [],
       beatSchedule: [BeatEntry] = [], audio: String
     ) {
@@ -487,6 +499,8 @@ public struct DirectorPlan: Codable, Sendable, Equatable {
   }
 
   public var lengthFrames: Int
+  /// `settings.fps`, or `Settings.defaultFps` when the timeline names none
+  /// and the plan was built before the server resolved it.
   public var fps: Int
   public var width: Int
   public var height: Int

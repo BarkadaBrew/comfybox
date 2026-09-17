@@ -168,11 +168,11 @@ struct DirectorSidebar: View {
             .padding(14)
         }
         .task {
-            seedText = String(model.timeline.settings.seed)
+            seedText = model.timeline.settings.seed.map(String.init) ?? ""
             presets = await engine.fetchPresets().filter { $0.mediaKind == "video" }
         }
         .onChange(of: model.timeline.settings.seed) { _, seed in
-            if UInt64(seedText) != seed { seedText = String(seed) }
+            if UInt64(seedText) != seed { seedText = seed.map(String.init) ?? "" }
         }
     }
 
@@ -202,9 +202,9 @@ struct DirectorSidebar: View {
     private var advanced: some View {
         VStack(alignment: .leading, spacing: 10) {
             Stepper(value: Binding(
-                get: { model.timeline.settings.fps },
+                get: { model.fps },
                 set: { value in model.updateSettings { $0.fps = value } }), in: 1...120) {
-                Text("FPS \(model.timeline.settings.fps)")
+                Text("FPS \(model.fps)")
             }
             labeled("Steps (blank = preset default)") {
                 TextField("default", text: Binding(
@@ -296,7 +296,13 @@ struct DirectorSidebar: View {
     }
 
     private func commitSeed() {
-        guard let seed = UInt64(seedText.trimmingCharacters(in: .whitespaces)) else { return }
+        let text = seedText.trimmingCharacters(in: .whitespaces)
+        // Blank = no seed: the preset's (or the builtin) seed applies.
+        if text.isEmpty {
+            model.updateSettings(coalesce: "seed") { $0.seed = nil }
+            return
+        }
+        guard let seed = UInt64(text) else { return }
         model.updateSettings(coalesce: "seed") { $0.seed = seed }
     }
 

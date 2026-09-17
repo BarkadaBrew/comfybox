@@ -51,7 +51,9 @@ public enum DirectorValidator {
   ) -> DirectorValidation {
     var issues: [DirectorIssue] = []
     var snapped = timeline
-    let fps = timeline.settings.fps
+    // nil fps => preset/config/builtin, resolved by the server; the builtin
+    // stands in for the frame<->seconds arithmetic below.
+    let fps = timeline.settings.fps ?? DirectorTimeline.Settings.defaultFps
 
     // MARK: Structure
 
@@ -206,6 +208,17 @@ public enum DirectorValidator {
     case .imported:
       var kept: [DirectorTimeline.AudioClip] = []
       for var clip in timeline.audioClips {
+        // The mixer places a clip at its start frame and takes length_frames
+        // after trim_start_frames: a negative start/trim or an empty clip
+        // would be silently misplaced or dropped (DirectorImport defaults a
+        // missing upstream length to 0), so they are errors, not guesses.
+        if clip.startFrame < 0 || clip.lengthFrames < 1 || clip.trimStartFrames < 0 {
+          issues.append(.error(
+            "audio_clip_out_of_range",
+            "audio clip \(clip.id) needs start_frame >= 0, length_frames >= 1 and trim_start_frames >= 0 (got start \(clip.startFrame), length \(clip.lengthFrames), trim \(clip.trimStartFrames))",
+            ids: [clip.id]))
+          continue
+        }
         if clip.gain < 0 {
           issues.append(.error("invalid_gain", "audio clip \(clip.id) gain must be >= 0 (got \(clip.gain))", ids: [clip.id]))
         }

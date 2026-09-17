@@ -31,18 +31,20 @@ public enum DirectorDocument {
     }
   }
 
-  /// Encode for disk. With `embedAssets` false every `image_base64` is
-  /// stripped; with it true each keyframe whose `image_path` is readable gets
-  /// the file's bytes embedded (an unreadable image is written without a
-  /// payload rather than failing the save).
+  /// Encode for disk. A keyframe whose `image_path` is readable here gets the
+  /// file's bytes embedded when `embedAssets` is true and no payload when it
+  /// is false. A keyframe whose path is NOT readable here (a portable file
+  /// opened on another machine) keeps whatever `image_base64` it already
+  /// carries — that payload is the only copy of the image, so re-saving must
+  /// never drop it; with no payload it is written path-only rather than
+  /// failing the save.
   public static func data(_ timeline: DirectorTimeline, embedAssets: Bool = false) throws -> Data {
     var doc = timeline
     for i in doc.keyframes.indices {
-      doc.keyframes[i].imageBase64 = nil
-      guard embedAssets, let path = doc.keyframes[i].imagePath, !path.isEmpty else { continue }
-      if let bytes = try? Data(contentsOf: URL(fileURLWithPath: path)), !bytes.isEmpty {
-        doc.keyframes[i].imageBase64 = bytes.base64EncodedString()
-      }
+      let path = doc.keyframes[i].imagePath ?? ""
+      let bytes = path.isEmpty ? nil : (try? Data(contentsOf: URL(fileURLWithPath: path)))
+      guard let bytes, !bytes.isEmpty else { continue }  // unreadable: keep the payload
+      doc.keyframes[i].imageBase64 = embedAssets ? bytes.base64EncodedString() : nil
     }
     return try DirectorJSON.encoder().encode(doc)
   }

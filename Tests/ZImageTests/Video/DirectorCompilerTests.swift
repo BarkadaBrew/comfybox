@@ -217,6 +217,67 @@ final class DirectorCompilerTests: XCTestCase {
     XCTAssertNil(wire1[0].strength)
   }
 
+  func testSegmentStartingOnBoundaryDoesNotLeakIntoPreviousChunk() throws {
+    let global = "a woman walks through a market"
+    let t = timeline(length: 577, prompt: global, segments: [
+      .init(id: "p1", startFrame: 0, lengthFrames: 288, prompt: "she inspects the fruit"),
+      .init(id: "p2", startFrame: 288, lengthFrames: 200, prompt: "she turns toward the camera"),
+    ])
+    let c = try compile(t)
+    let b0 = c.chunks[0].body, b1 = c.chunks[1].body
+    XCTAssertEqual(c.plan.chunks[0].promptSegments, ["p1"])
+    XCTAssertEqual(c.plan.chunks[0].beatSchedule.map(\.text), ["she inspects the fruit"])
+    XCTAssertEqual(b0["prompt"] as? String, global + "\nshe inspects the fruit")
+    XCTAssertEqual((b0["beat_schedule"] as? [[String: Any]])?.count, 1)
+    // p1 ends at 288 = start_1 exactly: it covers chunk 0 only, and p1's
+    // [0, 288) does not reach chunk 1 at all.
+    XCTAssertEqual(c.plan.chunks[1].promptSegments, ["p2"])
+    XCTAssertEqual(b1["prompt"] as? String, global + "\nshe turns toward the camera")
+
+    // Mirror: a segment ending at start_1 + 1 puts no sliver into chunk 1.
+    let mirror = try compile(timeline(length: 577, segments: [
+      .init(id: "p1", startFrame: 96, lengthFrames: 193, prompt: "she inspects the fruit"),
+    ]))
+    XCTAssertEqual(mirror.plan.chunks[0].promptSegments, ["p1"])
+    XCTAssertEqual(mirror.plan.chunks[1].promptSegments, [])
+    XCTAssertNil(mirror.chunks[1].body["beat_schedule"])
+
+    // The timeline's LAST frame is nobody's boundary: a segment there stays.
+    let tail = DirectorMath.beatFractions(
+      segmentStart: 576, segmentLength: 1, chunk: DirectorMath.chunkLayout(lengthFrames: 577)[1],
+      sharesEndFrame: false)
+    XCTAssertNotNil(tail)
+  }
+
+  func testPresetOnlyTimelineSendsNoSeedOrFps() throws {
+    var t = timeline(length: 577, preset: "kira-video")
+    t.settings.seed = nil
+    t.settings.fps = nil
+    let c = try compile(t)
+    for chunk in c.chunks {
+      XCTAssertNil(chunk.body["seed"], "chunk \(chunk.index): the preset seed must apply")
+      XCTAssertNil(chunk.body["fps"], "chunk \(chunk.index): the preset/config fps must apply")
+      XCTAssertEqual(chunk.body["preset"] as? String, "kira-video")
+    }
+    XCTAssertEqual(c.plan.chunks.map(\.seed), [nil, nil])
+    XCTAssertEqual(c.plan.fps, DirectorTimeline.Settings.defaultFps)
+
+    // Once the server resolved chunk 0 (preset seed 9000, preset fps 30),
+    // the recompiled bodies carry seed + k and that fps everywhere.
+    let resolved = DirectorCompiler.resolvingDefaults(
+      DirectorValidator.validate(t, fileExists: { _ in true }).snapped, fps: 30, seed: 9000)
+    let rc = try compile(resolved)
+    XCTAssertEqual(rc.chunks.map { ($0.body["seed"] as? NSNumber)?.uint64Value }, [9000, 9001])
+    XCTAssertEqual(rc.chunks.map { $0.body["fps"] as? Int }, [30, 30])
+    XCTAssertEqual(rc.plan.chunks.map(\.seed), [9000, 9001])
+    XCTAssertEqual(rc.plan.fps, 30)
+
+    // Explicit timeline values are never overridden by the resolved ones.
+    let explicit = DirectorCompiler.resolvingDefaults(timeline(fps: 25, seed: 7), fps: 30, seed: 9000)
+    XCTAssertEqual(explicit.settings.fps, 25)
+    XCTAssertEqual(explicit.settings.seed, 7)
+  }
+
   func testNoSegmentsOmitsBeatScheduleAndUsesGlobalPromptOnly() throws {
     let c = try compile(timeline(length: 577, prompt: "  a still lake at dawn"))
     for chunk in c.chunks {

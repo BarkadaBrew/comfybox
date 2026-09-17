@@ -157,12 +157,24 @@ public enum DirectorMath {
   /// lo = max(start, start_k), hi = min(start + len, end_k + 1); nil when the
   /// segment does not overlap the chunk. A segment spanning a boundary
   /// appears in both chunks (ending at 1.0 in k, starting at 0.0 in k+1).
+  ///
+  /// The shared boundary frame alone is NOT an overlap: a segment starting
+  /// on start_{k+1} (the grid-snapped normal case) would otherwise leak into
+  /// chunk k as a zero-width beat whose text biases chunk k's last frame —
+  /// the carry-over chunk k+1 is conditioned on. Likewise a segment ending at
+  /// start_k + 1 does not put a (0, 1/f) sliver into chunk k > 0.
+  /// `sharesEndFrame` is false for the timeline's last chunk (its end frame
+  /// belongs to no one else).
   public static func beatFractions(
-    segmentStart: Int, segmentLength: Int, chunk: ChunkSpan
+    segmentStart: Int, segmentLength: Int, chunk: ChunkSpan, sharesEndFrame: Bool = true
   ) -> (startFrac: Float, endFrac: Float)? {
     let lo = max(segmentStart, chunk.startFrame)
     let hi = min(segmentStart + segmentLength, chunk.endFrame + 1)
     guard hi > lo, chunk.frames > 0 else { return nil }
+    if hi - lo == 1 {
+      if sharesEndFrame && lo == chunk.endFrame { return nil }
+      if chunk.index > 0 && lo == chunk.startFrame { return nil }
+    }
     let frames = Float(chunk.frames)
     return (Float(lo - chunk.startFrame) / frames, Float(hi - chunk.startFrame) / frames)
   }

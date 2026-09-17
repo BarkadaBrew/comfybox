@@ -334,4 +334,26 @@ final class DirectorValidatorTests: XCTestCase {
     ])
     XCTAssertEqual(validate(t), validate(t))
   }
+
+  func testImportedClipOutOfRangeIsError() {
+    let negative = DirectorTimeline.AudioClip(id: "a1", audioPath: "/a.wav", startFrame: -48, lengthFrames: 120)
+    let empty = DirectorTimeline.AudioClip(id: "a2", audioPath: "/a.wav", startFrame: 0, lengthFrames: 0)
+    let badTrim = DirectorTimeline.AudioClip(id: "a3", audioPath: "/a.wav", startFrame: 0, lengthFrames: 24, trimStartFrames: -1)
+    let fine = DirectorTimeline.AudioClip(id: "a4", audioPath: "/a.wav", startFrame: 0, lengthFrames: 24)
+    let v = validate(timeline(clips: [negative, empty, badTrim, fine], mode: .imported))
+    XCTAssertFalse(v.ok)
+    let ids = v.issues.filter { $0.code == "audio_clip_out_of_range" && $0.severity == .error }.flatMap(\.ids)
+    XCTAssertEqual(ids, ["a1", "a2", "a3"])
+    XCTAssertTrue(validate(timeline(clips: [fine], mode: .imported)).ok)
+  }
+
+  func testMissingFpsValidatesAgainstBuiltin() {
+    var t = timeline()
+    t.settings.fps = nil
+    t.settings.seed = nil
+    let v = validate(t)
+    XCTAssertTrue(v.ok, "\(v.issues)")
+    XCTAssertEqual(v.plan?.fps, DirectorTimeline.Settings.defaultFps)
+    XCTAssertNil(v.plan?.chunks.first?.seed, "no seed is invented before the server resolves one")
+  }
 }

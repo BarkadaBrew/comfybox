@@ -37,8 +37,8 @@ final class DirectorRouteTests: XCTestCase {
     let p = try payload(minimalTimelineJSON, extra: #","output_path":"final.mp4","source":"desktop""#)
     XCTAssertEqual(p.outputPath, "final.mp4")
     XCTAssertEqual(p.source, "desktop")
-    XCTAssertEqual(p.timeline.settings.fps, 24)
-    XCTAssertEqual(p.timeline.settings.seed, 42)
+    XCTAssertNil(p.timeline.settings.fps, "absent fps stays nil (preset/config applies)")
+    XCTAssertNil(p.timeline.settings.seed, "absent seed stays nil (preset applies)")
     XCTAssertEqual(p.timeline.settings.lengthFrames, 289)
     XCTAssertEqual(p.timeline.keyframes.first?.strength, 1.0)
     XCTAssertEqual(p.timeline.audio.mode, .generated)
@@ -292,5 +292,77 @@ final class DirectorRouteTests: XCTestCase {
     XCTAssertNil(legacyObj["plan"])
     XCTAssertNil(legacyObj["stage_index"])
     XCTAssertNil(legacyObj["stage_count"])
+  }
+
+  // MARK: - Review fixes
+
+  func testChunkErrorKeepsInterruptsAndDirectorErrors() {
+    let named = WarmServer.directorChunkError(WarmServerError.renderInterrupted, chunk: 1, stage: "render")
+    XCTAssertTrue(isRenderInterruption(named), "renderInterrupted must not be laundered into chunkFailed")
+    XCTAssertTrue(isRenderInterruption(WarmServer.directorChunkError(CancellationError(), chunk: 0, stage: "lastframe")))
+    let passthrough = WarmServer.directorChunkError(
+      DirectorError.chunkFailed(chunk: 2, stage: "fps", message: "x"), chunk: 0, stage: "render")
+    XCTAssertEqual(passthrough as? DirectorError, .chunkFailed(chunk: 2, stage: "fps", message: "x"))
+    struct Boom: Error, LocalizedError { var errorDescription: String? { "boom" } }
+    XCTAssertEqual(
+      WarmServer.directorChunkError(Boom(), chunk: 3, stage: "audio") as? DirectorError,
+      .chunkFailed(chunk: 3, stage: "audio", message: "boom"))
+  }
+
+  func testChunkDimsError() {
+    XCTAssertNil(WarmServer.directorChunkDimsError(width: 576, height: 896, expectedWidth: 576, expectedHeight: 896))
+    XCTAssertNil(WarmServer.directorChunkDimsError(width: 576, height: 896, expectedWidth: 0, expectedHeight: 0))
+    let why = WarmServer.directorChunkDimsError(width: 512, height: 896, expectedWidth: 576, expectedHeight: 896)
+    XCTAssertTrue(why?.hasPrefix("chunk_dims_mismatch") == true, why ?? "nil")
+  }
+
+  func testGeneratedAudioSkipsEveryIngestFailurePerChunk() throws {
+    let layout = DirectorMath.chunkLayout(lengthFrames: 865)  // 3 chunks
+    XCTAssertEqual(layout.count, 3)
+    let chunks = layout.map { (span: $0, outputPath: "/c\($0.index).mp4", audioError: nil as String?) }
+    let pcm = StereoPCM(left: [0.1, 0.1], right: [0.1, 0.1], sampleRate: 48000)
+    let result = try WarmServer.directorGeneratedAudioPlacement(chunks: chunks, fps: 24) { path in
+      switch path {
+      case "/c0.mp4": return pcm
+      case "/c1.mp4": throw DirectorAudioIngestError.readerFailed(path, "corrupt")
+      default: throw DirectorAudioIngestError.fileMissing(path)
+      }
+    }
+    XCTAssertEqual(result.skipped, [1, 2])
+    XCTAssertEqual(result.placed.count, 1)
+    XCTAssertEqual(result.placed.first?.startFrame, 0)
+
+    // A render-reported audio error is skipped without decoding.
+    var withError = chunks
+    withError[0].audioError = "vocoder failed"
+    let skippedFirst = try WarmServer.directorGeneratedAudioPlacement(chunks: withError, fps: 24) { _ in pcm }
+    XCTAssertEqual(skippedFirst.skipped, [0])
+    XCTAssertEqual(skippedFirst.placed.count, 2)
+
+    // An interrupt still propagates.
+    XCTAssertThrowsError(try WarmServer.directorGeneratedAudioPlacement(chunks: chunks, fps: 24) { _ in
+      throw CancellationError()
+    })
+  }
+
+  func testPlaceholderPNGHasRequestedPixelSize() throws {
+    let path = FileManager.default.temporaryDirectory
+      .appendingPathComponent("director-test-\(UUID().uuidString)-dryrun.png").path
+    defer { try? FileManager.default.removeItem(atPath: path) }
+    try WarmServer.directorWritePlaceholderPNG(width: 576, height: 896, path: path)
+    let size = try XCTUnwrap(WarmServer.imagePixelSize(atPath: path))
+    XCTAssertEqual(size.width, 576)
+    XCTAssertEqual(size.height, 896)
+  }
+
+  func testAggregateRecordCarriesSkippedChunks() throws {
+    let record = VideoGenerationRecord(
+      prompt: "p", model: "ltx2-director", width: 576, height: 896, frames: 577, fps: 24,
+      resolvedWidth: 576, resolvedHeight: 896, twoPass: false, refine: false, audio: true,
+      kind: "director", audioSource: "generated", chunkCount: 2, stitchPath: "reencode",
+      audioSkippedChunks: [1])
+    let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: record.encodeJSON()) as? [String: Any])
+    XCTAssertEqual(obj["audio_skipped_chunks"] as? [Int], [1])
+    XCTAssertEqual(try VideoGenerationRecord.decodeJSON(record.encodeJSON()).audioSkippedChunks, [1])
   }
 }

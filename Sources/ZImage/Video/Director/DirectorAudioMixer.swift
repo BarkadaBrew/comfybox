@@ -68,7 +68,17 @@ public enum DirectorAudioMixer {
     var right = [Float](repeating: 0, count: n)
     guard n > 0 else { return StereoPCM(left: left, right: right, sampleRate: sampleRate) }
 
-    for clip in clips {
+    for original in clips {
+      // Normalise a clip that starts before the timeline (the validator
+      // rejects it; API callers of the mixer are not all validated): the
+      // frames before 0 are trimmed off the head and the slot shrinks, so the
+      // audible part stays where the timeline says it is.
+      var clip = original
+      if clip.startFrame < 0 {
+        clip.trimStartFrames = max(0, clip.trimStartFrames) - clip.startFrame
+        clip.lengthFrames += clip.startFrame
+        clip.startFrame = 0
+      }
       guard clip.lengthFrames > 0, clip.gain != 0 else { continue }
       let start = sampleOffset(frame: clip.startFrame, fps: fps, sampleRate: sampleRate)
       guard start < n else { continue }

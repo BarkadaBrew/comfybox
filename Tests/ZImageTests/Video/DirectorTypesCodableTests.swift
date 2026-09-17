@@ -24,8 +24,10 @@ final class DirectorTypesCodableTests: XCTestCase {
 
   private func assertDefaults(_ t: DirectorTimeline, file: StaticString = #filePath, line: UInt = #line) {
     XCTAssertEqual(t.version, 1, file: file, line: line)
-    XCTAssertEqual(t.settings.fps, 24, file: file, line: line)
-    XCTAssertEqual(t.settings.seed, 42, file: file, line: line)
+    // No decode defaults: an absent fps/seed stays nil so the preset/config
+    // value applies at render (request > preset > config > builtin).
+    XCTAssertNil(t.settings.fps, file: file, line: line)
+    XCTAssertNil(t.settings.seed, file: file, line: line)
     XCTAssertEqual(t.settings.width, 576, file: file, line: line)
     XCTAssertEqual(t.settings.height, 896, file: file, line: line)
     XCTAssertEqual(t.settings.lengthFrames, 289, file: file, line: line)

@@ -48,9 +48,28 @@ struct DirectorRequestBodyTests {
         }
     }
 
-    @Test("no image_base64 is ever sent from the desktop")
+    @Test("image_base64 is stripped where the image path exists locally")
     func noImageBase64InBody() throws {
-        let text = String(decoding: try EngineService.directorRequestBody(timeline: timeline(), outputPath: "/o.mp4"), as: UTF8.self)
+        let text = String(decoding: try EngineService.directorRequestBody(
+            timeline: timeline(), outputPath: "/o.mp4", fileExists: { _ in true }), as: UTF8.self)
         #expect(!text.contains("image_base64"))
+        let validate = String(decoding: try EngineService.directorValidateBody(
+            timeline: timeline(), fileExists: { _ in true }), as: UTF8.self)
+        #expect(!validate.contains("image_base64"))
+    }
+
+    @Test("a portable keyframe (missing path + embedded image) keeps image_base64 on submit and validate")
+    func portableKeyframeKeepsBase64() throws {
+        let exists: (String) -> Bool = { $0 == "/tmp/a.png" }  // b.png only exists as base64
+        struct Envelope: Decodable { let timeline: DirectorTimeline }
+        for data in [
+            try EngineService.directorRequestBody(timeline: timeline(), outputPath: "/o.mp4", fileExists: exists),
+            try EngineService.directorValidateBody(timeline: timeline(), fileExists: exists),
+        ] {
+            let decoded = try DirectorJSON.decoder().decode(Envelope.self, from: data)
+            #expect(decoded.timeline.keyframes.first { $0.id == "k1" }?.imageBase64 == nil)
+            #expect(decoded.timeline.keyframes.first { $0.id == "k2" }?.imageBase64 == "AAAA")
+            #expect(decoded.timeline.keyframes.first { $0.id == "k2" }?.imagePath == "/tmp/b.png")
+        }
     }
 }

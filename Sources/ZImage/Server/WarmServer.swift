@@ -3055,6 +3055,13 @@ public final class WarmServer {
         guard initImagePath == nil else {
           throw LTX2VideoError.invalidKeyframe("more than one keyframe at frame 0 (only one init image)")
         }
+        // Same (0, 1] rule `LTX2VideoGenerator.validate` applies to the
+        // frame > 0 extras — the frame-0 entry bypasses that check because it
+        // becomes `initStrength`, so it is range-checked here.
+        if let strength = kf.strength, !(strength > 0 && strength <= 1) {
+          throw LTX2VideoError.invalidKeyframe(
+            "keyframe strength \(strength) at frame 0 must be in (0, 1]")
+        }
         initImagePath = kf.imagePath
         initStrength = kf.strength ?? 1.0
       } else {
@@ -6263,6 +6270,82 @@ public final class WarmServer {
       expectedFrames: expectedFrames, expectedFps: expectedFps)
   }
 
+  /// comfybox#322 for director stages: what a caught error becomes. A
+  /// `DirectorError` passes through; an operator interrupt in EITHER spelling
+  /// (`CancellationError`, nested or bare, and the video queue's named
+  /// `WarmServerError.renderInterrupted`) is rethrown unchanged so
+  /// `VideoJobTracker.markFailed` classifies it as `interrupted`; anything
+  /// else is a `chunkFailed(k, stage, …)`. Pure.
+  static func directorChunkError(_ error: Error, chunk k: Int, stage: String) -> Error {
+    if error is DirectorError { return error }
+    if isRenderInterruption(error) { return error }
+    return DirectorError.chunkFailed(chunk: k, stage: stage, message: error.localizedDescription)
+  }
+
+  /// `chunk_dims_mismatch` when a chunk's dims differ from chunk 0's (the
+  /// stitch concatenates at one size and must not rescale). A non-positive
+  /// expected size (unknown) passes. nil = dims agree.
+  static func directorChunkDimsError(
+    width: Int, height: Int, expectedWidth: Int, expectedHeight: Int
+  ) -> String? {
+    guard expectedWidth > 0, expectedHeight > 0 else { return nil }
+    guard width != expectedWidth || height != expectedHeight else { return nil }
+    return "chunk_dims_mismatch: the chunk resolves to \(width)x\(height), chunk 1 is \(expectedWidth)x\(expectedHeight) "
+      + "(the continuation chunks fit the carry-over frame's aspect); pick dimensions that are multiples of 64"
+  }
+
+  /// Generated-mode audio placement over the rendered chunks. A chunk whose
+  /// render reported `audioError`, or whose mp4 fails to decode with ANY
+  /// `DirectorAudioIngestError` (no track, reader failure, file missing),
+  /// contributes silence and is listed in `skipped` — the documented policy,
+  /// so one chunk's soundtrack never discards every rendered chunk. Any
+  /// other error (an interrupt) propagates. `decode` is injectable for tests.
+  static func directorGeneratedAudioPlacement(
+    chunks: [(span: DirectorMath.ChunkSpan, outputPath: String, audioError: String?)],
+    fps: Int,
+    decode: (String) throws -> StereoPCM
+  ) throws -> (placed: [PlacedAudio], skipped: [Int], skippedReasons: [(chunk: Int, reason: String)]) {
+    var placed: [PlacedAudio] = []
+    var reasons: [(chunk: Int, reason: String)] = []
+    for chunk in chunks {
+      if let audioError = chunk.audioError {
+        reasons.append((chunk.span.index, audioError))
+        continue
+      }
+      do {
+        let decoded = try decode(chunk.outputPath)
+        placed += DirectorAudioMixer.chunkPlacement(chunkPCM: [decoded], spans: [chunk.span], fps: fps)
+      } catch let error as DirectorAudioIngestError {
+        reasons.append((chunk.span.index, error.description))
+      }
+    }
+    return (placed, reasons.map(\.chunk), reasons)
+  }
+
+  /// A mid-grey PNG of `width`x`height` at `path` — the dry run's stand-in
+  /// for a continuation chunk's carry-over frame (only its pixel size is read
+  /// during preparation).
+  static func directorWritePlaceholderPNG(width: Int, height: Int, path: String) throws {
+    let w = max(1, width), h = max(1, height)
+    var pixels = [UInt8](repeating: 128, count: w * h)
+    let space = CGColorSpaceCreateDeviceGray()
+    let image: CGImage? = pixels.withUnsafeMutableBytes { raw in
+      CGContext(
+        data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w,
+        space: space, bitmapInfo: CGImageAlphaInfo.none.rawValue)?.makeImage()
+    }
+    guard let image,
+          let dest = CGImageDestinationCreateWithURL(
+            URL(fileURLWithPath: path) as CFURL, "public.png" as CFString, 1, nil)
+    else {
+      throw WarmServerError.invalidRequest(message: "director dry run: could not create placeholder frame at \(path)")
+    }
+    CGImageDestinationAddImage(dest, image, nil)
+    guard CGImageDestinationFinalize(dest) else {
+      throw WarmServerError.invalidRequest(message: "director dry run: could not write placeholder frame at \(path)")
+    }
+  }
+
   /// Write every `image_base64` keyframe to
   /// `<directory>/director-<session>-asset-<id>.png`, rewrite its
   /// `image_path` and drop the payload, so the compiler (which never guesses
@@ -6357,25 +6440,69 @@ public final class WarmServer {
 
       var snapped = validation.snapped
       materialized = try Self.directorMaterializeAssets(&snapped, session: session, directory: dir)
-      let timeline = snapped
-      let compilation = try DirectorCompiler.compile(
-        DirectorValidation(snapped: timeline, issues: validation.issues, ok: true, plan: validation.plan),
+      let preliminary = try DirectorCompiler.compile(
+        DirectorValidation(snapped: snapped, issues: validation.issues, ok: true, plan: validation.plan),
         session: session, source: source)
+      guard let chunkZeroBody = preliminary.chunks.first?.body else {
+        discardAssets()
+        return .error(.error(status: 400, message: "timeline compiled to no chunks"))
+      }
 
-      // DRY RUN: every chunk body (carry-over omitted for k > 0 — that
-      // keyframe only exists once chunk k-1 has rendered) through the same
-      // preparation the render will use, so preset-induced multi-chunk,
-      // temporal upscale, keyframe conflicts and dimension errors are 400s
-      // now, not failures after a long render.
+      // Resolve fps/seed the way a render does (request > preset > config >
+      // builtin): prepare chunk 0 as compiled — a timeline that names no
+      // fps/seed sends none — and pin the prepared values into the timeline,
+      // then recompile so every chunk body, the plan and the sidecar agree
+      // with what renders (chunk k seeds resolvedSeed + k).
+      guard let probe = try await prepareLocalVideo(body: try JSONSerialization.data(withJSONObject: chunkZeroBody)) else {
+        discardAssets()
+        return .error(.error(status: 503, message: "Director rendering needs local LTX-2 (--ltx2-weights/--ltx2-gemma)"))
+      }
+      let timeline = DirectorCompiler.resolvingDefaults(snapped, fps: probe.request.fps, seed: probe.request.seed)
+      let compilation = try DirectorCompiler.compile(
+        DirectorValidation(
+          snapped: timeline, issues: validation.issues, ok: true,
+          plan: DirectorCompiler.plan(for: timeline, warnings: validation.issues.filter { $0.severity == .warning })),
+        session: session, source: source)
+      let fps = timeline.settings.fps ?? probe.request.fps
+
+      // DRY RUN: every chunk body through the same preparation the render
+      // will use, so preset-induced multi-chunk, temporal upscale, keyframe
+      // conflicts and dimension errors are 400s now, not failures after a
+      // long render. Chunks k > 0 carry a placeholder frame-0 keyframe (a
+      // PNG shaped like chunk 0's render) where the render carries chunk
+      // k-1's extracted last frame, so the dry run resolves the SAME i2v /
+      // multi-keyframe mode and dims the render will, and every chunk must
+      // resolve to chunk 0's dims (the stitch never rescales).
       var chunkZero: PreparedLocalVideo? = nil
+      var placeholder: String? = nil
+      defer {
+        if let placeholder { try? FileManager.default.removeItem(atPath: placeholder) }
+      }
       for chunk in compilation.chunks {
-        let bodyData = try JSONSerialization.data(withJSONObject: chunk.body)
+        let body: [String: Any]
+        if chunk.carryOverFromChunk != nil, let first = chunkZero {
+          if placeholder == nil {
+            let path = (dir as NSString).appendingPathComponent("director-\(session)-dryrun.png")
+            try Self.directorWritePlaceholderPNG(
+              width: first.request.width, height: first.request.height, path: path)
+            placeholder = path
+          }
+          body = chunk.bodyWithCarryOver(imagePath: placeholder!)
+        } else {
+          body = chunk.body
+        }
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
         guard let prep = try await prepareLocalVideo(body: bodyData) else {
           discardAssets()
           return .error(.error(status: 503, message: "Director rendering needs local LTX-2 (--ltx2-weights/--ltx2-gemma)"))
         }
-        if let why = Self.directorDryRunError(
-          prep: prep, expectedFrames: chunk.span.frames, expectedFps: timeline.settings.fps) {
+        var why = Self.directorDryRunError(prep: prep, expectedFrames: chunk.span.frames, expectedFps: fps)
+        if why == nil, let first = chunkZero {
+          why = Self.directorChunkDimsError(
+            width: prep.request.width, height: prep.request.height,
+            expectedWidth: first.request.width, expectedHeight: first.request.height)
+        }
+        if let why {
           discardAssets()
           return .error(.error(status: 400, message: "chunk \(chunk.index + 1)/\(compilation.chunks.count): \(why)"))
         }
@@ -6389,7 +6516,7 @@ public final class WarmServer {
       let n = compilation.chunks.count
       let planJSON = String(decoding: try DirectorJSON.encoder(pretty: false).encode(compilation.plan), as: UTF8.self)
       let assets = materialized
-      logger.info("Director[\(session)]: accepted \(n) chunk(s), \(timeline.settings.lengthFrames)f @ \(timeline.settings.fps) fps, audio \(timeline.audio.mode.rawValue) -> \(resolvedOutput)")
+      logger.info("Director[\(session)]: accepted \(n) chunk(s), \(timeline.settings.lengthFrames)f @ \(fps) fps, audio \(timeline.audio.mode.rawValue) -> \(resolvedOutput)")
       let status = videoJobTracker.submitOrchestrated(
         source: source, mode: .director,
         resolvedConfig: first.request.resolvedConfigSnapshot?.params,
@@ -6402,7 +6529,8 @@ public final class WarmServer {
         }
         return try await self.runDirector(
           compilation: compilation, timeline: timeline, session: session, source: source,
-          resolvedOutput: resolvedOutput, materializedAssets: assets, jobId: jobId, report: report)
+          resolvedOutput: resolvedOutput, materializedAssets: assets,
+          admittedRecipeHash: first.recipeHash, jobId: jobId, report: report)
       }
       let encoder = JSONEncoder()
       encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -6453,12 +6581,17 @@ public final class WarmServer {
     source: String,
     resolvedOutput: String,
     materializedAssets: [String],
+    admittedRecipeHash: String,
     jobId: String,
     report: @escaping @Sendable (Int) -> Void
   ) async throws -> LTX2VideoResult {
     let started = Date()
     let dir = configuration.allowedOutputDirectory
     let settings = timeline.settings
+    // The submit route pinned fps/seed into the timeline (resolvingDefaults);
+    // the fallbacks only cover a caller that did not.
+    let fps = settings.fps ?? DirectorTimeline.Settings.defaultFps
+    let seed = settings.seed ?? 42
     let n = compilation.chunks.count
     let chunkWeight = 96.0 / Double(max(n, 1))
     defer {
@@ -6495,6 +6628,17 @@ public final class WarmServer {
         guard let prep = try await prepareLocalVideo(body: bodyData) else {
           throw chunkFailed(k, "render", "local LTX-2 not configured")
         }
+        // Re-apply the submit-time gate: this chunk may be prepared hours
+        // after the 202, and presets.json / config.json can change in
+        // between (temporal upscale, a preset extend, a frame floor). Refuse
+        // BEFORE spending a GPU render on a chunk that cannot stitch.
+        if let why = Self.directorDryRunError(prep: prep, expectedFrames: chunk.span.frames, expectedFps: fps) {
+          throw chunkFailed(k, "render", why)
+        }
+        if k == 0, prep.recipeHash != admittedRecipeHash {
+          throw chunkFailed(k, "render",
+            "recipe_drift: chunk 1 now resolves to recipe \(prep.recipeHash), the job was admitted as \(admittedRecipeHash) (a preset or config changed); resubmit")
+        }
         let base = Double(k) * chunkWeight
         // #1479: like storyboard shots, director chunks stay on the legacy,
         // non-preemptible `generate` entry — a multi-chunk orchestration
@@ -6513,24 +6657,28 @@ public final class WarmServer {
             report(Int(base + Double(pct) * chunkWeight / 100.0))
           })
         }
-      } catch let error as DirectorError {
-        throw error
       } catch {
         // comfybox#322: never launder an interrupt into a chunk failure —
         // `chunkFailed` keeps only a message string, and the trackers
-        // classify on the `CancellationError` itself.
-        if ltx2IsCancellation(error) { throw error }
-        throw chunkFailed(k, "render", error.localizedDescription)
+        // classify on the interrupt itself (both spellings).
+        throw Self.directorChunkError(error, chunk: k, stage: "render")
       }
 
-      // The stitch assumes every chunk is at settings.fps (the dry run
+      // The stitch assumes every chunk is at the timeline fps (the dry run
       // refused temporal upscale; this is the belt to that suspender).
-      let outputFps = result.generationRecord?.outputFps ?? result.generationRecord?.fps ?? settings.fps
-      guard outputFps == settings.fps else {
-        throw chunkFailed(k, "fps", "chunk rendered at \(outputFps) fps, the timeline is \(settings.fps) fps")
+      let outputFps = result.generationRecord?.outputFps ?? result.generationRecord?.fps ?? fps
+      guard outputFps == fps else {
+        throw chunkFailed(k, "fps", "chunk rendered at \(outputFps) fps, the timeline is \(fps) fps")
       }
       guard result.frameCount == chunk.span.frames else {
         throw chunkFailed(k, "render", "chunk wrote \(result.frameCount) frames, the plan expected \(chunk.span.frames)")
+      }
+      // Every chunk must match chunk 0's encoded dims: the stitcher would
+      // otherwise silently rescale (and distort) a mismatched chunk.
+      if let first = chunkResults.first, let why = Self.directorChunkDimsError(
+        width: result.outputWidth, height: result.outputHeight,
+        expectedWidth: first.outputWidth, expectedHeight: first.outputHeight) {
+        throw chunkFailed(k, "render", why)
       }
       chunkPaths.append(result.outputPath)
       chunkResults.append(result)
@@ -6541,8 +6689,7 @@ public final class WarmServer {
         do {
           previousLastFrame = try LastFrameExtractor.extractLastFrame(from: result.outputPath, to: framePath)
         } catch {
-          if ltx2IsCancellation(error) { throw error }
-          throw chunkFailed(k, "lastframe", error.localizedDescription)
+          throw Self.directorChunkError(error, chunk: k, stage: "lastframe")
         }
       }
     }
@@ -6553,6 +6700,7 @@ public final class WarmServer {
     videoJobTracker.setStage(jobId, index: n, count: n)
     var pcm: StereoPCM? = nil
     let audioSource: String
+    var audioSkippedChunks: [Int] = []
     do {
       switch timeline.audio.mode {
       case .imported:
@@ -6566,29 +6714,31 @@ public final class WarmServer {
             pcm: decoded, startFrame: clip.startFrame, lengthFrames: clip.lengthFrames,
             trimStartFrames: clip.trimStartFrames, gain: clip.gain))
         }
-        pcm = DirectorAudioMixer.mix(placed, fps: settings.fps, lengthFrames: settings.lengthFrames)
+        pcm = DirectorAudioMixer.mix(placed, fps: fps, lengthFrames: settings.lengthFrames)
         audioSource = "imported"
       case .generated:
         // Each chunk generated its own audio from noise; place chunk k's
         // track at its span (the boundary frame's 1/fps is dropped for
         // k > 0, matching the stitcher's dropped frame). Seams are expected
         // (validator warning `generated_audio_seams`). A chunk whose audio
-        // failed or has no track contributes silence.
-        var placed: [PlacedAudio] = []
-        for (chunk, result) in zip(compilation.chunks, chunkResults) {
-          if result.audioError != nil { continue }
-          do {
-            let decoded = try DirectorAudioIngest.decode(path: result.outputPath)
-            placed += DirectorAudioMixer.chunkPlacement(chunkPCM: [decoded], spans: [chunk.span], fps: settings.fps)
-          } catch DirectorAudioIngestError.noAudioTrack(_) {
-            continue
-          }
+        // failed, has no track or cannot be decoded contributes silence
+        // (recorded as `audio_skipped_chunks`) — never a whole-job failure
+        // after every chunk has rendered.
+        let generated = try Self.directorGeneratedAudioPlacement(
+          chunks: zip(compilation.chunks, chunkResults).map {
+            (span: $0.0.span, outputPath: $0.1.outputPath, audioError: $0.1.audioError)
+          },
+          fps: fps,
+          decode: { try DirectorAudioIngest.decode(path: $0) })
+        audioSkippedChunks = generated.skipped
+        for skipped in generated.skippedReasons {
+          logger.warning("Director[\(session)] chunk \(skipped.chunk + 1)/\(n): generated audio skipped (silence): \(skipped.reason)")
         }
-        if placed.isEmpty {
+        if generated.placed.isEmpty {
           pcm = nil
           audioSource = "none"
         } else {
-          pcm = DirectorAudioMixer.mix(placed, fps: settings.fps, lengthFrames: settings.lengthFrames)
+          pcm = DirectorAudioMixer.mix(generated.placed, fps: fps, lengthFrames: settings.lengthFrames)
           audioSource = "generated"
         }
       case .inpaint:
@@ -6596,31 +6746,30 @@ public final class WarmServer {
         audioSource = "none"
       }
     } catch {
-      if ltx2IsCancellation(error) { throw error }
-      throw chunkFailed(n - 1, "audio", error.localizedDescription)
+      throw Self.directorChunkError(error, chunk: n - 1, stage: "audio")
     }
 
     // MARK: Stitch
 
     // The chunks' REAL encoded dims (the delivery downscale can make a chunk
-    // smaller than settings.width/height); the writer scales every chunk to
-    // these, so a mismatched chunk is a resample, never a failure.
+    // smaller than settings.width/height). Every chunk was checked against
+    // chunk 0's dims after it rendered, so the writer never rescales.
     let firstChunk = chunkResults[0]
     let stitchWidth = firstChunk.outputWidth > 0 ? firstChunk.outputWidth : settings.width
     let stitchHeight = firstChunk.outputHeight > 0 ? firstChunk.outputHeight : settings.height
-    logger.info("Director[\(session)]: stitching \(n) chunk(s) at \(stitchWidth)x\(stitchHeight) @ \(settings.fps) fps, audio \(audioSource) -> \(resolvedOutput)")
+    logger.info("Director[\(session)]: stitching \(n) chunk(s) at \(stitchWidth)x\(stitchHeight) @ \(fps) fps, audio \(audioSource) -> \(resolvedOutput)")
     let stitch: StitchResult
     do {
       try Task.checkCancellation()
       stitch = try DirectorStitcher.stitch(
         chunkPaths: chunkPaths,
         expectedFrames: compilation.chunks.map(\.span.frames),
-        fps: settings.fps, width: stitchWidth, height: stitchHeight,
+        fps: fps, width: stitchWidth, height: stitchHeight,
         audio: pcm, outputPath: resolvedOutput)
     } catch let error as DirectorError {
       throw error
     } catch {
-      if ltx2IsCancellation(error) { throw error }
+      if isRenderInterruption(error) { throw error }
       throw DirectorError.stitchFailed(error.localizedDescription)
     }
 
@@ -6633,12 +6782,12 @@ public final class WarmServer {
     let record = VideoGenerationRecord(
       prompt: timeline.globalPrompt,
       negativePrompt: settings.negativePrompt,
-      seed: settings.seed,
+      seed: firstChunk.generationRecord?.seed ?? seed,
       steps: firstChunk.generationRecord?.steps ?? settings.steps,
       model: "ltx2-director",
       engine: "ltx2",
       width: settings.width, height: settings.height,
-      frames: stitch.frameCount, fps: settings.fps,
+      frames: stitch.frameCount, fps: fps,
       weightsDir: firstChunk.generationRecord?.weightsDir,
       gemma: firstChunk.generationRecord?.gemma,
       engineBuild: firstChunk.generationRecord?.engineBuild,
@@ -6651,11 +6800,12 @@ public final class WarmServer {
       loras: effectiveLoras,
       audioSource: audioSource,
       chunkCount: n,
-      stitchPath: stitch.path)
+      stitchPath: stitch.path,
+      audioSkippedChunks: audioSkippedChunks.isEmpty ? nil : audioSkippedChunks)
     VideoSidecar.write(record, forMediaAt: stitch.outputPath)
     auditLog.append(
       kind: "video.director",
-      message: "\(n) chunk(s), \(stitch.frameCount)f @ \(settings.fps) fps, audio \(audioSource) -> \(stitch.outputPath)",
+      message: "\(n) chunk(s), \(stitch.frameCount)f @ \(fps) fps, audio \(audioSource) -> \(stitch.outputPath)",
       metadata: [:])
     report(100)
 
