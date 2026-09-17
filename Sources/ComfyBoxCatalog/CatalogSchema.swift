@@ -27,6 +27,12 @@ public enum CatalogSchema {
     /// Columns appended to `assets`, in order. Name → SQLite type.
     public static let newColumns: [(String, String)] = [
         ("realm", "TEXT"),
+        // FDD-remote-galleries §3.3. `absolute_path` is NOT NULL UNIQUE and
+        // keeps the LAST KNOWN LOCAL path even after a move, so where an asset
+        // actually lives is recorded here instead: storage_state is
+        // local|remote|missing, primary_host is "mac" or "remote:<id>".
+        ("storage_state", "TEXT"),
+        ("primary_host", "TEXT"),
         ("sealed", "INTEGER NOT NULL DEFAULT 0"),
         ("lane", "TEXT"),
         ("arc", "TEXT"),
@@ -160,6 +166,22 @@ public enum CatalogSchema {
             )
             """)
         try exec(db, "CREATE INDEX IF NOT EXISTS idx_locations_path ON asset_locations(path)")
+
+        // The transfer journal (FDD-remote-galleries §3.3): a move is copy →
+        // verify → relocate → delete-local, and a crash between any two of
+        // those must be recoverable. One row per in-flight transfer; finished
+        // and failed transfers are deleted, so this table is normally empty.
+        try exec(db, """
+            CREATE TABLE IF NOT EXISTS asset_transfers (
+                asset_id TEXT PRIMARY KEY,
+                remote_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                remote_path TEXT NOT NULL,
+                sha256 TEXT,
+                started_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """)
 
         try exec(db, """
             CREATE TABLE IF NOT EXISTS collections (
