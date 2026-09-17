@@ -256,3 +256,130 @@ struct RemoteGalleryTransferTests {
                 "the sidecar records that this was vault content")
     }
 }
+
+// MARK: - Immich sends (stubbed server)
+
+/// A stub with its own state, so this suite cannot race ImmichClientTests
+/// (both suites run in parallel; `.serialized` only orders tests WITHIN a suite).
+final class ImmichTransferStubProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> (Int, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let (code, data) = Self.handler?(request) ?? (200, Data("{}".utf8))
+        let response = HTTPURLResponse(url: request.url!, statusCode: code, httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+
+    static func reset() { handler = nil }
+
+    static func session() -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [ImmichTransferStubProtocol.self]
+        return URLSession(configuration: config)
+    }
+}
+
+@Suite("RemoteGalleryTransfer: Immich", .serialized)
+@MainActor
+struct RemoteGalleryImmichTransferTests {
+
+    private func makeWorld() async throws -> (RemoteGalleryTransfer, DAMStore, CatalogStore, AssetIngestor, String, String) {
+        let base = (NSTemporaryDirectory() as NSString).appendingPathComponent("imx-\(UUID().uuidString)")
+        let localDir = (base as NSString).appendingPathComponent("local")
+        let thumbs = (base as NSString).appendingPathComponent("thumbs")
+        for dir in [localDir, thumbs] {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        let dbPath = (base as NSString).appendingPathComponent("dam.sqlite3")
+        let catalog = try await CatalogStore.open(path: dbPath)
+        let store = try await DAMStore.open(path: dbPath)
+        let ingestor = AssetIngestor(store: store, watchDirectory: localDir, thumbnailDirectory: thumbs)
+        let transfer = RemoteGalleryTransfer(store: store, catalog: catalog, ingestor: ingestor) { remote in
+            ImmichClient(baseURL: remote.normalizedBaseURL ?? "", apiKey: "test-key",
+                         session: ImmichTransferStubProtocol.session())
+        }
+        return (transfer, store, catalog, ingestor, localDir, dbPath)
+    }
+
+    private func makeAsset(_ store: DAMStore, _ catalog: CatalogStore, dir: String, id: String) async throws -> DAMAsset {
+        let path = (dir as NSString).appendingPathComponent("\(id).png")
+        FileManager.default.createFile(atPath: path, contents: Data("bytes".utf8))
+        let asset = DAMAsset(id: id, kind: "image", filename: "\(id).png", absolutePath: path)
+        try await store.insertAsset(asset)
+        try await catalog.upsert(CatalogAsset(id: id, filename: "\(id).png", absolutePath: path),
+                                 explicitCollectionIDs: [])
+        return asset
+    }
+
+    private let remote = RemoteGalleryConfig.immich(name: "Immich", baseURL: "http://10.0.100.232:2283", albumName: "ComfyBox")
+
+    @Test("a confirmed upload moves the asset and records its Immich id")
+    func uploadMoves() async throws {
+        ImmichTransferStubProtocol.reset()
+        ImmichTransferStubProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            if path == "/api/server/version" { return (200, Data(#"{"major":2,"minor":3,"patch":1}"#.utf8)) }
+            if path == "/api/assets", request.httpMethod == "POST" {
+                return (201, Data(#"{"id":"immich-9","status":"created"}"#.utf8))
+            }
+            if path == "/api/assets/immich-9" { return (200, Data(#"{"id":"immich-9"}"#.utf8)) }
+            if path == "/api/albums", request.httpMethod == "POST" { return (201, Data(#"{"id":"album-1"}"#.utf8)) }
+            return (200, Data("{}".utf8))
+        }
+        let (transfer, store, catalog, _, dir, dbPath) = try await makeWorld()
+        defer { try? FileManager.default.removeItem(atPath: dbPath) }
+        let asset = try await makeAsset(store, catalog, dir: dir, id: "a1")
+
+        let outcome = await transfer.send(assets: [asset], to: remote)
+        #expect(outcome.sent == ["a1"])
+        #expect(outcome.albumID == "album-1")
+        #expect(!FileManager.default.fileExists(atPath: asset.absolutePath), "the local copy is gone")
+        let locations = try await catalog.locations(of: "a1", scope: nil)
+        #expect(locations.first?.path == "immich://immich-9")
+        #expect(try await catalog.pendingTransfers().isEmpty)
+    }
+
+    @Test("an upload the server cannot confirm keeps the local copy")
+    func unconfirmedKeepsLocal() async throws {
+        ImmichTransferStubProtocol.reset()
+        ImmichTransferStubProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            if path == "/api/server/version" { return (200, Data(#"{"major":2,"minor":3,"patch":1}"#.utf8)) }
+            if path == "/api/assets", request.httpMethod == "POST" {
+                return (201, Data(#"{"id":"immich-9","status":"created"}"#.utf8))
+            }
+            // The verification says it is not there.
+            return (404, Data(#"{"message":"not found"}"#.utf8))
+        }
+        let (transfer, store, catalog, _, dir, dbPath) = try await makeWorld()
+        defer { try? FileManager.default.removeItem(atPath: dbPath) }
+        let asset = try await makeAsset(store, catalog, dir: dir, id: "a1")
+
+        let outcome = await transfer.send(assets: [asset], to: remote)
+        #expect(outcome.sent.isEmpty)
+        #expect(outcome.failed.count == 1)
+        #expect(FileManager.default.fileExists(atPath: asset.absolutePath), "nothing is deleted on an unconfirmed upload")
+        #expect(try await catalog.pendingTransfers().isEmpty)
+    }
+
+    @Test("a server version this build does not speak stops the whole send")
+    func versionGateStopsSend() async throws {
+        ImmichTransferStubProtocol.reset()
+        ImmichTransferStubProtocol.handler = { _ in (200, Data(#"{"major":9,"minor":0,"patch":0}"#.utf8)) }
+        let (transfer, store, catalog, _, dir, dbPath) = try await makeWorld()
+        defer { try? FileManager.default.removeItem(atPath: dbPath) }
+        let asset = try await makeAsset(store, catalog, dir: dir, id: "a1")
+
+        let outcome = await transfer.send(assets: [asset], to: remote)
+        #expect(outcome.sent.isEmpty)
+        #expect(outcome.failed.first?.reason.contains("not supported") == true)
+        #expect(FileManager.default.fileExists(atPath: asset.absolutePath))
+    }
+}

@@ -30,16 +30,27 @@ public final class RemoteGalleryTransfer {
     public struct Outcome: Sendable, Equatable {
         public var sent: [String] = []
         public var failed: [Failure] = []
+        /// For an Immich remote: the album the send used, so the caller can
+        /// cache it back into the config and skip the lookup next time.
+        public var albumID: String?
     }
 
     private let store: DAMStore
     private let catalog: CatalogStore
     private let ingestor: AssetIngestor
+    /// How an Immich remote's client is built. Injectable so tests can talk to
+    /// a stub instead of a server.
+    private let immichClient: (RemoteGalleryConfig) -> ImmichClient?
 
-    public init(store: DAMStore, catalog: CatalogStore, ingestor: AssetIngestor) {
+    public init(store: DAMStore, catalog: CatalogStore, ingestor: AssetIngestor,
+                immichClient: ((RemoteGalleryConfig) -> ImmichClient?)? = nil) {
         self.store = store
         self.catalog = catalog
         self.ingestor = ingestor
+        self.immichClient = immichClient ?? { remote in
+            guard let base = remote.normalizedBaseURL, let key = Keychain.get(remote.keychainAccount) else { return nil }
+            return ImmichClient(baseURL: base, apiKey: key)
+        }
     }
 
     // MARK: - Sending
@@ -50,6 +61,9 @@ public final class RemoteGalleryTransfer {
                      to remote: RemoteGalleryConfig,
                      progress: ((Int, Int) -> Void)? = nil) async -> Outcome {
         var outcome = Outcome()
+        if remote.kind == .immich {
+            return await sendToImmich(assets: assets, remote: remote, progress: progress)
+        }
         guard remote.kind == .folder, let galleryRoot = remote.galleryRoot else {
             return Outcome(sent: [], failed: assets.map {
                 Failure(assetID: $0.id, reason: "This remote kind cannot receive sends yet")
@@ -171,6 +185,82 @@ public final class RemoteGalleryTransfer {
         try await catalog.finishTransfer(assetID: assetID)
     }
 
+    // MARK: - Immich
+
+    /// Upload, confirm it is really there, then move the catalog row and
+    /// delete the local copy — the same order as a folder send
+    /// (FDD-remote-galleries §3.4).
+    private func sendToImmich(assets: [DAMAsset],
+                              remote: RemoteGalleryConfig,
+                              progress: ((Int, Int) -> Void)?) async -> Outcome {
+        var outcome = Outcome()
+        guard let client = immichClient(remote) else {
+            return Outcome(sent: [], failed: assets.map {
+                Failure(assetID: $0.id, reason: ImmichError.notConfigured.localizedDescription)
+            })
+        }
+        do {
+            try await client.assertSupportedVersion()
+        } catch {
+            return Outcome(sent: [], failed: assets.map {
+                Failure(assetID: $0.id, reason: error.localizedDescription)
+            })
+        }
+
+        var albumID: String?
+        if let albumName = remote.albumName, !albumName.isEmpty {
+            albumID = try? await client.ensureAlbum(named: albumName, cachedID: remote.albumID)
+        }
+        outcome.albumID = albumID
+
+        for (offset, asset) in assets.enumerated() {
+            progress?(offset, assets.count)
+            do {
+                try await sendOneToImmich(asset, remote: remote, client: client, albumID: albumID)
+                outcome.sent.append(asset.id)
+            } catch {
+                outcome.failed.append(Failure(assetID: asset.id, reason: error.localizedDescription))
+            }
+        }
+        progress?(assets.count, assets.count)
+        return outcome
+    }
+
+    private func sendOneToImmich(_ asset: DAMAsset,
+                                 remote: RemoteGalleryConfig,
+                                 client: ImmichClient,
+                                 albumID: String?) async throws {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: asset.absolutePath) else {
+            throw TransferError.localFileMissing(asset.filename)
+        }
+        let sentAt = Date()
+        let secured = (try? await store.securedAssetIds().contains(asset.id)) ?? false
+        let digest = try Self.sha256(ofFileAt: asset.absolutePath)
+        try await catalog.beginTransfer(assetID: asset.id, remoteID: remote.id,
+                                        remotePath: "immich://pending", sha256: digest)
+
+        let uploaded: ImmichAsset
+        do {
+            let sidecar = try? RemoteSidecar(asset: asset, sha256: digest, sentAt: sentAt, sensitive: secured).encoded()
+            uploaded = try await client.upload(fileAt: asset.absolutePath, assetID: asset.id,
+                                               createdAt: asset.createdAt, modifiedAt: asset.modifiedAt,
+                                               sidecar: sidecar)
+            guard uploaded.isPresent, try await client.assetExists(id: uploaded.id) else {
+                throw TransferError.notConfirmedOnServer(asset.filename)
+            }
+            if let albumID { try? await client.addToAlbum(albumID: albumID, assetIDs: [uploaded.id]) }
+        } catch {
+            try? await catalog.setTransferState(assetID: asset.id, state: .failed)
+            throw error
+        }
+
+        let remotePath = "immich://\(uploaded.id)"
+        try await catalog.setTransferState(assetID: asset.id, state: .verified, remotePath: remotePath)
+        try await finishMove(assetID: asset.id, localPath: asset.absolutePath,
+                             remote: remote, mediaPath: remotePath, wasSecured: secured)
+    }
+
     // MARK: - Recovery
 
     /// Finish or undo transfers interrupted by a crash or a pulled drive.
@@ -182,14 +272,17 @@ public final class RemoteGalleryTransfer {
         let byID = Dictionary(uniqueKeysWithValues: remotes.map { ($0.id, $0) })
 
         for transfer in pending {
-            guard let remote = byID[transfer.remoteID], let galleryRoot = remote.galleryRoot,
-                  FileManager.default.fileExists(atPath: galleryRoot) else { continue }
+            guard let remote = byID[transfer.remoteID] else { continue }
+            let galleryRoot = remote.galleryRoot ?? ""
+            if remote.kind == .folder, !FileManager.default.fileExists(atPath: galleryRoot) { continue }
 
             switch transfer.state {
             case .copying:
                 // The copy never completed: the local file is authoritative.
-                try? FileManager.default.removeItem(atPath: (galleryRoot as NSString)
-                    .appendingPathComponent(transfer.remotePath) + ".part")
+                if !transfer.remotePath.hasPrefix("immich://") {
+                    try? FileManager.default.removeItem(atPath: (galleryRoot as NSString)
+                        .appendingPathComponent(transfer.remotePath) + ".part")
+                }
                 try? await catalog.finishTransfer(assetID: transfer.assetID)
             case .verified, .relocated:
                 // The remote copy exists and was verified: finish the move.
@@ -227,6 +320,7 @@ public final class RemoteGalleryTransfer {
     enum TransferError: LocalizedError {
         case localFileMissing(String)
         case digestMismatch(String)
+        case notConfirmedOnServer(String)
 
         var errorDescription: String? {
             switch self {
@@ -234,6 +328,8 @@ public final class RemoteGalleryTransfer {
                 return "\(name) is not on this Mac any more"
             case .digestMismatch(let name):
                 return "\(name) did not arrive intact — the local copy was kept"
+            case .notConfirmedOnServer(let name):
+                return "\(name) could not be confirmed on the server — the local copy was kept"
             }
         }
     }
