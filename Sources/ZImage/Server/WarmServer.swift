@@ -7144,10 +7144,20 @@ public final class WarmServer {
         return .error(.error(status: 503, message: "Director rendering needs local LTX-2 (--ltx2-weights/--ltx2-gemma)"))
       }
       let timeline = DirectorCompiler.resolvingDefaults(snapped, fps: probe.request.fps, seed: probe.request.seed)
+      // RE-VALIDATE rather than re-plan. `DirectorCompiler.plan` with no
+      // layout recomputes the plain arithmetic split, which silently threw
+      // away the boundaries the validator had moved into pauses (WP11) — so
+      // /validate promised one set of joins and the render used another.
+      // Re-validating also re-runs the snap at the RESOLVED fps, which is the
+      // point of this block: fps changes the frame-to-time mapping, so the
+      // pauses are not in the same frames they were before it was pinned.
+      let resolvedValidation = DirectorValidator.validate(timeline)
+      let resolvedPlan = resolvedValidation.plan
+        ?? DirectorCompiler.plan(
+          for: timeline, warnings: validation.issues.filter { $0.severity == .warning })
       let compilation = try DirectorCompiler.compile(
         DirectorValidation(
-          snapped: timeline, issues: validation.issues, ok: true,
-          plan: DirectorCompiler.plan(for: timeline, warnings: validation.issues.filter { $0.severity == .warning })),
+          snapped: timeline, issues: validation.issues, ok: true, plan: resolvedPlan),
         session: session, source: source)
       let fps = timeline.settings.fps ?? probe.request.fps
 
