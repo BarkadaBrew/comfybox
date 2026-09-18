@@ -76,6 +76,8 @@ public enum CatalogSchema {
                           description: "Tile designs — desktop tool, tile engine, Krita, Kira."),
         CatalogCollection(id: "col-photography", slug: "photography", name: "Photography",
                           description: "Art photography from any producer."),
+        CatalogCollection(id: "col-sequences", slug: "sequences", name: "Sequences",
+                          description: "Director renders that carry the timeline that made them."),
         CatalogCollection(id: "col-adult", slug: "adult", name: "Adult",
                           parentID: nil, description: "Adult entertainment."),
         // Kira's realm — hers alone.
