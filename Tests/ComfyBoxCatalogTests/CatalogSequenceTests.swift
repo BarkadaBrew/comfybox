@@ -129,6 +129,35 @@ final class CatalogSequenceTests: XCTestCase {
         XCTAssertEqual(row.sequenceID, "seq-new")
     }
 
+    // MARK: filing
+
+    func testASequenceFilesIntoSequencesInADDITIONToItsGenre() {
+        // Cross-cutting, like Decoupage: "it is a sequence" and "it is one of
+        // Kira's adult scenes" are both true, and filing it only as the former
+        // would hide it from the genre it belongs to.
+        let plain = CatalogAsset(
+            id: "a1", kind: "video", filename: "c.mp4", absolutePath: "/a/c.mp4",
+            contentMode: "apple")
+        let sequence = CatalogAsset(
+            id: "a2", kind: "video", filename: "s.mp4", absolutePath: "/a/s.mp4",
+            contentMode: "apple", sequenceID: "seq-7")
+
+        let plainIDs = CollectionRules.defaultCollectionIDs(for: plain)
+        let sequenceIDs = CollectionRules.defaultCollectionIDs(for: sequence)
+
+        XCTAssertFalse(plainIDs.contains(CollectionRules.sequencesCollectionID))
+        XCTAssertTrue(sequenceIDs.contains(CollectionRules.sequencesCollectionID))
+        for id in plainIDs {
+            XCTAssertTrue(sequenceIDs.contains(id), "it keeps \(id), it does not replace it")
+        }
+    }
+
+    func testTheSequencesCollectionIsSeeded() {
+        XCTAssertTrue(
+            CatalogSchema.seedCollections.contains { $0.id == CollectionRules.sequencesCollectionID },
+            "the rule table references it by id, so it must exist")
+    }
+
     func testASealedRowDropsTheAuthoredNameButKeepsTheId() {
         // The name carries the timeline's title, so it follows the same rule as
         // the prompts; the id and chunk count are facets.

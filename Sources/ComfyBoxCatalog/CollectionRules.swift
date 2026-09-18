@@ -68,7 +68,22 @@ public enum CollectionRules {
         "avocado": "col-adult",
     ]
 
+    /// A Director render files into Sequences IN ADDITION to wherever its
+    /// realm/lane/tier would put it. It is a cross-cutting body of work, like
+    /// Decoupage — "it is a sequence" and "it is one of Kira's adult scenes"
+    /// are both true, and filing it only as the former would hide it from the
+    /// genre it belongs to.
+    public static let sequencesCollectionID = "col-sequences"
+
     public static func defaultCollectionIDs(for asset: CatalogAsset) -> [String] {
+        var ids = baseCollectionIDs(for: asset)
+        if asset.sequenceID != nil, !ids.contains(sequencesCollectionID) {
+            ids.append(sequencesCollectionID)
+        }
+        return ids
+    }
+
+    private static func baseCollectionIDs(for asset: CatalogAsset) -> [String] {
         switch asset.realm {
         case .kira:
             let byLane = kiraCollectionIDs(for: asset)
