@@ -964,7 +964,7 @@ struct GalleryView: View {
         let blurNSFW = shouldBlurNSFW(asset)
         GalleryCellView(
             asset: asset,
-            thumbnailPath: ingestor.thumbnailPath(for: asset.id),
+            thumbnailPath: thumbnailPath(for: asset),
             remoteURL: mediaLocation(for: asset).remoteURL,
             cellWidth: width,
             aspectRatio: aspectRatio(asset),
@@ -1871,6 +1871,24 @@ struct GalleryView: View {
         if failed == 0 { return "Moved \(sent) to \(remoteName)" }
         if sent == 0 { return "Nothing moved to \(remoteName) — \(failed) failed, local copies kept" }
         return "Moved \(sent) to \(remoteName); \(failed) failed and kept their local copies"
+    }
+
+    /// Where this asset's thumbnail is. A moved asset's thumbnail travels with
+    /// it: the Mac's cached copy is deleted by the send, so the cell reads the
+    /// one on the drive (Todd 2026-09-18: "or create one in remote gallery").
+    private func thumbnailPath(for asset: DAMAsset) -> String {
+        if let host = browser?.remoteHostByAsset[asset.id],
+           let root = browser?.remoteGalleryRoots[host] {
+            let onDrive = Self.remoteThumbnailPath(galleryRoot: root, assetID: asset.id)
+            if FileManager.default.fileExists(atPath: onDrive) { return onDrive }
+        }
+        return ingestor.thumbnailPath(for: asset.id)
+    }
+
+    /// `<gallery root>/thumbnails/<asset id>.jpg` — the layout a send writes.
+    static func remoteThumbnailPath(galleryRoot: String, assetID: String) -> String {
+        ((galleryRoot as NSString).appendingPathComponent(FolderGalleryIndex.thumbnailDirectory) as NSString)
+            .appendingPathComponent("\(assetID).jpg")
     }
 
     /// The authenticated thumbnail URL for an asset that lives on an Immich

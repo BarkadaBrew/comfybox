@@ -227,6 +227,21 @@ public final class CatalogBrowser {
             // like any other while the drive is attached, and vanish when it
             // is not — Todd's choice: "hide it until the drive is back".
             if let remoteLocation = locations.first(where: { $0.host.hasPrefix(Self.remoteHostPrefix) }) {
+                // The main gallery does NOT list what has been moved off this
+                // Mac (Todd 2026-09-18: "moving asset doesnt remove thumbnail
+                // for gallery"). A moved asset lives in the Remote Gallery tab,
+                // which asks for it by host. Server trees (kira/bree) are not
+                // remote GALLERIES and are unaffected.
+                guard restrictToRemoteHost != nil else {
+                    // Unless it came back to this Mac, in which case it is
+                    // local again and belongs here.
+                    if fm.fileExists(atPath: row.absolutePath) {
+                        local[row.id] = row.absolutePath
+                        kept.append(row)
+                        try? await store.relocateAsset(id: row.id, host: Self.localHost, path: row.absolutePath)
+                    }
+                    continue
+                }
                 // A file that came BACK to this Mac (restored from a backup, or
                 // copied back by hand) is local again, whatever the catalog
                 // last recorded (Codex review of the implementation).

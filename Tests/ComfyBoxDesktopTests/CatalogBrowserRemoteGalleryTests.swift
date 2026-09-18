@@ -17,7 +17,7 @@ struct CatalogBrowserRemoteGalleryTests {
         return (try await CatalogStore.open(path: path), path)
     }
 
-    @Test("an asset on an attached drive shows, reading from the drive")
+    @Test("an asset on an attached drive shows in the REMOTE tab, reading from the drive")
     func attachedDriveShows() async throws {
         let (store, dbPath) = try await makeStore()
         defer { try? FileManager.default.removeItem(atPath: dbPath) }
@@ -35,13 +35,17 @@ struct CatalogBrowserRemoteGalleryTests {
 
         let browser = CatalogBrowser(store: store)
         browser.remoteGalleryRoots = ["remote:r1": driveRoot]
+        // Since 2026-09-18 a moved asset belongs to the Remote tab only, so the
+        // scope is what shows it (Todd: "moving asset doesnt remove thumbnail
+        // for gallery").
+        browser.restrictToRemoteHost = "remote:r1"
         await browser.apply(filter: CatalogQuery(limit: 10))
         #expect(browser.items.map(\.id) == ["a1"])
         #expect(browser.localPath(forID: "a1") == onDrive, "it reads from the drive, not the old local path")
         #expect(browser.localPath(forID: "a1") != nil, "an attached drive is as good as local")
     }
 
-    @Test("an asset on a drive that is not attached is hidden, not broken")
+    @Test("an asset on a drive that is not attached is hidden in the remote tab too")
     func absentDriveHides() async throws {
         let (store, dbPath) = try await makeStore()
         defer { try? FileManager.default.removeItem(atPath: dbPath) }
@@ -52,6 +56,7 @@ struct CatalogBrowserRemoteGalleryTests {
 
         let browser = CatalogBrowser(store: store)
         browser.remoteGalleryRoots = [:]   // nothing attached
+        browser.restrictToRemoteHost = "remote:r1"
         await browser.apply(filter: CatalogQuery(limit: 10))
         #expect(browser.items.isEmpty, "Todd's choice: hide it until the drive is back")
     }
@@ -158,5 +163,64 @@ struct CatalogBrowserRemoteScopeTests {
 
         #expect(try await store.assetIDs(onHost: "remote:r1") == ["b", "a"])
         #expect(try await store.assetIDs(onHost: "remote:nope").isEmpty)
+    }
+}
+
+@Suite("Remote galleries: moved assets leave the main gallery")
+@MainActor
+struct RemoteGalleryMainGalleryTests {
+
+    private func makeWorld() async throws -> (CatalogStore, String, String) {
+        let dbPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("mg-\(UUID().uuidString).sqlite3")
+        let store = try await CatalogStore.open(path: dbPath)
+        let driveRoot = (NSTemporaryDirectory() as NSString).appendingPathComponent("drv-\(UUID().uuidString)")
+        let mediaDir = (driveRoot as NSString).appendingPathComponent("media")
+        let thumbDir = (driveRoot as NSString).appendingPathComponent("thumbnails")
+        for dir in [mediaDir, thumbDir] {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        FileManager.default.createFile(atPath: (mediaDir as NSString).appendingPathComponent("moved.png"),
+                                       contents: Data("bytes".utf8))
+        return (store, dbPath, driveRoot)
+    }
+
+    @Test("a moved asset is not in the main gallery, even with the drive attached")
+    func movedLeavesMainGallery() async throws {
+        let (store, dbPath, driveRoot) = try await makeWorld()
+        defer { try? FileManager.default.removeItem(atPath: dbPath); try? FileManager.default.removeItem(atPath: driveRoot) }
+
+        try await store.upsert(CatalogAsset(id: "moved", filename: "moved.png", absolutePath: "/gone/moved.png"),
+                               explicitCollectionIDs: [])
+        try await store.relocateAsset(id: "moved", host: "remote:r1", path: "media/moved.png")
+
+        let browser = CatalogBrowser(store: store)
+        browser.remoteGalleryRoots = ["remote:r1": driveRoot]   // the drive IS attached
+        await browser.apply(filter: CatalogQuery(limit: 50))
+        #expect(browser.items.isEmpty, "it was moved off this Mac; the main gallery must not show it")
+
+        // The Remote tab asks for it by host, and gets it.
+        browser.restrictToRemoteHost = "remote:r1"
+        await browser.apply(filter: CatalogQuery(limit: 50))
+        #expect(browser.items.map(\.id) == ["moved"])
+    }
+
+    @Test("an asset that came back is in the main gallery again")
+    func returnedComesBack() async throws {
+        let (store, dbPath, driveRoot) = try await makeWorld()
+        defer { try? FileManager.default.removeItem(atPath: dbPath); try? FileManager.default.removeItem(atPath: driveRoot) }
+
+        let localPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("back-\(UUID().uuidString).png")
+        FileManager.default.createFile(atPath: localPath, contents: Data("bytes".utf8))
+        defer { try? FileManager.default.removeItem(atPath: localPath) }
+
+        try await store.upsert(CatalogAsset(id: "back", filename: "back.png", absolutePath: localPath),
+                               explicitCollectionIDs: [])
+        try await store.relocateAsset(id: "back", host: "remote:r1", path: "media/back.png")
+
+        let browser = CatalogBrowser(store: store)
+        browser.remoteGalleryRoots = ["remote:r1": driveRoot]
+        await browser.apply(filter: CatalogQuery(limit: 50))
+        #expect(browser.items.map(\.id) == ["back"])
+        #expect(try await store.storageState(of: "back")?.storageState == "local")
     }
 }
