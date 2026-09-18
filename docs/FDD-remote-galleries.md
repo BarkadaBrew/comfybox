@@ -165,8 +165,29 @@ Codex (read-only, 2026-09-17) reviewed the draft against the code and raised ten
 
 ## 9. Implementation notes (2026-09-17)
 
-Built and tested as specified, with two deliberate gaps recorded in the plan:
-the Remote Gallery tab is not yet scoped to a remote picker, and Immich-hosted
-assets are hidden from the grid rather than rendered, because Immich requires
-its API key as a request header and SwiftUI's image loading cannot send one.
-Folder remotes render exactly like local assets while their drive is attached.
+Built and tested as specified (#472), then corrected twice from live use.
+
+**Both gaps from the first pass are closed** (#478, #480): the Remote Gallery
+tab is scoped to a picker of the configured remotes with their status, and
+Immich-hosted assets render through `ImmichThumbnailProtocol`, a URLProtocol
+that serves `immich-thumb://` URLs by adding the API key — which SwiftUI's
+image loading cannot do itself.
+
+**What live use taught, that stub tests could not:**
+
+- Immich 2.3.1 marks `metadata` required on `POST /api/assets`, but an EMPTY
+  list makes the server fail its own insert (Postgres `syntax error at or near
+  ")"`, HTTP 500). The field is omitted.
+- `sidecarData` takes XMP only; a JSON sidecar is refused (`Unsupported file
+  type`, 400). The recipe goes on the asset description instead.
+- Verification before a local delete compares Immich's own SHA-1 checksum.
+- A send that worked looked like a no-op, because an attached drive's assets
+  keep showing. Moved assets are now labelled with their gallery, and send
+  results (with the failure reason) appear on screen.
+- Setting the scope on `CatalogBrowser` is not enough: `GalleryView` fills its
+  grid through its own loader, so a scope change must trigger a reload.
+
+**Still open:** bringing an asset back from a remote, and one unverified path —
+an Immich send driven from the app. Its HTTP shape is verified against the live
+server with curl; a Swift test process cannot reach the LAN (macOS answers
+"Local network prohibited"), so only the signed app can make that call.
