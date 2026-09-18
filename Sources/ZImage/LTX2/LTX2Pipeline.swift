@@ -52,6 +52,21 @@ final class LTX2AVDenoiseState {
     return MLX.concatenated([latents, padding], axis: 2)
   }
 
+  /// Accept a supplied latent ONLY if it is shaped like the stream it replaces.
+  ///
+  /// `fit` squares up the time axis; nothing checked the rest. A latent with the
+  /// wrong channel or feature width patchifies to a token the transformer's
+  /// projection cannot multiply, and MLX answers that with `fatalError` — which
+  /// takes the whole engine down mid-render, not just the job. A caller that
+  /// gets nil back renders generated audio instead, which is a worse clip and a
+  /// live server.
+  static func conditioning(_ given: MLXArray, like reference: MLXArray) -> MLXArray? {
+    guard given.ndim == reference.ndim, given.dim(0) == reference.dim(0),
+          given.dim(1) == reference.dim(1), given.dim(3) == reference.dim(3)
+    else { return nil }
+    return fit(given, toFrames: reference.dim(2))
+  }
+
   /// A CLEAN audio latent the render must follow rather than invent
   /// (FDD §4.7, WP11: audio-driven chunks). When present it is re-snapped
   /// after every step, so the audio stream never drifts off the voice and the
@@ -506,7 +521,7 @@ public final class LTX2Pipeline {
     // (sampleRate / (hop * downsample) = 16000/640).
     var avState: LTX2AVDenoiseState? = nil
     if let seconds = audioSeconds, wantAudio {
-      let ta = max(1, Int((seconds * 25).rounded(.up)))
+      let ta = LTX2MelAnalysis.latentFrames(seconds: Double(seconds))
       // Seeded: isolated key (video bit-identical with audio on/off).
       // Unseeded: global stream, so audio noise varies like everything else
       // (Codex #9: keying off seed-0 froze unseeded audio noise).
@@ -526,11 +541,15 @@ public final class LTX2Pipeline {
       // is trimmed or zero-padded to this chunk's length, so a caller cannot
       // desynchronise the stream by handing over a slice of the wrong size.
       if let given = audioConditioning {
-        let clean = LTX2AVDenoiseState.fit(given, toFrames: ta)
-        avState?.conditioning = clean
-        avState?.audioLatents = clean
-        logger.info(
-          "Audio-driven: conditioning on \(clean.dim(2)) audio latent frame(s) — the voice is given, not generated.")
+        if let clean = LTX2AVDenoiseState.conditioning(given, like: audioInit) {
+          avState?.conditioning = clean
+          avState?.audioLatents = clean
+          logger.info(
+            "Audio-driven: conditioning on \(clean.dim(2)) audio latent frame(s) — the voice is given, not generated.")
+        } else {
+          logger.warning(
+            "Audio-driven: supplied latent \(given.shape) does not match the audio stream \(audioInit.shape) — generating audio instead.")
+        }
       }
       logger.info("Audio stream enabled: \(ta) latent frames (\(seconds)s, negatives \(negativeAudioEmbeddings != nil ? "on" : "off")).")
     }
@@ -1268,7 +1287,7 @@ public final class LTX2Pipeline {
     // IC-control ref frames (they sit at t=0s, matching their video PE).
     var avState: LTX2AVDenoiseState? = nil
     if let seconds = audioSeconds, wantAudio {
-      let ta = max(1, Int((seconds * 25).rounded(.up)))
+      let ta = LTX2MelAnalysis.latentFrames(seconds: Double(seconds))
       let audioKey = seed.map { MLXRandom.key($0 &+ 0xA0D10) }
       let audioNoise = MLXRandom.normal([1, 8, ta, 16], key: audioKey).asType(.float32)
       let audioInit = audioNoise * MLXArray(sigmas[0])
@@ -1283,11 +1302,15 @@ public final class LTX2Pipeline {
         audioNoiseKey: seed.map { MLXRandom.key($0 &+ 0xA0D12) })
       // Audio-driven (WP11): start FROM the voice and stay there.
       if let given = audioConditioning {
-        let clean = LTX2AVDenoiseState.fit(given, toFrames: ta)
-        avState?.conditioning = clean
-        avState?.audioLatents = clean
-        logger.info(
-          "Audio-driven (i2v): conditioning on \(clean.dim(2)) audio latent frame(s) — the voice is given, not generated.")
+        if let clean = LTX2AVDenoiseState.conditioning(given, like: audioInit) {
+          avState?.conditioning = clean
+          avState?.audioLatents = clean
+          logger.info(
+            "Audio-driven (i2v): conditioning on \(clean.dim(2)) audio latent frame(s) — the voice is given, not generated.")
+        } else {
+          logger.warning(
+            "Audio-driven (i2v): supplied latent \(given.shape) does not match the audio stream \(audioInit.shape) — generating audio instead.")
+        }
       }
       logger.info("Audio stream enabled (i2v): \(ta) latent frames (\(seconds)s, negatives \(negativeAudioEmbeddings != nil ? "on" : "off")).")
     }
@@ -1619,7 +1642,7 @@ public final class LTX2Pipeline {
     // keyframes need nothing audio-specific here.
     var avState: LTX2AVDenoiseState? = nil
     if let seconds = audioSeconds, wantAudio {
-      let ta = max(1, Int((seconds * 25).rounded(.up)))
+      let ta = LTX2MelAnalysis.latentFrames(seconds: Double(seconds))
       let audioKey = seed.map { MLXRandom.key($0 &+ 0xA0D10) }
       let audioNoise = MLXRandom.normal([1, 8, ta, 16], key: audioKey).asType(.float32)
       let audioInit = audioNoise * MLXArray(sigmas[0])
@@ -1632,6 +1655,20 @@ public final class LTX2Pipeline {
         pe: avPE,
         negativeAudioContext: negativeAudioEmbeddings,
         audioNoiseKey: seed.map { MLXRandom.key($0 &+ 0xA0D12) })
+      // Audio-driven (WP11) — as in T2V and I2V. A keyframed chunk is the
+      // COMMON case for a Director monologue, so leaving this out is what made
+      // gate run 1 produce a clip identical to the unconditioned one.
+      if let given = audioConditioning {
+        if let clean = LTX2AVDenoiseState.conditioning(given, like: audioInit) {
+          avState?.conditioning = clean
+          avState?.audioLatents = clean
+          logger.info(
+            "Audio-driven (multi-keyframe): conditioning on \(clean.dim(2)) audio latent frame(s) — the voice is given, not generated.")
+        } else {
+          logger.warning(
+            "Audio-driven (multi-keyframe): supplied latent \(given.shape) does not match the audio stream \(audioInit.shape) — generating audio instead.")
+        }
+      }
       logger.info("Audio stream enabled (multi-keyframe): \(ta) latent frames (\(seconds)s, negatives \(negativeAudioEmbeddings != nil ? "on" : "off")).")
     }
 

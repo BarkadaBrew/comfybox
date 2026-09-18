@@ -539,9 +539,16 @@ public final class LTX2VideoGenerator {
             let start = Int(
                 Double(request.audioConditionStartFrame) * secondsPerFrame
                     * Double(LTX2MelAnalysis.sampleRate))
-            let length = Int(
-                Double(request.framesPerChunk) * secondsPerFrame
-                    * Double(LTX2MelAnalysis.sampleRate))
+            // Take the window the LATENT needs, not the one the chunk plays.
+            // The audio encoder maps mel frames to latents by floor(m/4), so a
+            // window sized to the chunk's own duration lands one latent short of
+            // the stream (605 -> 151 against a 152-frame chunk) and `fit` pads
+            // the difference with silence — the voice would stop ~40ms before
+            // the picture does, every chunk. Asking for 4*ta mel frames lands
+            // exactly, and makes the fit a no-op in the ordinary case.
+            let length = LTX2MelAnalysis.sampleCount(
+                frames: 4 * LTX2MelAnalysis.latentFrames(
+                    seconds: Double(request.framesPerChunk) * secondsPerFrame))
             guard start < pcm.frames else {
                 logger.warning(
                     "LTX-2 audio-driven: chunk starts at \(start) samples but the track is only \(pcm.frames) — falling back to generated audio")
@@ -557,7 +564,10 @@ public final class LTX2VideoGenerator {
                 right += [Float](repeating: 0, count: length - right.count)
             }
             let waveform = MLXArray(left + right, [2, length])
-            let latents = vae.encode(mel.mel(waveform: waveform))
+            // The analysis emits the vocoder-facing (B, 2, F, T); the VAE wants
+            // time on the causal axis, (B, 2, T, F).
+            let spectrogram = mel.mel(waveform: waveform).transposed(0, 1, 3, 2)
+            let latents = vae.encodeToLatent(spectrogram)
             eval(latents)
             logger.info(
                 "LTX-2 audio-driven: conditioning on \(path) from frame \(request.audioConditionStartFrame) (\(latents.dim(2)) audio latent frames).")

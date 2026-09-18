@@ -72,6 +72,20 @@ public struct LTX2MelAnalysis: Sendable {
       forwardBasis: flattened.asType(.float32), melBasis: mel.asType(.float32))
   }
 
+  /// The audio latent rate: 25 frames/s, the VAE's 4x compression of the
+  /// 100 frames/s mel.
+  public static let latentRate = 25
+
+  /// Audio latent frames for a duration — the ONE definition of `ta`.
+  ///
+  /// The pipeline sizes its audio noise with this and the generator sizes the
+  /// analysis window with it; if the two ever disagreed by a frame, a supplied
+  /// voice would be silently padded or clipped against the stream it is meant
+  /// to replace.
+  public static func latentFrames(seconds: Double) -> Int {
+    max(1, Int((seconds * Double(latentRate)).rounded(.up)))
+  }
+
   /// Number of mel frames a sample count produces (centre-padded, as the
   /// reference analysis does: `1 + samples / hop`).
   public static func frameCount(samples: Int) -> Int {

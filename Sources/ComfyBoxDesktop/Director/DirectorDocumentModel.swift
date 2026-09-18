@@ -483,6 +483,22 @@ final class DirectorDocumentModel {
         projectURL = url
     }
 
+    /// Open the SEQUENCE beside a rendered clip: `clip.mp4` ->
+    /// `clip.sequence.json` (FDD §4.9.2). This is "drop the mp4 back on the
+    /// Director tab and get the timeline that made it", the way a ComfyUI PNG
+    /// restores its graph. Returns nil when the clip predates sequences, so
+    /// the caller can say so rather than opening an empty timeline.
+    @discardableResult
+    func loadSequence(forMediaAt url: URL) -> SequenceDocument? {
+        guard let document = SequenceSidecar.read(forMediaAt: url.path) else { return nil }
+        timeline = document.timeline
+        resetEditorState()
+        // A sequence is not a project file: saving must ask where to put it,
+        // rather than writing over the render's sidecar.
+        projectURL = nil
+        return document
+    }
+
     /// Save to `url` (assets embedded only when asked), clearing dirty.
     func save(to url: URL, embedAssets: Bool = false) throws {
         try DirectorDocument.write(timeline, to: url, embedAssets: embedAssets)

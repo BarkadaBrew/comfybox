@@ -134,6 +134,8 @@ struct DirectorView: View {
             Button("Save") { saveDocument(saveAs: false) }.keyboardShortcut("s", modifiers: .command)
             Button("Save As") { saveDocument(saveAs: true) }.keyboardShortcut("s", modifiers: [.command, .shift])
             Button("Open") { openDocument() }.keyboardShortcut("o", modifiers: .command)
+            Button("Open Sequence…") { openSequence() }
+                .help("Open the timeline that made a rendered clip")
             Button("New") { newDocument() }.keyboardShortcut("n", modifiers: [.command, .option])
             Button("Zoom In") { zoom(by: 1.25) }.keyboardShortcut("=", modifiers: .command)
             Button("Zoom Out") { zoom(by: 1 / 1.25) }.keyboardShortcut("-", modifiers: .command)
@@ -175,6 +177,27 @@ struct DirectorView: View {
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Open a rendered clip's Sequence: pick the mp4, get the timeline that
+    /// made it (FDD §4.9.2, WP13).
+    private func openSequence() {
+        guard confirmDiscardIfDirty("Open") else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.mpeg4Movie, .json]
+        panel.prompt = "Open Sequence"
+        panel.message = "Choose a rendered clip; its timeline is stored beside it."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if let document = model.loadSequence(forMediaAt: url) {
+            errorMessage = nil
+            statusMessage = "Opened \(document.name) — \(document.chunks.count) chunk(s), rendered \(document.createdAt.formatted(date: .abbreviated, time: .shortened))"
+        } else {
+            errorMessage =
+                "No sequence beside \(url.lastPathComponent) — it was rendered before sequences, or the sidecar moved."
         }
     }
 
