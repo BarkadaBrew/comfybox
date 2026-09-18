@@ -55,6 +55,9 @@ public struct CatalogQuery: Sendable, CustomStringConvertible {
     public var arc: String?
     public var kind: String?
     public var mode: String?
+    /// true = only Director renders (a sequence sits beside the clip);
+    /// false = only clips without one; nil = don't care.
+    public var hasSequence: Bool?
     public var minDurationMs: Int?
     public var maxDurationMs: Int?
     public var minRating: Int?
@@ -68,13 +71,15 @@ public struct CatalogQuery: Sendable, CustomStringConvertible {
                 collectionID: String? = nil, lane: String? = nil, tier: String? = nil,
                 character: String? = nil, source: String? = nil, stock: String? = nil,
                 genre: String? = nil, arc: String? = nil, kind: String? = nil,
-                mode: String? = nil, minDurationMs: Int? = nil, maxDurationMs: Int? = nil,
+                mode: String? = nil, hasSequence: Bool? = nil,
+                minDurationMs: Int? = nil, maxDurationMs: Int? = nil,
                 minRating: Int? = nil, since: Date? = nil, until: Date? = nil,
                 orderBy: CatalogOrder = .newest, limit: Int = 50, offset: Int = 0) {
         self.scope = scope; self.ceiling = ceiling; self.text = text
         self.collectionID = collectionID; self.lane = lane; self.tier = tier
         self.character = character; self.source = source; self.stock = stock
         self.genre = genre; self.arc = arc; self.kind = kind; self.mode = mode
+        self.hasSequence = hasSequence
         self.minDurationMs = minDurationMs; self.maxDurationMs = maxDurationMs
         self.minRating = minRating; self.since = since; self.until = until
         self.orderBy = orderBy; self.limit = limit; self.offset = offset
@@ -350,7 +355,7 @@ public actor CatalogStore {
                 realm, sealed, lane, arc, theme, stock, genre, family, style,
                 preset, loras, render_id, caption, caption_source, prompt_raw,
                 mode, duration_ms, fps, frames, resolution, aspect_ratio,
-                prompt_injected
+                prompt_injected, sequence_id, sequence_name, sequence_chunks
             ) VALUES (
                 ?1,?2,?3,?4,?5,?6,?7,?8,
                 ?9,?9,?9,0,
@@ -359,7 +364,7 @@ public actor CatalogStore {
                 ?21,?22,?23,?24,?25,?26,?27,?28,?29,
                 ?30,?31,?32,?33,?34,?35,
                 ?36,?37,?38,?39,?40,?41,
-                ?42
+                ?42,?43,?44,?45
             )
             ON CONFLICT(id) DO UPDATE SET
                 kind=excluded.kind, filename=excluded.filename,
@@ -394,7 +399,10 @@ public actor CatalogStore {
                 frames=COALESCE(excluded.frames, assets.frames),
                 resolution=COALESCE(excluded.resolution, assets.resolution),
                 aspect_ratio=COALESCE(excluded.aspect_ratio, assets.aspect_ratio),
-                prompt_injected=excluded.prompt_injected
+                prompt_injected=excluded.prompt_injected,
+                sequence_id=COALESCE(excluded.sequence_id, assets.sequence_id),
+                sequence_name=COALESCE(excluded.sequence_name, assets.sequence_name),
+                sequence_chunks=COALESCE(excluded.sequence_chunks, assets.sequence_chunks)
             """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -444,6 +452,9 @@ public actor CatalogStore {
         bindText(stmt, 40, asset.resolution)
         bindText(stmt, 41, asset.aspectRatio)
         bindText(stmt, 42, asset.promptInjected)
+        bindText(stmt, 43, asset.sequenceID)
+        bindText(stmt, 44, asset.sequenceName)
+        bindInt(stmt, 45, asset.sequenceChunks)
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw CatalogError.stepFailed(String(cString: sqlite3_errmsg(db)))
@@ -612,6 +623,12 @@ public actor CatalogStore {
         eq("character_name", query.character); eq("source", query.source)
         eq("stock", query.stock); eq("genre", query.genre); eq("arc", query.arc)
         eq("kind", query.kind); eq("mode", query.mode)
+        // A Director render is a video that ALSO has a sequence beside it, so
+        // this is a second axis rather than a kind (WP13). No bind: it is a
+        // null test, not a comparison.
+        if let wantsSequence = query.hasSequence {
+            wheres.append("a.sequence_id IS \(wantsSequence ? "NOT NULL" : "NULL")")
+        }
 
         func cmp(_ column: String, _ op: String, _ value: Int?) {
             guard let v = value else { return }
@@ -653,7 +670,8 @@ public actor CatalogStore {
                    a.render_id, a.content_mode, a.character_name,
                    a.lane, a.arc, a.theme, a.stock, a.genre, a.family, a.style,
                    a.mode, a.duration_ms, a.fps, a.frames, a.resolution, a.aspect_ratio,
-                   a.rating, a.favorite, a.prompt_injected
+                   a.rating, a.favorite, a.prompt_injected,
+                   a.sequence_id, a.sequence_name, a.sequence_chunks
             FROM assets a
             \(whereSQL)
             ORDER BY \(order)
@@ -1296,7 +1314,8 @@ public actor CatalogStore {
                    a.render_id, a.content_mode, a.character_name,
                    a.lane, a.arc, a.theme, a.stock, a.genre, a.family, a.style,
                    a.mode, a.duration_ms, a.fps, a.frames, a.resolution, a.aspect_ratio,
-                   a.rating, a.favorite, a.prompt_injected
+                   a.rating, a.favorite, a.prompt_injected,
+                   a.sequence_id, a.sequence_name, a.sequence_chunks
             FROM assets a WHERE a.id = ?1
             """
         var stmt: OpaquePointer?
@@ -1551,6 +1570,7 @@ public actor CatalogStore {
             genre: text(s, 30), family: text(s, 31), style: text(s, 32),
             mode: text(s, 33), durationMs: optInt(s, 34), fps: optDouble(s, 35),
             frames: optInt(s, 36), resolution: text(s, 37), aspectRatio: text(s, 38),
+            sequenceID: text(s, 42), sequenceName: text(s, 43), sequenceChunks: optInt(s, 44),
             rating: Int(sqlite3_column_int(s, 39)), favorite: sqlite3_column_int(s, 40) != 0)
     }
 

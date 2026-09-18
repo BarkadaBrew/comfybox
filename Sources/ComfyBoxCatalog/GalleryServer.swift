@@ -248,6 +248,13 @@ public enum GalleryServer {
         q.lane = s("lane"); q.tier = s("tier"); q.character = s("character")
         q.source = s("source"); q.stock = s("stock"); q.genre = s("genre")
         q.arc = s("arc"); q.kind = s("kind"); q.mode = s("mode")
+        // ?has_sequence=1 / =0 — only Director renders, or only clips without
+        // one. Anything else is "don't care", so a typo narrows nothing.
+        switch s("has_sequence") {
+        case "1", "true", "yes": q.hasSequence = true
+        case "0", "false", "no": q.hasSequence = false
+        default: break
+        }
         q.minDurationMs = i("min_duration"); q.maxDurationMs = i("max_duration")
         q.minRating = i("min_rating")
         q.since = d("since"); q.until = d("until")
@@ -277,6 +284,8 @@ public enum GalleryServer {
         put("mode", a.mode); put("duration_ms", a.durationMs); put("fps", a.fps)
         put("frames", a.frames); put("resolution", a.resolution); put("aspect_ratio", a.aspectRatio)
         put("width", a.width); put("height", a.height)
+        put("sequence_id", a.sequenceID); put("sequence_name", a.sequenceName)
+        put("sequence_chunks", a.sequenceChunks)
         out["rating"] = a.rating
         out["favorite"] = a.favorite
         out["sealed"] = a.sealed
@@ -618,6 +627,7 @@ public enum GalleryServer {
                     indexed:    \(report.assetsIndexed)
                     merged:     \(report.duplicatesMerged)
                     sidecars:   \(report.sidecarsRead)
+                    sequences:  \(report.sequencesRead)
                     journal:    \(report.journalEntriesRead)
                     edges:      \(report.edgesCreated)
                     unresolved: \(report.edgesUnresolved)

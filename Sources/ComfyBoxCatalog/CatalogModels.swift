@@ -124,6 +124,13 @@ public struct CatalogAsset: Sendable, Equatable {
     public let resolution: String?
     public let aspectRatio: String?
 
+    // Sequence (a Director render). `kind` stays "video" — the clip IS one.
+    // A non-nil `sequenceID` is what "this can be reopened in Director and
+    // replayed" means (WP13).
+    public let sequenceID: String?
+    public let sequenceName: String?
+    public let sequenceChunks: Int?
+
     // User annotation
     public let rating: Int
     public let favorite: Bool
@@ -144,6 +151,7 @@ public struct CatalogAsset: Sendable, Equatable {
         stock: String? = nil, genre: String? = nil, family: String? = nil, style: String? = nil,
         mode: String? = nil, durationMs: Int? = nil, fps: Double? = nil, frames: Int? = nil,
         resolution: String? = nil, aspectRatio: String? = nil,
+        sequenceID: String? = nil, sequenceName: String? = nil, sequenceChunks: Int? = nil,
         rating: Int = 0, favorite: Bool = false
     ) {
         self.id = id; self.kind = kind
@@ -173,6 +181,12 @@ public struct CatalogAsset: Sendable, Equatable {
         self.stock = stock; self.genre = genre; self.family = family; self.style = style
         self.mode = mode; self.durationMs = durationMs; self.fps = fps; self.frames = frames
         self.resolution = resolution; self.aspectRatio = aspectRatio
+        // The sequence NAME is authored text (it carries the timeline's title),
+        // so it follows the same sealed rule as the prompts above; the id and
+        // chunk count are facets and stay.
+        self.sequenceID = sequenceID
+        self.sequenceName = sealed ? nil : sequenceName
+        self.sequenceChunks = sequenceChunks
         self.rating = rating; self.favorite = favorite
     }
 }
