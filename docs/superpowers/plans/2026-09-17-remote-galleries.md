@@ -127,13 +127,13 @@
 R1–R9 are implemented, tested and pushed on `feat/remote-galleries` (PR #472).
 761 desktop tests and the catalog suite pass.
 
+Closed after live use (#478, #480): the Remote tab is scoped to a picker of
+remotes with status, moved assets are labelled, send results and failure
+reasons appear on screen, Immich assets render via `ImmichThumbnailProtocol`,
+and the Immich request shape is corrected against the live server.
+
 Left for a follow-up:
-- **The Remote Gallery tab still renders the same view as Gallery.** Remote
-  assets now appear there because they appear everywhere; scoping that tab to
-  a picker of reachable remotes is cosmetic and untouched.
-- **Immich-hosted assets do not render thumbnails in the grid.** Immich needs
-  its API key as a request header, which SwiftUI's image loading cannot send.
-  They are hidden rather than shown broken. Browsing them belongs in Immich's
-  own UI until a small local proxy or a pre-fetched thumbnail cache is added.
 - **Bringing an asset back** from a remote (the reverse of a send).
-- **A live Immich send** needs Todd's API key and the album name (OQ-1).
+- **One unverified path:** an Immich send driven from the app UI. The HTTP shape
+  is curl-verified against the live server; a Swift test process cannot reach
+  the LAN ("Local network prohibited"), so only the signed app can do it.
