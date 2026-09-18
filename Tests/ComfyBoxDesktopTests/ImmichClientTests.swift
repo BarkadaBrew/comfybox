@@ -212,3 +212,22 @@ struct ImmichThumbnailProtocolTests {
         #expect(!ImmichThumbnailProtocol.canInit(with: URLRequest(url: other)))
     }
 }
+
+@Suite("ImmichThumbnailProtocol: full size")
+struct ImmichOriginalURLTests {
+
+    @Test("a download asks for the original, not the preview")
+    func originalURL() throws {
+        let preview = try #require(ImmichThumbnailProtocol.url(remoteID: "R1", immichAssetID: "A2"))
+        let original = try #require(ImmichThumbnailProtocol.originalURL(from: preview))
+        #expect(original.query == "size=original")
+        #expect(original.host == "R1")
+        #expect(original.path == "/A2")
+    }
+
+    @Test("a non-Immich URL is left alone")
+    func otherURLsUntouched() throws {
+        let engine = try #require(URL(string: "http://127.0.0.1:7870/v1/gallery/file?path=/x.png"))
+        #expect(ImmichThumbnailProtocol.originalURL(from: engine) == nil)
+    }
+}

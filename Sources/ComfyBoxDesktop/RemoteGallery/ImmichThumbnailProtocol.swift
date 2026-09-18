@@ -22,6 +22,14 @@ final class ImmichThumbnailProtocol: URLProtocol, @unchecked Sendable {
         URL(string: "\(scheme)://\(remoteID)/\(immichAssetID)?size=\(size)")
     }
 
+    /// The same asset at full size — what a download must use, since the grid's
+    /// URL is a rendered preview.
+    static func originalURL(from url: URL) -> URL? {
+        guard url.scheme == scheme, var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        parts.queryItems = [URLQueryItem(name: "size", value: "original")]
+        return parts.url
+    }
+
     /// Call once at startup.
     static func register() {
         URLProtocol.registerClass(ImmichThumbnailProtocol.self)
@@ -77,10 +85,15 @@ final class ImmichThumbnailProtocol: URLProtocol, @unchecked Sendable {
             .queryItems?.first(where: { $0.name == "size" })?.value ?? "preview"
 
         let remotes = await MainActor.run { DesktopSettings.load().remoteGalleries ?? [] }
+        // "original" is the full file (what a download needs); anything else is
+        // one of Immich's rendered thumbnails.
+        let endpoint = size == "original"
+            ? "/api/assets/\(immichAssetID)/original"
+            : "/api/assets/\(immichAssetID)/thumbnail?size=\(size)"
         guard let remote = remotes.first(where: { $0.id == remoteID }),
               let base = remote.normalizedBaseURL,
               let key = Keychain.get(remote.keychainAccount),
-              let target = URL(string: "\(base)/api/assets/\(immichAssetID)/thumbnail?size=\(size)")
+              let target = URL(string: base + endpoint)
         else { throw ProtocolError.notConfigured }
 
         var upstream = URLRequest(url: target)
