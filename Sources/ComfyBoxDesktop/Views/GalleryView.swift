@@ -51,6 +51,9 @@ struct GalleryView: View {
     var onSendToGenerate: ((DAMAsset) -> Void)?
     /// Send an image to the Motion tab as an image-to-video reference.
     var onAnimate: ((DAMAsset) -> Void)?
+    /// Only offered for a clip whose `.sequence.json` was indexed — the
+    /// timeline that made it (WP13).
+    var onOpenSequence: ((DAMAsset) -> Void)?
     /// Send an image to the Inpaint tab.
     var onInpaint: ((DAMAsset) -> Void)?
     /// Open an image in the Edit tab. Called with the asset and the LOCAL path
@@ -1053,6 +1056,9 @@ struct GalleryView: View {
                         }
                         if onSendToGenerate != nil {
                             Button("Send to Generate") { onSendToGenerate?(asset) }
+                        }
+                        if onOpenSequence != nil, asset.isSequence {
+                            Button("Open in Director") { onOpenSequence?(asset) }
                         }
                         if onAnimate != nil {
                             Button("Send to Motion (I2V)") { onAnimate?(asset) }

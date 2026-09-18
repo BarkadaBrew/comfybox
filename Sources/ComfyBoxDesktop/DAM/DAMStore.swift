@@ -127,6 +127,7 @@ public actor DAMStore {
             "prompt", "negative_prompt", "seed", "steps", "guidance",
             "model_family", "rating", "favorite", "content_mode",
             "character_name", "source",
+            "sequence_id", "sequence_name", "sequence_chunks",
         ]
         let setClause = ownedColumns.map { "\($0) = excluded.\($0)" }.joined(separator: ", ")
         let sql = """
@@ -134,12 +135,14 @@ public actor DAMStore {
                 id, kind, filename, absolute_path, file_size, sha256,
                 width, height, created_at, modified_at, ingested_at, orphaned,
                 prompt, negative_prompt, seed, steps, guidance,
-                model_family, rating, favorite, content_mode, character_name, source
+                model_family, rating, favorite, content_mode, character_name, source,
+                sequence_id, sequence_name, sequence_chunks
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10, ?11, ?12,
                 ?13, ?14, ?15, ?16, ?17,
-                ?18, ?19, ?20, ?21, ?22, ?23
+                ?18, ?19, ?20, ?21, ?22, ?23,
+                ?24, ?25, ?26
             )
             ON CONFLICT(id) DO UPDATE SET \(setClause), absolute_path = excluded.absolute_path
             ON CONFLICT(absolute_path) DO UPDATE SET \(setClause)
@@ -174,6 +177,9 @@ public actor DAMStore {
         bindOptionalText(stmt, 21, asset.contentMode)
         bindOptionalText(stmt, 22, asset.characterName)
         bindOptionalText(stmt, 23, asset.source)
+        bindOptionalText(stmt, 24, asset.sequenceID)
+        bindOptionalText(stmt, 25, asset.sequenceName)
+        bindOptionalInt(stmt, 26, asset.sequenceChunks)
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DAMStoreError.insertFailed(lastError)
@@ -506,7 +512,8 @@ public actor DAMStore {
             SELECT id, kind, filename, absolute_path, file_size, sha256,
                    width, height, created_at, modified_at, ingested_at, orphaned,
                    prompt, negative_prompt, seed, steps, guidance,
-                   model_family, rating, favorite, content_mode, character_name, source
+                   model_family, rating, favorite, content_mode, character_name, source,
+                   sequence_id, sequence_name, sequence_chunks
             FROM assets
             ORDER BY created_at DESC
             LIMIT ?1 OFFSET ?2
@@ -556,7 +563,8 @@ public actor DAMStore {
                 SELECT id, kind, filename, absolute_path, file_size, sha256,
                        width, height, created_at, modified_at, ingested_at, orphaned,
                        prompt, negative_prompt, seed, steps, guidance,
-                       model_family, rating, favorite, content_mode, character_name, source
+                       model_family, rating, favorite, content_mode, character_name, source,
+                   sequence_id, sequence_name, sequence_chunks
                 FROM assets
                 WHERE id IN (\(placeholders))
                 """
@@ -706,7 +714,8 @@ public actor DAMStore {
             SELECT a.id, a.kind, a.filename, a.absolute_path, a.file_size, a.sha256,
                    a.width, a.height, a.created_at, a.modified_at, a.ingested_at, a.orphaned,
                    a.prompt, a.negative_prompt, a.seed, a.steps, a.guidance,
-                   a.model_family, a.rating, a.favorite, a.content_mode, a.character_name, a.source
+                   a.model_family, a.rating, a.favorite, a.content_mode, a.character_name, a.source,
+                   a.sequence_id, a.sequence_name, a.sequence_chunks
             FROM assets_fts fts
             JOIN assets a ON a.id = fts.id
             WHERE assets_fts MATCH ?1
@@ -985,7 +994,8 @@ public actor DAMStore {
             SELECT id, kind, filename, absolute_path, file_size, sha256,
                    width, height, created_at, modified_at, ingested_at, orphaned,
                    prompt, negative_prompt, seed, steps, guidance,
-                   model_family, rating, favorite, content_mode, character_name, source
+                   model_family, rating, favorite, content_mode, character_name, source,
+                   sequence_id, sequence_name, sequence_chunks
             FROM assets
             WHERE absolute_path = ?1
             LIMIT 1
@@ -1081,6 +1091,13 @@ public actor DAMStore {
         // Migration: add `source` to pre-existing databases (idempotent — a
         // duplicate-column error on already-migrated DBs is ignored).
         _ = try? execute("ALTER TABLE assets ADD COLUMN source TEXT")
+        // Director sequences (WP13). The catalog service adds the same three
+        // columns in CatalogSchema.newColumns; both run against the ONE shared
+        // assets table, and both are idempotent, so whichever process opens the
+        // database first migrates it.
+        _ = try? execute("ALTER TABLE assets ADD COLUMN sequence_id TEXT")
+        _ = try? execute("ALTER TABLE assets ADD COLUMN sequence_name TEXT")
+        _ = try? execute("ALTER TABLE assets ADD COLUMN sequence_chunks INTEGER")
 
         try execute("CREATE INDEX IF NOT EXISTS idx_assets_created ON assets(created_at DESC)")
 
@@ -1175,7 +1192,10 @@ public actor DAMStore {
             favorite: sqlite3_column_int(stmt, 19) != 0,
             contentMode: columnText(stmt, 20),
             characterName: columnText(stmt, 21),
-            source: columnText(stmt, 22)
+            source: columnText(stmt, 22),
+            sequenceID: columnText(stmt, 23),
+            sequenceName: columnText(stmt, 24),
+            sequenceChunks: columnOptionalInt(stmt, 25)
         )
     }
 

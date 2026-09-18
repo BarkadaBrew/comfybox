@@ -86,6 +86,10 @@ public struct BackfillReport: Sendable, Equatable {
     /// resolve in production" would look from the outside — like success.
     public var edgesUnresolved = 0
     public var sidecarsRead = 0
+    /// Director renders whose `.sequence.json` was read. Counted separately
+    /// because a zero here with videos present means the sidecars are not
+    /// where this thinks they are — a silence the other counters cannot show.
+    public var sequencesRead = 0
     public var journalEntriesRead = 0
     public var skipped = 0
     /// Assets in NO collection at all, catalog-wide, after the sweep. A bounded
@@ -190,6 +194,13 @@ public enum CatalogBackfill {
                         sources.append(smeta)
                         break
                     }
+                }
+                // A Director render's sequence sidecar sits BESIDE the clip,
+                // not in the metadata mirror, so it is found by name rather
+                // than by the candidate walk above (WP13).
+                if kind == "video", let seq = MetadataReader.readSequence(forMedia: path) {
+                    report.sequencesRead += 1
+                    sources.append(seq)
                 }
                 // Embedded EXIF — images only, a container carries none.
                 if kind == "image", let embedded = MetadataReader.readEmbedded(path: path) {
@@ -530,6 +541,12 @@ public enum CatalogBackfill {
             frames: existing?.frames ?? meta.frames,
             resolution: existing?.resolution ?? meta.resolution,
             aspectRatio: existing?.aspectRatio ?? meta.aspectRatio,
+            // The sidecar wins over the stored row here, unlike the fields
+            // above: a sequence can be RE-rendered onto the same path, and the
+            // new sidecar is then the truth about what that clip now is.
+            sequenceID: meta.sequenceID ?? existing?.sequenceID,
+            sequenceName: meta.sequenceName ?? existing?.sequenceName,
+            sequenceChunks: meta.sequenceChunks ?? existing?.sequenceChunks,
             rating: existing?.rating ?? 0, favorite: existing?.favorite ?? false)
     }
 

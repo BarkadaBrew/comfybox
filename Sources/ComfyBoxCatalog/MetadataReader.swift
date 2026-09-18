@@ -65,6 +65,13 @@ public struct FileMetadata: Sendable, Equatable {
     /// Images recover this from `EXIF:Software`; video has no embedded
     /// metadata at all, so for video this is the ONLY source of `source`.
     public var provider: String?
+    /// A Director SEQUENCE sits beside the clip as `<base>.sequence.json`: the
+    /// timeline, chunk seeds and asset hashes that produced it. Present only
+    /// for Director renders, so it is also the flag that says "this mp4 can be
+    /// reopened and replayed" (FDD-ltx-director-tab §4.9.2, WP13).
+    public var sequenceID: String?
+    public var sequenceName: String?
+    public var sequenceChunks: Int?
 
     public init() {}
 }
@@ -241,6 +248,42 @@ public enum MetadataReader {
                 .appendingPathComponent((exact as NSString).lastPathComponent))
         }
         return out
+    }
+
+    // MARK: - Sequences (the Director sidecar)
+
+    /// `clip.mp4` -> `clip.sequence.json`, the same rule `SequenceSidecar.path`
+    /// applies in the engine. Spelled out here rather than imported: this
+    /// target has NO dependencies (see Package.swift), and taking one on
+    /// ZImage to read three fields would drag the whole model stack into the
+    /// catalog process.
+    public static let sequenceSidecarSuffix = ".sequence.json"
+
+    public static func sequenceSidecarPath(forMedia media: String) -> String {
+        (media as NSString).deletingPathExtension + sequenceSidecarSuffix
+    }
+
+    /// The three facts that make a sequence findable. A structural read: the
+    /// catalog does not need the timeline, and decoding one would couple this
+    /// to a schema that is still moving.
+    ///
+    /// Returns nil when there is no sidecar (an ordinary render) AND when there
+    /// is one it cannot parse — an unreadable sidecar must leave the clip
+    /// indexed as the plain video it still is, never fail the file.
+    public static func readSequence(forMedia media: String) -> FileMetadata? {
+        let path = sequenceSidecarPath(forMedia: media)
+        guard let data = FileManager.default.contents(atPath: path), !data.isEmpty,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        // `schema` pins it: a stray `.sequence.json` from something else must
+        // not be read as one of ours.
+        guard (root["schema"] as? String) == "comfybox.sequence" else { return nil }
+        guard let id = root["id"] as? String, !id.isEmpty else { return nil }
+        var meta = FileMetadata()
+        meta.sequenceID = id
+        meta.sequenceName = (root["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        meta.sequenceChunks = (root["chunks"] as? [Any])?.count
+        return meta
     }
 
     // MARK: - Journals (the third source)

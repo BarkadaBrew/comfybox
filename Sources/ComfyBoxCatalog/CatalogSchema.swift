@@ -58,6 +58,14 @@ public enum CatalogSchema {
         // addition, so a database migrated by an earlier build and a fresh one
         // end up with the same physical column order.
         ("prompt_injected", "TEXT"),
+        // A Director render's sequence sidecar (WP13). `sequence_id` non-null
+        // is what "this clip can be reopened in Director" means; the clip's
+        // `kind` stays "video", because it IS one — every play badge, lightbox
+        // branch, container probe and i2v edge keys off that and would silently
+        // stop working for Director renders if the kind were promoted instead.
+        ("sequence_id", "TEXT"),
+        ("sequence_name", "TEXT"),
+        ("sequence_chunks", "INTEGER"),
     ]
 
     /// The seeded bodies of work. Ids are stable literals so re-seeding is a

@@ -324,7 +324,8 @@ final class CatalogBackfillTests: XCTestCase {
             "family", "fps", "frames", "genre", "guidance", "height", "lane",
             "loras", "mode", "modelFamily", "negativePrompt", "preset", "prompt",
             "promptInjected", "promptRaw", "provider", "renderID", "resolution",
-            "sealed", "seed", "software", "sourceImagePath", "steps", "stock",
+            "sealed", "seed", "sequenceChunks", "sequenceID", "sequenceName",
+            "software", "sourceImagePath", "steps", "stock",
             "style", "theme", "width",
         ], """
         A field was added to or removed from FileMetadata. Map it in \

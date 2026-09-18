@@ -13,6 +13,10 @@ import ZImage
 
 struct DirectorView: View {
     @Bindable var engine: EngineService
+    /// A rendered clip handed over by the gallery's "Open in Director": its
+    /// sequence sidecar becomes the open timeline (WP13). Cleared once taken,
+    /// so returning to the tab does not reopen it over later edits.
+    var pendingSequenceClip: Binding<String?> = .constant(nil)
 
     @State private var model = DirectorDocumentModel(autosave: DirectorAutosaveStore())
     @State private var didAppear = false
@@ -70,6 +74,9 @@ struct DirectorView: View {
         }
         .navigationTitle(title)
         .background(shortcutButtons)
+        .onChange(of: pendingSequenceClip.wrappedValue) { _, clip in
+            takePendingSequence(clip)
+        }
         .onAppear {
             guard !didAppear else { return }
             didAppear = true
@@ -177,6 +184,24 @@ struct DirectorView: View {
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Take a clip handed over by the gallery. Unlike `openSequence()` this
+    /// arrives without a panel, so it must still refuse to discard unsaved
+    /// work — and it clears the handover either way, so a declined prompt is
+    /// not re-asked every time the tab reappears.
+    private func takePendingSequence(_ clip: String?) {
+        guard let clip, !clip.isEmpty else { return }
+        pendingSequenceClip.wrappedValue = nil
+        guard confirmDiscardIfDirty("Open") else { return }
+        let url = URL(fileURLWithPath: clip)
+        if let document = model.loadSequence(forMediaAt: url) {
+            errorMessage = nil
+            statusMessage = "Opened \(document.name) — \(document.chunks.count) chunk(s)"
+        } else {
+            errorMessage =
+                "No sequence beside \(url.lastPathComponent) — it was rendered before sequences, or the sidecar moved."
         }
     }
 
