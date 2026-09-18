@@ -37,7 +37,7 @@ final class MCPParityPhase1ToolTests: XCTestCase {
   /// Bumped 61 -> 70 by the Creative Library (PRD-creative-library L2): library_search, _get,
   /// _facets, _fill_template, _upsert, _mark_used, _delete, _collection_upsert, _collection_delete.
   func testTotalToolCountIncludesGapSet() {
-    XCTAssertEqual(MCPToolRegistry.tools.count, 72, "Expected 72 registered MCP tools after Phase 1 + Phase 3 + get_job + #273 + #447 + Director WP2c + the Creative Library")
+    XCTAssertEqual(MCPToolRegistry.tools.count, 75, "Expected 75 registered MCP tools after Phase 1 + Phase 3 + get_job + #273 + #447 + Director WP2c + the Creative Library")
   }
 
   /// Every tool added in this session declares its route(s) (FDD §3.5 D5:

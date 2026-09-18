@@ -62,6 +62,9 @@ public enum MCPToolRegistry {
     libraryCollectionDelete.annotated(.destructive),
     libraryImportPack.annotated(.additive),
     libraryImportStudioPacks.annotated(.additive),
+    listSequences.annotated(.readOnly),
+    readSequence.annotated(.readOnly),
+    checkSequence.annotated(.readOnly),
     importLegacyPresets.annotated(.additive),
     queueList.annotated(.readOnly),
     interruptRender.annotated(.destructive),
@@ -1169,6 +1172,49 @@ public enum MCPToolRegistry {
       "required": ["id"],
     ] as [String: Any],
     routes: [RouteRef(method: "DELETE", path: "/v1/library/collections/{id}")]
+  )
+
+  // MARK: - Sequences (FDD-ltx-director-tab §4.9.2)
+
+  static let listSequences = MCPToolDefinition(
+    name: "list_sequences",
+    description: """
+      List rendered Sequences — Director's saved product. Each one carries the timeline, the \
+      per-chunk seeds and the assets that made it, so it can be reopened or replayed.
+      """,
+    inputSchema: [
+      "type": "object",
+      "properties": ["limit": ["type": "integer"]] as [String: Any],
+    ] as [String: Any],
+    routes: [RouteRef(method: "GET", path: "/v1/sequences")]
+  )
+
+  static let readSequence = MCPToolDefinition(
+    name: "read_sequence",
+    description: """
+      Read the Sequence for a rendered video (pass the mp4 path or the .sequence.json path). \
+      Returns the timeline that made it, its chunks and seeds, and its assets.
+      """,
+    inputSchema: [
+      "type": "object",
+      "properties": ["path": ["type": "string"]] as [String: Any],
+      "required": ["path"],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/sequences/read")]
+  )
+
+  static let checkSequence = MCPToolDefinition(
+    name: "check_sequence",
+    description: """
+      What a replay of this Sequence would hit before spending GPU: missing or changed assets, \
+      recipe drift, a different engine build. Check before re-rendering someone's old clip.
+      """,
+    inputSchema: [
+      "type": "object",
+      "properties": ["path": ["type": "string"]] as [String: Any],
+      "required": ["path"],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/sequences/check")]
   )
 
   static let libraryImportPack = MCPToolDefinition(

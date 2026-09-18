@@ -2435,6 +2435,33 @@ public final class EngineService {
     // MARK: - Presets (/v1/presets — the server-side canonical store)
 
     /// Fetch the server preset list (bare snake_case array).
+    // MARK: - Creative Library (PRD-creative-library L4)
+
+    /// Raw GET against the engine's library routes. The library client owns
+    /// decoding; this owns only "are we connected" and the transport.
+    public func libraryGet(_ path: String) async throws -> Data {
+        guard let client = client, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+        let (status, data) = try await client.get(path)
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, "GET \(path)")
+        }
+        return data
+    }
+
+    @discardableResult
+    public func libraryPost(_ path: String, body: Data) async throws -> Data {
+        guard let client = client, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+        let (status, data) = try await client.post(path, body: body)
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, "POST \(path)")
+        }
+        return data
+    }
+
     public func fetchPresets() async -> [ServerPreset] {
         guard let client = client, connectionState.isConnected else { return [] }
         do {

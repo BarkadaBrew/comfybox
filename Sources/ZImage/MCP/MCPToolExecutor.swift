@@ -125,6 +125,15 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeLibraryMarkUsed(arguments)
       case "library_import_studio_packs":
         return try await executeLibraryImportStudioPacks(arguments)
+      case "list_sequences":
+        if let limit = arguments?.integer("limit") {
+          return try await executeGet("/v1/sequences?limit=\(limit)")
+        }
+        return try await executeGet("/v1/sequences")
+      case "read_sequence":
+        return try await executeSequencePath("/v1/sequences/read", arguments)
+      case "check_sequence":
+        return try await executeSequencePath("/v1/sequences/check", arguments)
       case "library_import_pack":
         return try await executeLibraryImportPack(arguments)
       case "library_delete":
@@ -1344,6 +1353,15 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
     let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
     let (status, data) = try await client.post("/v1/library/used/\(encoded)", body: Data("{}".utf8))
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  private func executeSequencePath(_ path: String, _ params: MCPParams?) async throws -> MCPToolResult {
+    guard let params, let target = params.string("path"), !target.isEmpty else {
+      return MCPToolResult(error: "Error: 'path' is required")
+    }
+    let body = try JSONEncoder().encode(["path": target])
+    let (status, data) = try await client.post(path, body: body)
     return Self.mapHTTPResponse(status: status, data: data)
   }
 

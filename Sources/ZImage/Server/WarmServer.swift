@@ -2027,6 +2027,19 @@ public final class WarmServer {
     case ("POST", "/v1/library/items"), ("PUT", "/v1/library/items"):
       return libraryUpsertResponse(body: request.body)
 
+    // MARK: - Sequences (FDD-ltx-director-tab §4.9.2, WP13)
+
+    case ("POST", "/v1/sequences/read"):
+      return Self.sequenceRead(body: request.body, allowedOutputDirectory: configuration.allowedOutputDirectory)
+
+    case ("POST", "/v1/sequences/check"):
+      return sequenceCheckResponse(body: request.body)
+
+    case ("GET", "/v1/sequences"):
+      return Self.sequenceList(
+        directory: (configuration.allowedOutputDirectory as NSString).expandingTildeInPath,
+        query: request.queryParameters)
+
     case ("POST", "/v1/library/import-studio-packs"):
       return libraryImportStudioPacksResponse(body: request.body)
 
@@ -5049,6 +5062,95 @@ public final class WarmServer {
     }
   }
 
+  // MARK: - Sequence routes
+
+  /// `POST /v1/sequences/read` — `{path}`: the sequence for a rendered file
+  /// (or a `.sequence.json` directly). This is what "drop the mp4 back on the
+  /// Director tab" calls.
+  static func sequenceRead(body: Data, allowedOutputDirectory: String) -> RoutedResponse {
+    struct ReadRequest: Decodable { let path: String }
+    guard let request = try? JSONDecoder().decode(ReadRequest.self, from: body) else {
+      return .error(.error(status: 400, message: "Invalid body: expected {\"path\": …}"))
+    }
+    let expanded = (request.path as NSString).expandingTildeInPath
+    let document = expanded.hasSuffix(SequenceDocument.sidecarSuffix)
+      ? SequenceSidecar.read(at: expanded)
+      : SequenceSidecar.read(forMediaAt: expanded)
+    guard let document else {
+      return .error(.error(
+        status: 404,
+        message: "No sequence sidecar for \(expanded) — it was rendered before sequences, or the sidecar moved"))
+    }
+    return .json(status: 200, payload: document)
+  }
+
+  /// `POST /v1/sequences/check` — `{path}`: what a replay would hit before it
+  /// spends the GPU (missing or changed assets, recipe drift, engine change).
+  private func sequenceCheckResponse(body: Data) -> RoutedResponse {
+    struct CheckRequest: Decodable { let path: String }
+    guard let request = try? JSONDecoder().decode(CheckRequest.self, from: body) else {
+      return .error(.error(status: 400, message: "Invalid body: expected {\"path\": …}"))
+    }
+    let expanded = (request.path as NSString).expandingTildeInPath
+    let document = expanded.hasSuffix(SequenceDocument.sidecarSuffix)
+      ? SequenceSidecar.read(at: expanded)
+      : SequenceSidecar.read(forMediaAt: expanded)
+    guard let document else {
+      return .error(.error(status: 404, message: "No sequence sidecar for \(expanded)"))
+    }
+    struct CheckResponse: Encodable {
+      let sequenceId: String
+      let check: SequenceSidecar.ReplayCheck
+      let ok: Bool
+      enum CodingKeys: String, CodingKey {
+        case sequenceId = "sequence_id"
+        case check, ok
+      }
+    }
+    let check = SequenceSidecar.check(
+      document,
+      currentRecipeHash: nil,
+      currentEngineBuild: BuildInfo.isKnown ? BuildInfo.gitSHA : nil)
+    return .json(
+      status: 200, payload: CheckResponse(sequenceId: document.id, check: check, ok: check.ok))
+  }
+
+  /// `GET /v1/sequences` — every sequence sidecar in the output directory,
+  /// newest first. `limit` caps the list (default 100).
+  static func sequenceList(directory: String, query: [String: String]) -> RoutedResponse {
+    struct Row: Encodable {
+      let id: String
+      let name: String
+      let createdAt: String
+      let path: String
+      let output: String?
+      let frames: Int?
+      let chunks: Int
+      enum CodingKeys: String, CodingKey {
+        case id, name, path, output, frames, chunks
+        case createdAt = "created_at"
+      }
+    }
+    let fm = FileManager.default
+    let names = (try? fm.contentsOfDirectory(atPath: directory)) ?? []
+    var rows: [(Date, Row)] = []
+    for name in names where name.hasSuffix(SequenceDocument.sidecarSuffix) {
+      let path = (directory as NSString).appendingPathComponent(name)
+      guard let document = SequenceSidecar.read(at: path) else { continue }
+      let mp4 = document.outputs.first { $0.kind == "mp4" }
+      rows.append((
+        document.createdAt,
+        Row(
+          id: document.id, name: document.name,
+          createdAt: SequenceDocument.iso.string(from: document.createdAt),
+          path: path, output: mp4?.path, frames: mp4?.frames,
+          chunks: document.chunks.count)))
+    }
+    let limit = query["limit"].flatMap(Int.init).map { min(max($0, 1), 500) } ?? 100
+    let sorted = rows.sorted { $0.0 > $1.0 }.prefix(limit).map(\.1)
+    return .json(status: 200, payload: Array(sorted))
+  }
+
   /// `POST /v1/library/import-studio-packs` — `{dry_run?}`. Migrates every
   /// installed Studio Pack into the Library (PRD L8): templates become
   /// templates, the prompt shape becomes a look, the settings become a recipe.
@@ -7175,6 +7277,39 @@ public final class WarmServer {
       stitchPath: stitch.path,
       audioSkippedChunks: audioSkippedChunks.isEmpty ? nil : audioSkippedChunks)
     VideoSidecar.write(record, forMediaAt: stitch.outputPath)
+
+    // The SEQUENCE sidecar (FDD §4.9.2, WP13): the generation record above
+    // describes the render; this describes the WORK, so the mp4 can be dropped
+    // back on the Director tab and reopen the timeline that made it.
+    let sequence = SequenceDocument(
+      id: session,
+      name: (resolvedOutput as NSString).deletingPathExtension.components(separatedBy: "/").last
+        ?? session,
+      source: source,
+      timeline: timeline,
+      chunks: compilation.chunks.enumerated().map { index, chunk in
+        SequenceChunkRecord(
+          index: index,
+          startFrame: chunk.span.startFrame,
+          frames: chunk.span.frames,
+          seed: index == 0 ? (firstChunk.generationRecord?.seed ?? UInt64(max(0, seed))) : nil,
+          recipeHash: index == 0 ? firstChunk.generationRecord?.recipeHash : nil)
+      },
+      assets: SequenceSidecar.assets(of: timeline),
+      outputs: [
+        SequenceOutput(
+          kind: "mp4", path: stitch.outputPath, frames: stitch.frameCount,
+          durationSeconds: stitch.durationSeconds)
+      ],
+      engine: SequenceEngineRecord(
+        buildSha: firstChunk.generationRecord?.engineBuild,
+        stitchPath: stitch.path,
+        toneMatch: !toneTransforms.isEmpty,
+        audioSource: audioSource))
+    if !SequenceSidecar.write(sequence, forMediaAt: stitch.outputPath) {
+      logger.warning("Director[\(session)]: could not write the sequence sidecar")
+    }
+
     auditLog.append(
       kind: "video.director",
       message: "\(n) chunk(s), \(stitch.frameCount)f @ \(fps) fps, audio \(audioSource) -> \(stitch.outputPath)",
