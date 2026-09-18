@@ -63,3 +63,14 @@ struct GalleryViewRemoteScopeTests {
         #expect(line.contains("local copies kept"))
     }
 }
+
+@Suite("GalleryView: a moved asset's thumbnail")
+@MainActor
+struct GalleryViewRemoteThumbnailTests {
+
+    @Test("the thumbnail travels with the asset, in the layout a send writes")
+    func remoteThumbnailPath() {
+        let path = GalleryView.remoteThumbnailPath(galleryRoot: "/Volumes/Vault/ComfyBoxGallery", assetID: "A1")
+        #expect(path == "/Volumes/Vault/ComfyBoxGallery/thumbnails/A1.jpg")
+    }
+}
