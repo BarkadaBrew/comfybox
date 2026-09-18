@@ -122,12 +122,22 @@ public enum DirectorMath {
   ///     145-frame chunks   1.92 (LTX voice), 1.73 (TTS voice)
   ///     273-frame chunks   1.03, 1.27, 1.30  (the 3 chunks of a 34 s take)
   ///
-  /// At 273 frames the conditioning stops distinguishing speech from silence
-  /// almost entirely — chunk 0's 1.03 is no response at all. The voice barely
-  /// matters (1.73 vs 1.92); the chunk length is the lever. So a timeline that
-  /// drives its video from audio chunks SHORTER, trading more seams (which the
-  /// tone-match + exact-last-frame work has made invisible) for a mouth that
-  /// actually follows the words.
+  /// CORRECTED 2026-09-18 05:40 after rendering the A/B this was supposed to
+  /// justify. The numbers above are all FIRST chunks — every one of those
+  /// measurements was a single-chunk render conditioning off a real keyframe —
+  /// and the generalisation to every chunk does not hold:
+  ///
+  ///     34 s take, same script/voice/keyframe/seed, only the chunking changed
+  ///     3 x 273 f:  chunk0 1.03 | continuation chunks pooled 1.31
+  ///     6 x 137 f:  chunk0 3.05 | continuation chunks pooled 1.10
+  ///
+  /// Shortening chunks transforms the FIRST chunk (1.03 -> 3.05) and does
+  /// nothing for the rest. Net it is still a clear win — whole-clip response
+  /// 1.20 -> 1.45, r 0.132 -> 0.195 — so the ceiling stays. But the honest
+  /// claim is narrower than "chunk length is the lever": a continuation chunk
+  /// conditions POORLY ON AUDIO AT ANY LENGTH, and why is the open question
+  /// (the carry-over frame is the obvious suspect, since it is the only thing
+  /// that distinguishes those chunks from the ones that score 1.7-3.0).
   public static let audioDrivenChunkFrames = 145
   public static var audioDrivenChunkSteps: Int { (audioDrivenChunkFrames - 1) / latentStride }
 
