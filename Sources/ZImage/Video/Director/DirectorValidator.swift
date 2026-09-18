@@ -76,15 +76,28 @@ public enum DirectorValidator {
     if length != requested {
       issues.append(.warning("length_snapped", "length_frames \(requested) snapped up to \(length) (1 + 8k)"))
     }
+    // An audio-driven timeline chunks shorter, which lowers how much timeline
+    // fits inside the 16-chunk budget.
+    let driven = timeline.isAudioDriven
+    let ceiling = driven ? DirectorMath.audioDrivenChunkFrames : DirectorMath.maxChunkFrames
+    let maxLength = 1 + DirectorMath.latentStride * ((ceiling - 1) / DirectorMath.latentStride)
+      * DirectorMath.maxChunks
     var lengthValid = true
     if length < DirectorMath.minTimelineFrames {
       lengthValid = false
       issues.append(.error("timeline_too_short", "timeline must be at least \(DirectorMath.minTimelineFrames) frames after snapping (got \(length))"))
-    } else if length > DirectorMath.maxTimelineFrames {
+    } else if length > maxLength {
       lengthValid = false
-      issues.append(.error("timeline_too_long", "timeline must be at most \(DirectorMath.maxTimelineFrames) frames (\(DirectorMath.maxChunks) chunks; got \(length))"))
+      // An audio-driven timeline chunks shorter (WP11), so it reaches the
+      // 16-chunk ceiling at a shorter DURATION. Say which limit was hit and
+      // why, rather than silently producing 17 chunks or truncating.
+      let because = driven
+        ? " (audio-driven timelines chunk at \(DirectorMath.audioDrivenChunkFrames) frames so the mouth follows the voice)"
+        : ""
+      issues.append(.error("timeline_too_long", "timeline must be at most \(maxLength) frames (\(DirectorMath.maxChunks) chunks; got \(length))\(because)"))
     }
-    let layout = lengthValid ? DirectorMath.chunkLayout(lengthFrames: length) : []
+    let layout = lengthValid
+      ? DirectorMath.chunkLayout(lengthFrames: length, maxFrames: ceiling) : []
 
     // MARK: Ids
 

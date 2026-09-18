@@ -50,7 +50,8 @@ public enum DirectorCompiler {
   /// per-chunk keyframes / prompt segment ids / beat schedule / audio flag,
   /// keyframe ticks, boundary frames and the validator's warnings.
   public static func plan(for snapped: DirectorTimeline, warnings: [DirectorIssue] = []) -> DirectorPlan {
-    let layout = DirectorMath.chunkLayout(lengthFrames: snapped.settings.lengthFrames)
+    let layout = DirectorMath.chunkLayout(
+      lengthFrames: snapped.settings.lengthFrames, maxFrames: snapped.chunkCeilingFrames)
     let generated = snapped.audio.mode == .generated
     let chunks = layout.map { span -> DirectorPlan.Chunk in
       let cond = conditioning(for: snapped, span: span)
@@ -90,7 +91,8 @@ public enum DirectorCompiler {
     }
     let settings = snapped.settings
     let generated = snapped.audio.mode == .generated
-    let layout = DirectorMath.chunkLayout(lengthFrames: settings.lengthFrames)
+    let layout = DirectorMath.chunkLayout(
+      lengthFrames: settings.lengthFrames, maxFrames: snapped.chunkCeilingFrames)
     precondition(layout.count == plan.chunks.count, "plan/layout chunk count mismatch")
 
     return layout.map { span in

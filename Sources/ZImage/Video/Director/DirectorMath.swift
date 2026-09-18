@@ -113,10 +113,31 @@ public enum DirectorMath {
   /// 8 * steps + 1 frames; start_{i+1} = start_i + frames_i - 1. The frames
   /// sum back to L. For n >= 2 every chunk is in [145, 289]; for n == 1 the
   /// single chunk is L.
-  public static func chunkLayout(lengthFrames: Int) -> [ChunkSpan] {
+  /// The ceiling for an AUDIO-DRIVEN timeline (WP11). Measured 2026-09-18 on
+  /// the same seed/keyframe/prompt, as the ratio of mouth motion during speech
+  /// to mouth motion during silence — "does the mouth go still when the voice
+  /// stops", which unlike a correlation does not depend on how much of the
+  /// track is speech:
+  ///
+  ///     145-frame chunks   1.92 (LTX voice), 1.73 (TTS voice)
+  ///     273-frame chunks   1.03, 1.27, 1.30  (the 3 chunks of a 34 s take)
+  ///
+  /// At 273 frames the conditioning stops distinguishing speech from silence
+  /// almost entirely — chunk 0's 1.03 is no response at all. The voice barely
+  /// matters (1.73 vs 1.92); the chunk length is the lever. So a timeline that
+  /// drives its video from audio chunks SHORTER, trading more seams (which the
+  /// tone-match + exact-last-frame work has made invisible) for a mouth that
+  /// actually follows the words.
+  public static let audioDrivenChunkFrames = 145
+  public static var audioDrivenChunkSteps: Int { (audioDrivenChunkFrames - 1) / latentStride }
+
+  public static func chunkLayout(
+    lengthFrames: Int, maxFrames: Int = maxChunkFrames
+  ) -> [ChunkSpan] {
     let length = max(9, lengthFrames)
+    let ceilingSteps = max(1, (max(9, maxFrames) - 1) / latentStride)
     let steps = (length - 1) / latentStride
-    let count = max(1, (steps + maxChunkSteps - 1) / maxChunkSteps)
+    let count = max(1, (steps + ceilingSteps - 1) / ceilingSteps)
     let base = steps / count
     let extra = steps % count
     var spans: [ChunkSpan] = []

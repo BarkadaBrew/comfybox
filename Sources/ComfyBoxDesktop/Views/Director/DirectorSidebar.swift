@@ -98,7 +98,9 @@ struct DirectorSidebar: View {
                         step: 0.5, fractionDigits: 2,
                         onEditingEnded: commitSeconds)
                     Text(String(format: "%d f = %.2f s · %d chunk(s)", model.lengthFrames, model.timelineSeconds,
-                                DirectorMath.chunkLayout(lengthFrames: model.lengthFrames).count))
+                                DirectorMath.chunkLayout(
+                                    lengthFrames: model.lengthFrames,
+                                    maxFrames: model.timeline.chunkCeilingFrames).count))
                         .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
 
