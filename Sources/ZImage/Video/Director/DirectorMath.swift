@@ -162,6 +162,75 @@ public enum DirectorMath {
     return spans
   }
 
+  /// Snap chunk boundaries into PAUSES in the voice (WP11's spec line
+  /// "pause-snapped chunk boundaries", root-caused 2026-09-18).
+  ///
+  /// Measured, one variable at a time, as the ratio of mouth motion during
+  /// speech to during silence:
+  ///
+  ///     photo keyframe       + audio@0    1.73
+  ///     photo keyframe       + audio@136  2.45   <- the offset is fine
+  ///     generated carry-over + audio@136  0.68
+  ///
+  /// A continuation chunk starts from the previous chunk's last frame. When a
+  /// boundary lands mid-word that frame holds an OPEN mouth, and the pose
+  /// fights the voice for the rest of the chunk — pin strength makes no
+  /// difference (1.0 -> 0.68, 0.7 -> 0.70), so it is not how hard we pin but
+  /// WHAT we pin to. Land the boundary in a pause and the carry-over catches a
+  /// closed mouth: the photo-like condition that scored 2.45.
+  ///
+  /// Only multiples of 8 are reachable — every chunk is 1 + 8k and
+  /// `start_{i+1} = start_i + 8 * steps_i` — so a boundary moves to the
+  /// nearest quiet multiple of 8 that keeps BOTH neighbours legal. A boundary
+  /// with no quiet frame in reach stays where it was: a worse seam is better
+  /// than an illegal chunk, and `isQuiet` returning false everywhere must
+  /// reproduce `chunkLayout` exactly.
+  public static func pauseSnapped(
+    _ layout: [ChunkSpan], lengthFrames: Int, maxFrames: Int,
+    searchFrames: Int = 24, isQuiet: (Int) -> Bool
+  ) -> [ChunkSpan] {
+    guard layout.count > 1 else { return layout }
+    let minFrames = min(1 + latentStride, maxFrames)
+    // The interior boundaries: the END frame of every chunk but the last,
+    // which is also the START frame of its successor. Frame 0 and the final
+    // frame are fixed by the timeline and never appear here.
+    let boundaries = layout.dropLast().map { $0.startFrame + $0.frames - 1 }
+    var moved: [Int] = []
+    var previous = 0
+    for (index, nominal) in boundaries.enumerated() {
+      let nextFixed = index + 1 < boundaries.count ? boundaries[index + 1] : lengthFrames - 1
+      var best: Int? = nil
+      var bestDistance = Int.max
+      // Walk outward from the nominal boundary so ties prefer the smaller move.
+      for delta in stride(from: 0, through: searchFrames, by: latentStride) {
+        for candidate in (delta == 0 ? [nominal] : [nominal - delta, nominal + delta]) {
+          guard candidate > previous, candidate < lengthFrames - 1,
+                (candidate - previous) % latentStride == 0,
+                candidate - previous + 1 >= minFrames,
+                candidate - previous + 1 <= maxFrames,
+                nextFixed - candidate + 1 <= maxFrames,
+                nextFixed - candidate + 1 >= minFrames,
+                isQuiet(candidate)
+          else { continue }
+          let distance = abs(candidate - nominal)
+          if distance < bestDistance { best = candidate; bestDistance = distance }
+        }
+        if best != nil { break }
+      }
+      let chosen = best ?? nominal
+      moved.append(chosen)
+      previous = chosen
+    }
+    // Rebuild spans from the (possibly moved) boundaries.
+    var spans: [ChunkSpan] = []
+    var start = 0
+    for (index, boundary) in (moved + [lengthFrames - 1]).enumerated() {
+      spans.append(ChunkSpan(index: index, startFrame: start, frames: boundary - start + 1))
+      start = boundary
+    }
+    return spans
+  }
+
   /// Chunk-local frame index (frame 0 of chunk k is global start_k).
   public static func localFrame(global: Int, chunk: ChunkSpan) -> Int {
     global - chunk.startFrame

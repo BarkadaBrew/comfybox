@@ -2041,6 +2041,16 @@ public final class LTX2Pipeline {
       let velocityPos: MLXArray
       var avVelocityPos: MLXArray? = nil
       var avVelocityNeg: MLXArray? = nil
+      // Audio-driven (WP11): when the voice is GIVEN, the audio the video
+      // attends to is CLEAN — `av.audioLatents` is re-snapped to the
+      // conditioning after every step, so callAV always receives sigma-0
+      // audio. Telling it `audioSigma: sigma` anyway is a lie the gate
+      // believes: `avCaA2vGateAdaLN` — the a2v gate applied ON THE VIDEO
+      // STREAM — is driven by the AUDIO sigma (see prepareAVConditioning's
+      // doc comment), so for most of the schedule the model discounts a clean
+      // voice as if it were noise, exactly while the video's structure is
+      // being decided.
+      let aSigma: Float = avState?.conditioning != nil ? 0 : sigma
       if let av = avState {
         // Joint A/V pass (task #21): both velocities in one forward. NAG
         // patches the video text cross-attention inside this positive pass;
@@ -2053,7 +2063,7 @@ public final class LTX2Pipeline {
           audioLatents: av.audioLatents.asType(dtype),
           timestep: timesteps,
           videoSigmaMax: sigma,
-          audioSigma: sigma,
+          audioSigma: aSigma,
           context: textEmbeddings.asType(dtype),
           audioContext: av.audioContext.asType(dtype),
           nagContext: nagEmbeddings?.asType(dtype),
@@ -2107,7 +2117,7 @@ public final class LTX2Pipeline {
             audioLatents: av.audioLatents.asType(dtype),
             timestep: timesteps,
             videoSigmaMax: sigma,
-            audioSigma: sigma,
+            audioSigma: aSigma,
             context: negEmb.asType(dtype),
             audioContext: negACtx.asType(dtype),
             sigma: sigmaArray,
