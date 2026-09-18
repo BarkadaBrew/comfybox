@@ -2483,6 +2483,14 @@ public final class WarmServer {
     /// Generate synchronized audio (task #21). T2V single-chunk only in v1;
     /// first audio render reloads the transformer with the audio branch.
     let audio: Bool?
+    /// AUDIO-DRIVEN (FDD §4.7, WP11): a voice track this render must follow.
+    /// The engine slices this chunk's span, encodes it, and holds it fixed
+    /// while the video denoises, so the mouth follows real words instead of
+    /// inventing speech. Requires `audio: true`. Absent is today's behaviour.
+    let audioConditionPath: String?
+    /// Where this chunk starts inside that track, in output frames — how a
+    /// multi-chunk sequence gives each chunk its own slice of one voice.
+    let audioConditionStartFrame: Int?
     /// Suppress the manual character prepend when the CALLER has already woven
     /// the description into the prompt (Todd 2026-08-07). Mirrors the image
     /// path's `skip_character_injection`, which the video path never had.
@@ -3241,6 +3249,8 @@ public final class WarmServer {
       presetTuning: videoPreset?.videoTuning,
       resolvedConfigSnapshot: resolvedConfigSnapshot,
       audio: req.audio ?? false,
+      audioConditionPath: req.audioConditionPath,
+      audioConditionStartFrame: req.audioConditionStartFrame ?? 0,
       beatSchedule: effectiveBeatSchedule,
       // comfybox#401 (review round 2, ruling 1): carried through only for
       // the generation record — same values (and same absence-means-unset

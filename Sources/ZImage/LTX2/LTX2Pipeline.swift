@@ -41,6 +41,22 @@ public typealias LTX2AVPEs = (
 /// different (joint) model than video-only — by design.
 final class LTX2AVDenoiseState {
   var audioLatents: MLXArray  // (B, 8, Ta, 16) float32
+  /// Trim or zero-pad an audio latent to a chunk's frame count, so a slice of
+  /// the wrong length cannot silently shift the voice against the picture.
+  static func fit(_ latents: MLXArray, toFrames frames: Int) -> MLXArray {
+    let have = latents.dim(2)
+    if have == frames { return latents }
+    if have > frames { return latents[0..., 0..., 0..<frames, 0...] }
+    let padding = MLX.zeros(
+      [latents.dim(0), latents.dim(1), frames - have, latents.dim(3)], dtype: latents.dtype)
+    return MLX.concatenated([latents, padding], axis: 2)
+  }
+
+  /// A CLEAN audio latent the render must follow rather than invent
+  /// (FDD §4.7, WP11: audio-driven chunks). When present it is re-snapped
+  /// after every step, so the audio stream never drifts off the voice and the
+  /// video's a2v cross-attention reads real speech.
+  var conditioning: MLXArray? = nil
   let audioContext: MLXArray  // (B, S, 2048)
   /// Negative audio embeddings (task #26): when present, the CFG/CFG++
   /// negative pass runs dual-stream and the audio step is guided.
@@ -344,6 +360,9 @@ public final class LTX2Pipeline {
     negativeInputIds: MLXArray? = nil,
     negativeAttentionMask: MLXArray? = nil,
     audioSeconds: Float? = nil,
+    /// A CLEAN audio latent (B, 8, Ta, 16) the render must follow instead of
+    /// inventing sound: audio-driven chunks (FDD §4.7, WP11).
+    audioConditioning: MLXArray? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) throws -> LTX2PipelineOutput {
     try nonPreemptible("generateT2V") {
@@ -352,7 +371,8 @@ public final class LTX2Pipeline {
         width: width, height: height, numFrames: numFrames, steps: steps,
         seed: seed, guidance: guidance,
         negativeInputIds: negativeInputIds, negativeAttentionMask: negativeAttentionMask,
-        audioSeconds: audioSeconds, progressCallback: progressCallback)
+        audioSeconds: audioSeconds, audioConditioning: audioConditioning,
+        progressCallback: progressCallback)
     }
   }
 
@@ -370,6 +390,7 @@ public final class LTX2Pipeline {
     negativeInputIds: MLXArray? = nil,
     negativeAttentionMask: MLXArray? = nil,
     audioSeconds: Float? = nil,
+    audioConditioning: MLXArray? = nil,
     preemption: PreemptionSignal? = nil,
     telemetry: LTX2PhaseTelemetry? = nil,
     resume: LTX2ResumeState? = nil,
@@ -501,6 +522,16 @@ public final class LTX2Pipeline {
         pe: avPE,
         negativeAudioContext: negativeAudioEmbeddings,
         audioNoiseKey: seed.map { MLXRandom.key($0 &+ 0xA0D12) })
+      // Audio-driven (WP11): start FROM the voice and stay there. The latent
+      // is trimmed or zero-padded to this chunk's length, so a caller cannot
+      // desynchronise the stream by handing over a slice of the wrong size.
+      if let given = audioConditioning {
+        let clean = LTX2AVDenoiseState.fit(given, toFrames: ta)
+        avState?.conditioning = clean
+        avState?.audioLatents = clean
+        logger.info(
+          "Audio-driven: conditioning on \(clean.dim(2)) audio latent frame(s) — the voice is given, not generated.")
+      }
       logger.info("Audio stream enabled: \(ta) latent frames (\(seconds)s, negatives \(negativeAudioEmbeddings != nil ? "on" : "off")).")
     }
 
@@ -2208,6 +2239,9 @@ public final class LTX2Pipeline {
           sigma: sigma, sigmaNext: sigmaNext, cfgScale: min(cfgAt(i), audioCfg),
           useCfgPP: useCfgPP, useSDE: useSDE && !forceDeterministic,
           ancestralNoise: aNoise)
+        // Audio-driven: the voice is GIVEN, so re-snap to it after the step.
+        // (The step still runs: its velocity is what the video attends to.)
+        if let clean = av.conditioning { av.audioLatents = clean }
         eval(av.audioLatents)
       }
       // CFG++ steps along the uncond direction, which drifts frames the denoise

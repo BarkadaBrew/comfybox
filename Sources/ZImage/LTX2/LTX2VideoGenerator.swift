@@ -105,6 +105,14 @@ public struct LTX2VideoRequest: Sendable {
     /// Generate synchronized audio (task #21). T2V single-chunk only in v1;
     /// loads the audio branch (+~11GiB) into the transformer on first use.
     public var audio: Bool
+    /// AUDIO-DRIVEN (FDD §4.7, WP11): a voice track this chunk must follow
+    /// rather than invent sound for. The engine decodes it, slices this
+    /// chunk's span, encodes it through the audio VAE and holds that latent
+    /// fixed while the video denoises, so the mouth follows real words.
+    /// Requires `audio` to be true. Nil is today's behaviour exactly.
+    public var audioConditionPath: String?
+    /// Where this chunk starts inside that track, in output frames.
+    public var audioConditionStartFrame: Int = 0
     /// Temporal beat scheduling (comfybox#310): structured multi-beat
     /// content, carried as its own top-level field rather than a `tuning`
     /// key — tuning entries are scalar render knobs, this is structured
@@ -182,6 +190,8 @@ public struct LTX2VideoRequest: Sendable {
         resolvedConfigSnapshot: LTX2ResolvedVideoConfig? = nil,
         recipeHash: String? = nil,
         audio: Bool = false,
+        audioConditionPath: String? = nil,
+        audioConditionStartFrame: Int = 0,
         beatSchedule: [BeatSegment]? = nil,
         source: String? = nil,
         contentMode: String? = nil,
@@ -192,6 +202,8 @@ public struct LTX2VideoRequest: Sendable {
     ) {
         self.keyframes = keyframes
         self.audio = audio
+        self.audioConditionPath = audioConditionPath
+        self.audioConditionStartFrame = audioConditionStartFrame
         self.beatSchedule = beatSchedule
         self.source = source
         self.contentMode = contentMode
@@ -449,6 +461,8 @@ public final class LTX2VideoGenerator {
     /// Audio codec (VAE + vocoder), lazily bound from the monolith on the
     /// first audio render; cheap (mmap subset) and kept for the process life.
     private var audioVAE: LTX2AudioVAE?
+    /// waveform -> mel, loaded from the checkpoint's own analysis basis.
+    private var melAnalysis: LTX2MelAnalysis?
 
     /// #1479: raised by the coordinator to ask the in-flight render to
     /// check point and unwind. Read (never written) inside the render, with no
@@ -499,6 +513,62 @@ public final class LTX2VideoGenerator {
     /// deliberately insufficient: production historically carried a stale
     /// `LTX2_VOCODER_PATH` that silently displaced the monolith's matched
     /// BigVGAN+BWE. Both variables make the mismatch an explicit experiment.
+    /// AUDIO-DRIVEN (FDD §4.7, WP11): decode the voice track, take THIS
+    /// chunk's span, and encode it to the audio latent the render must follow.
+    ///
+    /// Everything that can go wrong returns nil and logs, because a missing or
+    /// unreadable voice track must degrade to generated audio rather than fail
+    /// a render that is otherwise fine.
+    func audioConditioningLatents(for request: LTX2VideoRequest) -> MLXArray? {
+        guard let path = request.audioConditionPath, !path.isEmpty else { return nil }
+        do {
+            if audioVAE == nil {
+                audioVAE = try LTX2AudioVAE.load(path: resolveWeightsFileURL().path, logger: logger)
+            }
+            guard let vae = audioVAE else { return nil }
+            if melAnalysis == nil {
+                let tensors = try MLX.loadArrays(url: resolveWeightsFileURL())
+                melAnalysis = LTX2MelAnalysis.load(weights: tensors, logger: logger)
+            }
+            guard let mel = melAnalysis else { return nil }
+
+            let pcm = try DirectorAudioIngest.decode(
+                path: path, sampleRate: LTX2MelAnalysis.sampleRate)
+            // This chunk's span of the track, in 16 kHz samples.
+            let secondsPerFrame = 1.0 / Double(max(request.fps, 1))
+            let start = Int(
+                Double(request.audioConditionStartFrame) * secondsPerFrame
+                    * Double(LTX2MelAnalysis.sampleRate))
+            let length = Int(
+                Double(request.framesPerChunk) * secondsPerFrame
+                    * Double(LTX2MelAnalysis.sampleRate))
+            guard start < pcm.frames else {
+                logger.warning(
+                    "LTX-2 audio-driven: chunk starts at \(start) samples but the track is only \(pcm.frames) — falling back to generated audio")
+                return nil
+            }
+            let end = min(pcm.frames, start + length)
+            var left = Array(pcm.left[start..<end])
+            var right = Array(pcm.right[start..<end])
+            // A short tail is silence, not a shorter clip: the latent must span
+            // the chunk or the voice drifts against the picture.
+            if left.count < length {
+                left += [Float](repeating: 0, count: length - left.count)
+                right += [Float](repeating: 0, count: length - right.count)
+            }
+            let waveform = MLXArray(left + right, [2, length])
+            let latents = vae.encode(mel.mel(waveform: waveform))
+            eval(latents)
+            logger.info(
+                "LTX-2 audio-driven: conditioning on \(path) from frame \(request.audioConditionStartFrame) (\(latents.dim(2)) audio latent frames).")
+            return latents
+        } catch {
+            logger.warning(
+                "LTX-2 audio-driven: could not build audio conditioning from \(path) — \(error.localizedDescription); falling back to generated audio")
+            return nil
+        }
+    }
+
     public static func externalVocoderOverridePath(
         environment: [String: String]
     ) -> String? {
@@ -1815,6 +1885,8 @@ public final class LTX2VideoGenerator {
                     negativeAttentionMask: negBatch?.attentionMask,
                     audioSeconds: wantAudio && chunk == 0
                         ? Float(request.framesPerChunk) / Float(request.fps) : nil,
+                    audioConditioning: wantAudio && chunk == 0
+                        ? audioConditioningLatents(for: request) : nil,
                     preemption: preemption, telemetry: telemetry,
                     resume: chunkResume, chunkIndex: chunk,
                     beatSchedule: resolvedBeats,
