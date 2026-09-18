@@ -49,8 +49,16 @@ public enum DirectorCompiler {
   /// The full plan for a snapped timeline: chunk spans, seeds, carry-over,
   /// per-chunk keyframes / prompt segment ids / beat schedule / audio flag,
   /// keyframe ticks, boundary frames and the validator's warnings.
-  public static func plan(for snapped: DirectorTimeline, warnings: [DirectorIssue] = []) -> DirectorPlan {
-    let layout = DirectorMath.chunkLayout(
+  /// `layout` lets the VALIDATOR hand in boundaries it already moved into
+  /// pauses (WP11) — it is the only caller that can read the voice. Omitted,
+  /// the layout is the plain arithmetic one, which is what a caller with no
+  /// audio access should get.
+  public static func plan(
+    for snapped: DirectorTimeline, warnings: [DirectorIssue] = [],
+    layout providedLayout: [DirectorMath.ChunkSpan]? = nil,
+    joinsInPauses: Bool = false
+  ) -> DirectorPlan {
+    let layout = providedLayout ?? DirectorMath.chunkLayout(
       lengthFrames: snapped.settings.lengthFrames, maxFrames: snapped.chunkCeilingFrames)
     let generated = snapped.audio.mode == .generated
     let chunks = layout.map { span -> DirectorPlan.Chunk in
@@ -72,6 +80,7 @@ public enum DirectorCompiler {
       chunks: chunks,
       keyframeTicks: placedKeyframes(snapped).map { .init(id: $0.id, frame: $0.frame) },
       boundaryFrames: layout.dropFirst().map(\.startFrame),
+      joinsInPauses: joinsInPauses,
       warnings: warnings.filter { $0.severity == .warning })
   }
 
@@ -91,9 +100,14 @@ public enum DirectorCompiler {
     }
     let settings = snapped.settings
     let generated = snapped.audio.mode == .generated
-    let layout = DirectorMath.chunkLayout(
-      lengthFrames: settings.lengthFrames, maxFrames: snapped.chunkCeilingFrames)
-    precondition(layout.count == plan.chunks.count, "plan/layout chunk count mismatch")
+    // The PLAN owns the spans. Recomputing them would silently discard
+    // boundaries moved into pauses (WP11): the plan would describe one set of
+    // joins and the rendered bodies another, a disagreement that shows up
+    // only as a bad clip.
+    let layout = plan.chunks.map {
+      DirectorMath.ChunkSpan(index: $0.index, startFrame: $0.startFrame, frames: $0.frames)
+    }
+    precondition(!layout.isEmpty, "a plan must carry at least one chunk")
 
     return layout.map { span in
       let cond = conditioning(for: snapped, span: span)

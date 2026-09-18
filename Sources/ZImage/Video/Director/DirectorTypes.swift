@@ -539,11 +539,19 @@ public struct DirectorPlan: Codable, Sendable, Equatable {
   public var keyframeTicks: [KeyframeTick]
   /// start_k for k > 0 (desktop overlay ticks).
   public var boundaryFrames: [Int]
+  /// WP11: true when the joins above were moved so a PAUSE in the voice spans
+  /// them. Reported rather than silent — moving a boundary changes where the
+  /// seams fall, and that should not have to be inferred by diffing two plans.
+  /// False for a timeline that does not drive its video from audio, and for a
+  /// voice whose audio could not be read.
+  public var joinsInPauses: Bool
+
   public var warnings: [DirectorIssue]
 
   public init(
     lengthFrames: Int, fps: Int, width: Int, height: Int, audioMode: String,
     chunks: [Chunk], keyframeTicks: [KeyframeTick], boundaryFrames: [Int],
+    joinsInPauses: Bool = false,
     warnings: [DirectorIssue]
   ) {
     self.lengthFrames = lengthFrames
@@ -554,6 +562,7 @@ public struct DirectorPlan: Codable, Sendable, Equatable {
     self.chunks = chunks
     self.keyframeTicks = keyframeTicks
     self.boundaryFrames = boundaryFrames
+    self.joinsInPauses = joinsInPauses
     self.warnings = warnings
   }
 }
