@@ -4414,8 +4414,21 @@ public final class WarmServer {
         if let last = lifecycleLedger.lastEvent(jobId: job.id), let dict = Self.lifecycleEventDict(last) {
           entry["last_event"] = dict
         }
+        // WP23: what lane this is in, and whether it is waiting for its time.
+        entry["lane"] = job.schedule.lane.rawValue
+        if let hold = job.schedule.holdUntil {
+          entry["hold_until"] = iso.string(from: hold)
+          entry["held"] = hold > Date()
+          entry["spill"] = job.schedule.spill.rawValue
+        }
         return entry
       },
+    ]
+    let window = ServerConfigStore.shared.current().config.batchWindow ?? BatchWindow()
+    payload["batch_window"] = [
+      "start": window.start, "end": window.end, "time_zone": window.timeZone,
+      "open": window.isOpen(at: Date()),
+      "chunks_per_night": QueueLaneScheduler.chunksPerNight(window: window),
     ]
     if let id = snap.activeJobId { payload["active_job_id"] = id }
     if let summary = snap.activeSummary { payload["active_summary"] = summary }
@@ -6759,12 +6772,42 @@ public final class WarmServer {
   /// `version > 1` surfaces as `DirectorError.unsupportedVersion` (400).
   struct DirectorPayload: Decodable {
     let timeline: DirectorTimeline
+    /// Lane + disposition (WP23). A multi-chunk sequence defaults to BATCH, so
+    /// it fills idle GPU instead of blocking an image someone is waiting for;
+    /// a single-chunk clip stays interactive. `disposition` is now | tonight |
+    /// at (with `hold_until`), and `spill` is wait | idle | strict.
+    let lane: String?
+    let disposition: String?
+    /// ISO-8601. A `Date` here would decode as a number under the wire
+    /// decoder's default strategy, so the text is parsed where it is used.
+    let holdUntil: String?
+    let spill: String?
     /// Output .mp4 name or absolute path; resolved under
     /// `allowedOutputDirectory` at SUBMIT (a bad path is a 400, never a
     /// failure after a 30-minute render). Default `director-<session>.mp4`.
     let outputPath: String?
     /// Queue attribution; default "api".
     let source: String?
+  }
+
+  /// The schedule a Director submit asks for. Defaults: a timeline that
+  /// compiles to more than one chunk is batch work; one chunk is interactive.
+  static func directorSchedule(
+    payload: DirectorPayload, chunkCount: Int, window: BatchWindow, now: Date = Date()
+  ) -> QueueSchedule {
+    let lane: QueueLane = {
+      if let raw = payload.lane, let parsed = QueueLane(rawValue: raw.lowercased()) { return parsed }
+      return chunkCount > 1 ? .batch : .interactive
+    }()
+    let requestedHold = payload.holdUntil.flatMap { ISO8601DateFormatter().date(from: $0) }
+    let disposition = QueueDisposition(
+      raw: payload.disposition ?? "now", holdUntil: requestedHold) ?? .now
+    let spill = payload.spill.flatMap { QueueSpill(rawValue: $0.lowercased()) } ?? .wait
+    return QueueSchedule(
+      lane: lane,
+      holdUntil: QueueSchedule.resolve(
+        lane: lane, disposition: disposition, window: window, now: now),
+      spill: spill)
   }
 
   /// 200 body of /validate. `plan` is encoded as an explicit `null` when the
@@ -7137,6 +7180,10 @@ public final class WarmServer {
       }
 
       let n = compilation.chunks.count
+      // WP23: which lane this runs in, and whether it waits for tonight.
+      let schedule = Self.directorSchedule(
+        payload: payload, chunkCount: n,
+        window: ServerConfigStore.shared.current().config.batchWindow ?? BatchWindow())
       let planJSON = String(decoding: try DirectorJSON.encoder(pretty: false).encode(compilation.plan), as: UTF8.self)
       let assets = materialized
       logger.info("Director[\(session)]: accepted \(n) chunk(s), \(timeline.settings.lengthFrames)f @ \(fps) fps, audio \(timeline.audio.mode.rawValue) -> \(resolvedOutput)")
@@ -7153,7 +7200,7 @@ public final class WarmServer {
         return try await self.runDirector(
           compilation: compilation, timeline: timeline, session: session, source: source,
           resolvedOutput: resolvedOutput, materializedAssets: assets,
-          admittedRecipeHash: first.recipeHash, jobId: jobId, report: report)
+          admittedRecipeHash: first.recipeHash, jobId: jobId, schedule: schedule, report: report)
       }
       let encoder = JSONEncoder()
       encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -7206,6 +7253,7 @@ public final class WarmServer {
     materializedAssets: [String],
     admittedRecipeHash: String,
     jobId: String,
+    schedule: QueueSchedule = QueueSchedule(),
     report: @escaping @Sendable (Int) -> Void
   ) async throws -> LTX2VideoResult {
     let started = Date()
@@ -7280,7 +7328,8 @@ public final class WarmServer {
         // and interrupt-by-id then resolve this job — harmless for a
         // non-preemptible render (the coordinator only marks pause/resume
         // for a render that yields).
-        result = try await coordinator.enqueueLocalVideo(wantsAudio: chunk.wantsAudio, videoJobId: jobId) { coordReport in
+        result = try await coordinator.enqueueLocalVideo(
+          wantsAudio: chunk.wantsAudio, videoJobId: jobId, schedule: schedule) { coordReport in
           .completed(try prep.generator.generate(prep.request) { c, totalChunks, step, totalSteps in
             let pct = Self.localVideoProgressPercent(
               chunk: c, totalChunks: totalChunks, step: step, totalSteps: totalSteps)
@@ -10539,9 +10588,14 @@ private actor WarmServerCoordinator {
     /// in-memory state; controlGenerate closes over resolved temp files;
     /// shutdown never needs recovery).
     var rawBody: Data? = nil
+    /// Lane + hold-until (FDD §4.10.9, WP23). The default is interactive and
+    /// unheld, so every existing submit behaves exactly as before.
+    var schedule: QueueSchedule = QueueSchedule()
   }
 
   private var pending: [PendingJob] = []
+  /// Wakes the loop when the earliest held (batch, `tonight`) job comes due.
+  private var heldWakeTask: Task<Void, Never>?
   /// Human-readable summary of the operation the loop is currently running.
   private var activeJobSummary: String?
   /// Source/app of the currently-running job.
@@ -12257,6 +12311,7 @@ private actor WarmServerCoordinator {
   func enqueueLocalVideo(
     wantsAudio: Bool = false,
     videoJobId: String? = nil,
+    schedule: QueueSchedule = QueueSchedule(),
     _ body: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2RenderOutcome
   ) async throws -> LTX2VideoResult {
     if shuttingDown {
@@ -12272,7 +12327,9 @@ private actor WarmServerCoordinator {
       lifecycleCompletionHandler(jobId: resolvedId, jobKind: QueueJobKind.video.rawValue, source: "api", enqueuedAt: enqueuedAt)
     return try await withCheckedThrowingContinuation { continuation in
       let newJob = PendingJob(
-        id: resolvedId, operation: .localVideo(body, ContinuationBox(continuation, onResume: onResume), wantsAudio: wantsAudio, videoJobId: videoJobId))
+        id: resolvedId,
+        operation: .localVideo(body, ContinuationBox(continuation, onResume: onResume), wantsAudio: wantsAudio, videoJobId: videoJobId),
+        schedule: schedule)
       pending.append(newJob)
       // comfybox#283: `videoJobId` (the id `/v1/video/status/{id}` uses) can
       // differ from `newJob.id` (the id `/v1/queue` uses) — pre-existing, not
@@ -12409,7 +12466,8 @@ private actor WarmServerCoordinator {
           kind: Self.kind(of: job.operation),
           summary: Self.describe(job.operation),
           source: job.source,
-          enqueuedAt: job.enqueuedAt
+          enqueuedAt: job.enqueuedAt,
+          schedule: job.schedule
         )
       },
       maxPending: configuration.maxPendingRequests
@@ -12597,6 +12655,9 @@ private actor WarmServerCoordinator {
     let summary: String
     let source: String
     let enqueuedAt: Date
+    /// Lane + hold-until (WP23). Interactive and unheld unless a submit said
+    /// otherwise, so every existing reader sees what it saw before.
+    var schedule: QueueSchedule = QueueSchedule()
   }
 
   // MARK: - Queue controls (pause / resume / reorder)
@@ -12840,6 +12901,28 @@ private actor WarmServerCoordinator {
     }
   }
 
+  /// Wake the loop when the earliest held job comes due, so a `tonight` job
+  /// starts on time instead of waiting for the next submit.
+  private func scheduleHeldJobWake() {
+    let now = Date()
+    let due = pending.compactMap(\.schedule.holdUntil).filter { $0 > now }.min()
+    guard let due, due != .distantFuture else { return }
+    let seconds = max(1, due.timeIntervalSince(now))
+    heldWakeTask?.cancel()
+    heldWakeTask = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+      guard !Task.isCancelled else { return }
+      await self?.kickProcessing()
+    }
+  }
+
+  /// Start the loop if it is idle (a held job coming due, a disposition change).
+  func kickProcessing() {
+    guard !isProcessing, !pending.isEmpty else { return }
+    isProcessing = true
+    Task { await processLoop() }
+  }
+
   private func processLoop() async {
     while true {
       // 0.B-2 drain point 1/2 (FDD §3.1.4a point 3): apply undrained deltas at
@@ -12861,11 +12944,19 @@ private actor WarmServerCoordinator {
         }
         index = next
       } else {
-        guard !pending.isEmpty else {
+        // Lanes (WP23): interactive first, then batch, each in submission
+        // order; a job held for tonight is invisible until its time. With no
+        // batch work and nothing held this is exactly `index = 0`.
+        guard let next = QueueLaneScheduler.nextIndex(
+          in: pending, now: Date(), paused: false,
+          schedule: { $0.schedule }, runsWhilePaused: { Self.runsWhilePaused($0.operation) })
+        else {
           isProcessing = false
+          // A held job is not "nothing to do" — wake when it comes due.
+          scheduleHeldJobWake()
           return
         }
-        index = 0
+        index = next
       }
 
       let job = pending.remove(at: index)
