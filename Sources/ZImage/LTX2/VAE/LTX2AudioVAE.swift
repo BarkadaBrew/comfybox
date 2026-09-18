@@ -326,16 +326,27 @@ public final class LTX2AudioVAE: Module {
     super.init()
   }
 
-  /// Encode a mel spectrogram to the posterior-mean latent.
+  /// Encode a mel spectrogram to a normalized latent: the exact inverse of
+  /// `decodeToMel`, and the only contract the denoise state accepts.
   ///
-  /// - Parameter mel: `(B, 2, F, T)` channels-first.
-  /// - Returns: `(B, zChannels, F/4, T/4)` channels-first (distribution mean).
-  public func encode(_ mel: MLXArray) -> MLXArray {
-    let nhwc = mel.transposed(0, 2, 3, 1)         // (B, F, T, 2)
-    let moments = encoder(nhwc)                    // (B, F/4, T/4, 16)
+  /// TIME IS THE CAUSAL HEIGHT AXIS, on both sides. An earlier version of this
+  /// put FREQUENCY there and returned an un-normalized posterior mean, which
+  /// nothing called until audio-driven chunks did — and then handed the
+  /// transformer a (B, 8, 16, T/4) latent that patchified to a 1208-wide token
+  /// and killed the process inside `addmm`. `encodeDecodeRoundTripKeepsShape`
+  /// pins the inverse so that cannot come back.
+  ///
+  /// - Parameter mel: `(B, 2, T, F)` channels-first — as `decodeToMel` returns.
+  /// - Returns: `(B, zChannels, T/4, F/4)` NORMALIZED, as `decodeToMel` takes.
+  public func encodeToLatent(_ mel: MLXArray) -> MLXArray {
+    let nhwc = mel.transposed(0, 2, 3, 1)         // (B, T, F, 2)
+    let moments = encoder(nhwc)                    // (B, T/4, F/4, 2*z)
     let z = config.zChannels
     let mean = moments[0..., 0..., 0..., 0..<z]    // first zChannels = mean
-    return mean.transposed(0, 3, 1, 2)             // (B, z, F/4, T/4)
+    // The latents the denoise loop carries are normalized; decode denormalizes
+    // on the way out, so encode must normalize on the way in or the voice
+    // arrives at the wrong scale entirely.
+    return normalize(mean.transposed(0, 3, 1, 2))  // (B, z, T/4, F/4)
   }
 
   /// Decode a latent back to a mel spectrogram.

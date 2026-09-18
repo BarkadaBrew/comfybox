@@ -97,6 +97,27 @@ final class DirectorAudioDrivenTests: XCTestCase {
 
   // MARK: fitting a slice to a chunk
 
+  /// The crash of gate run 2: a latent with the right time axis but the wrong
+  /// feature width patchified to a 1208-wide token, and MLX answered `addmm`
+  /// with `fatalError` — killing the engine, not the job.
+  func testAMisshapenConditioningLatentIsRefusedRatherThanFatal() {
+    let stream = MLX.zeros([1, 8, 152, 16], dtype: .float32)
+    // What the old encode produced: frequency on the causal axis.
+    let transposed = MLX.zeros([1, 8, 16, 151], dtype: .float32)
+    XCTAssertNil(
+      LTX2AVDenoiseState.conditioning(transposed, like: stream),
+      "a wrong feature width must degrade to generated audio, never reach addmm")
+    XCTAssertNil(LTX2AVDenoiseState.conditioning(MLX.zeros([1, 16, 152, 16]), like: stream))
+    XCTAssertNil(LTX2AVDenoiseState.conditioning(MLX.zeros([8, 152, 16]), like: stream))
+  }
+
+  func testAWellShapedConditioningLatentIsAcceptedAndFitted() {
+    let stream = MLX.zeros([1, 8, 152, 16], dtype: .float32)
+    let given = MLX.zeros([1, 8, 140, 16], dtype: .float32)
+    let fitted = LTX2AVDenoiseState.conditioning(given, like: stream)
+    XCTAssertEqual(fitted?.shape, [1, 8, 152, 16], "short slices pad, they do not refuse")
+  }
+
   func testConditioningIsTrimmedOrPaddedToTheChunkLength() {
     let latents = MLX.zeros([1, 8, 40, 16], dtype: .float32)
     XCTAssertEqual(LTX2AVDenoiseState.fit(latents, toFrames: 40).dim(2), 40)
