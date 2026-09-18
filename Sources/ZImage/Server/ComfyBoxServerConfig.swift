@@ -318,6 +318,9 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
   /// the preflight always runs, using `ImageMemoryCapsConfig.default` when
   /// this key is absent.
   public var imageMemoryCaps: ImageMemoryCapsConfig
+  /// The overnight window batch work drains in (FDD §4.10.9, WP23). Absent
+  /// means the built-in 23:00–07:00 America/New_York.
+  public var batchWindow: BatchWindow?
 
   /// The one true ComfyBox HTTP port.
   public static let canonicalPort: UInt16 = 7870
@@ -496,7 +499,7 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
   static let ownedTopLevelKeys: Set<String> = [
     "port", "host", "modelSpec", "allowedOutputDirectory", "seedvr2WeightsPath", "providers",
     "replicate", "contentModeDefaultPresets", "krea2Models", "renderDefaults", "videoDefaults",
-    "imageMemoryCaps", "serverPort", "serverHost", "outputDirectory",
+    "imageMemoryCaps", "batchWindow", "serverPort", "serverHost", "outputDirectory",
   ]
 
   /// Save, PRESERVING top-level keys this struct does not model.
