@@ -7549,13 +7549,27 @@ public final class WarmServer {
         ?? session,
       source: source,
       timeline: timeline,
+      // EVERY chunk's own seed and recipe hash, not just chunk 0's. A
+      // sequence sidecar exists so a render can be reproduced; recording the
+      // seed for one chunk of three means the other two replay as something
+      // else, which is worse than recording nothing because it looks
+      // complete. `chunkResults` has carried this all along — chunk k's
+      // record is `chunkResults[k]`, and `SequenceChunkRecord.seed` already
+      // stores the UInt64 the engine actually used.
       chunks: compilation.chunks.enumerated().map { index, chunk in
-        SequenceChunkRecord(
+        let record = index < chunkResults.count ? chunkResults[index].generationRecord : nil
+        return SequenceChunkRecord(
           index: index,
           startFrame: chunk.span.startFrame,
           frames: chunk.span.frames,
-          seed: index == 0 ? (firstChunk.generationRecord?.seed ?? UInt64(max(0, seed))) : nil,
-          recipeHash: index == 0 ? firstChunk.generationRecord?.recipeHash : nil)
+          // The compiler derives chunk k's seed as base + k; fall back to that
+          // when a record is missing so a replay still has a number to use.
+          seed: record?.seed ?? chunk.body["seed"].flatMap { value -> UInt64? in
+            if let u = value as? UInt64 { return u }
+            if let i = value as? Int, i >= 0 { return UInt64(i) }
+            return nil
+          } ?? UInt64(max(0, seed)) &+ UInt64(index),
+          recipeHash: record?.recipeHash ?? firstChunk.generationRecord?.recipeHash)
       },
       assets: SequenceSidecar.assets(of: timeline),
       outputs: [

@@ -275,9 +275,19 @@ public enum SequenceSidecar {
     public var changedAssets: [String]
     public var recipeDrift: Bool
     public var engineChanged: Bool
+    /// The chunks did not all render under the same recipe. A long sequence
+    /// can span hours, and a preset edited halfway through changes later
+    /// chunks only — so the clip on disk was never reproducible as one thing,
+    /// whatever the recipe is now. Only detectable since every chunk records
+    /// its OWN hash; before that they all reported chunk 0's.
+    public var chunksDisagree: Bool
+    /// Chunks with no seed recorded. A replay of those is a different render,
+    /// so it is named rather than left to be discovered afterwards.
+    public var chunksMissingSeed: [Int]
 
     public var ok: Bool {
       missingAssets.isEmpty && changedAssets.isEmpty && !recipeDrift && !engineChanged
+        && !chunksDisagree && chunksMissingSeed.isEmpty
     }
 
     enum CodingKeys: String, CodingKey {
@@ -285,6 +295,8 @@ public enum SequenceSidecar {
       case changedAssets = "changed_assets"
       case recipeDrift = "recipe_drift"
       case engineChanged = "engine_changed"
+      case chunksDisagree = "chunks_disagree"
+      case chunksMissingSeed = "chunks_missing_seed"
     }
   }
 
@@ -307,8 +319,11 @@ public enum SequenceSidecar {
     let drift = storedRecipe != nil && currentRecipeHash != nil && storedRecipe != currentRecipeHash
     let engineChanged = document.engine.buildSha != nil && currentEngineBuild != nil
       && document.engine.buildSha != currentEngineBuild
+    let hashes = Set(document.chunks.compactMap(\.recipeHash))
     return ReplayCheck(
       missingAssets: missing, changedAssets: changed,
-      recipeDrift: drift, engineChanged: engineChanged)
+      recipeDrift: drift, engineChanged: engineChanged,
+      chunksDisagree: hashes.count > 1,
+      chunksMissingSeed: document.chunks.filter { $0.seed == nil }.map(\.index))
   }
 }
