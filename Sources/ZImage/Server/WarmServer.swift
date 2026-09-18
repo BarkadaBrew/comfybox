@@ -8566,7 +8566,8 @@ public final class WarmServer {
     // status carries the formatted "chunk k/n (stage)" string either way).
     case let error as DirectorError:
       switch error {
-      case .invalid, .unsupportedVersion, .fileUnreadable, .importFailed:
+      case .invalid, .unsupportedVersion, .fileUnreadable, .importFailed,
+           .misplacedField:
         return .error(status: 400, message: error.description)
       case .chunkFailed, .stitchFailed:
         return .error(status: 500, message: error.description)

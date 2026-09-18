@@ -372,6 +372,48 @@ public struct DirectorTimeline: Codable, Sendable, Equatable {
     audio = try c.decodeIfPresent(AudioSettings.self, forKey: .audio) ?? AudioSettings()
     referenceClips = try c.decodeIfPresent([ReferenceClip].self, forKey: .referenceClips) ?? []
     retake = try c.decodeIfPresent(Retake.self, forKey: .retake) ?? Retake()
+    try DirectorTimeline.refuseMisplacedFields(decoder)
+  }
+
+  /// Fields that live on `settings` but are easy to send at the root, where
+  /// `Codable` would drop them without a word.
+  ///
+  /// Deliberately a NAMED list rather than blanket unknown-key rejection: a
+  /// client sending a genuinely new field should keep working, but one sending
+  /// a field we DO understand, in the wrong place, must be told — silently
+  /// rendering with a different value is the failure this exists to prevent.
+  static let settingsOnlyKeys = [
+    "negative_prompt", "seed", "fps", "width", "height", "length_frames",
+    "preset", "steps", "character", "loras",
+  ]
+
+  static func refuseMisplacedFields(_ decoder: Decoder) throws {
+    // A second, untyped pass: CodingKeys cannot see keys it does not declare.
+    guard let raw = try? decoder.container(keyedBy: RawKey.self) else { return }
+    for key in settingsOnlyKeys {
+      // The route decoder uses `.convertFromSnakeCase`, which rewrites keys
+      // BEFORE the container sees them — so `negative_prompt` arrives here as
+      // `negativePrompt`. Check both spellings, and report the WIRE one, which
+      // is what the caller actually typed.
+      let spellings = Set([key, Self.camelCased(key)])
+      guard spellings.contains(where: { raw.contains(RawKey(stringValue: $0)!) }) else { continue }
+      throw DirectorError.misplacedField(key: key, belongsIn: "settings")
+    }
+  }
+
+  static func camelCased(_ snake: String) -> String {
+    let parts = snake.split(separator: "_")
+    guard let first = parts.first else { return snake }
+    return ([String(first)] + parts.dropFirst().map(\.capitalized)).joined()
+  }
+
+  /// A key type that accepts anything, so the decoder can be asked what the
+  /// payload ACTUALLY carried rather than only what we declared.
+  struct RawKey: CodingKey {
+    var stringValue: String
+    var intValue: Int? { nil }
+    init?(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { nil }
   }
 }
 
@@ -414,6 +456,12 @@ public enum DirectorError: Error, LocalizedError, CustomStringConvertible, Equat
   case invalid([DirectorIssue])
   /// `version` newer than this build understands.
   case unsupportedVersion(Int)
+  /// A field sent at the TIMELINE root that belongs somewhere else. Codable
+  /// ignores unknown keys, so this used to be silent: a request carrying
+  /// `negative_prompt` at the root rendered happily with the preset's negative
+  /// instead, and nothing said so. Caught 2026-09-18 after two 34-second
+  /// monologues were rendered without the negative they were written with.
+  case misplacedField(key: String, belongsIn: String)
   /// A `.cbdirector` file could not be read or parsed.
   case fileUnreadable(String)
   /// Upstream `timeline_data` could not be mapped.
@@ -425,6 +473,9 @@ public enum DirectorError: Error, LocalizedError, CustomStringConvertible, Equat
 
   public var description: String {
     switch self {
+    case .misplacedField(let key, let belongsIn):
+      return "`\(key)` belongs in `\(belongsIn)`, not at the timeline root — "
+        + "it would otherwise be ignored and the render would silently use a different value"
     case .invalid(let issues):
       let errors = issues.filter { $0.severity == .error }
       let codes = errors.map(\.code).joined(separator: ", ")
