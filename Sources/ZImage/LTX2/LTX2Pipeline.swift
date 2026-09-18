@@ -1048,6 +1048,7 @@ public final class LTX2Pipeline {
     faceAnchorStrength: Float = 0,
     refineAnchorImage: MLXArray? = nil,
     audioSeconds: Float? = nil,
+    audioConditioning: MLXArray? = nil,
     beatSchedule: [LTX2ResolvedBeat] = [],
     progressCallback: ((Int, Int) -> Void)? = nil
   ) throws -> LTX2PipelineOutput {
@@ -1059,6 +1060,7 @@ public final class LTX2Pipeline {
         negativeInputIds: negativeInputIds, negativeAttentionMask: negativeAttentionMask,
         faceAnchorMask: faceAnchorMask, faceAnchorStrength: faceAnchorStrength,
         refineAnchorImage: refineAnchorImage, audioSeconds: audioSeconds,
+        audioConditioning: audioConditioning,
         beatSchedule: beatSchedule,
         progressCallback: progressCallback)
     }
@@ -1082,6 +1084,7 @@ public final class LTX2Pipeline {
     faceAnchorStrength: Float = 0,
     refineAnchorImage: MLXArray? = nil,
     audioSeconds: Float? = nil,
+    audioConditioning: MLXArray? = nil,
     beatSchedule: [LTX2ResolvedBeat] = [],
     preemption: PreemptionSignal? = nil,
     telemetry: LTX2PhaseTelemetry? = nil,
@@ -1278,6 +1281,14 @@ public final class LTX2Pipeline {
         pe: avPE,
         negativeAudioContext: negativeAudioEmbeddings,
         audioNoiseKey: seed.map { MLXRandom.key($0 &+ 0xA0D12) })
+      // Audio-driven (WP11): start FROM the voice and stay there.
+      if let given = audioConditioning {
+        let clean = LTX2AVDenoiseState.fit(given, toFrames: ta)
+        avState?.conditioning = clean
+        avState?.audioLatents = clean
+        logger.info(
+          "Audio-driven (i2v): conditioning on \(clean.dim(2)) audio latent frame(s) — the voice is given, not generated.")
+      }
       logger.info("Audio stream enabled (i2v): \(ta) latent frames (\(seconds)s, negatives \(negativeAudioEmbeddings != nil ? "on" : "off")).")
     }
 
@@ -1461,6 +1472,7 @@ public final class LTX2Pipeline {
     negativeAttentionMask: MLXArray? = nil,
     beatSchedule: [LTX2ResolvedBeat] = [],
     audioSeconds: Float? = nil,
+    audioConditioning: MLXArray? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) throws -> LTX2PipelineOutput {
     try nonPreemptible("generateMultiKeyframe") {
@@ -1470,7 +1482,7 @@ public final class LTX2Pipeline {
         seed: seed, guidance: guidance,
         negativeInputIds: negativeInputIds, negativeAttentionMask: negativeAttentionMask,
         beatSchedule: beatSchedule,
-        audioSeconds: audioSeconds,
+        audioSeconds: audioSeconds, audioConditioning: audioConditioning,
         progressCallback: progressCallback)
     }
   }
@@ -1493,6 +1505,7 @@ public final class LTX2Pipeline {
     negativeAttentionMask: MLXArray? = nil,
     beatSchedule: [LTX2ResolvedBeat] = [],
     audioSeconds: Float? = nil,
+    audioConditioning: MLXArray? = nil,
     preemption: PreemptionSignal? = nil,
     telemetry: LTX2PhaseTelemetry? = nil,
     resume: LTX2ResumeState? = nil,

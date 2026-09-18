@@ -1794,6 +1794,8 @@ public final class LTX2VideoGenerator {
                     beatSchedule: resolvedBeats,
                     audioSeconds: wantAudio && chunk == 0
                         ? Float(request.framesPerChunk) / Float(request.fps) : nil,
+                    audioConditioning: wantAudio && chunk == 0
+                        ? audioConditioningLatents(for: request) : nil,
                     preemption: preemption, telemetry: telemetry,
                     resume: chunkResume, chunkIndex: chunk,
                     progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
@@ -1865,6 +1867,8 @@ public final class LTX2VideoGenerator {
                         refineAnchorImage: chunk == 0 ? refineAnchorImage : nil,
                         audioSeconds: wantAudio && chunk == 0
                             ? Float(request.framesPerChunk) / Float(request.fps) : nil,
+                        audioConditioning: wantAudio && chunk == 0
+                            ? audioConditioningLatents(for: request) : nil,
                         beatSchedule: resolvedBeats,
                         preemption: preemption, telemetry: telemetry,
                         resume: chunkResume, chunkIndex: chunk,
