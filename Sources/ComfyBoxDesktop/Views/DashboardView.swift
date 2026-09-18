@@ -50,6 +50,9 @@ struct DashboardView: View {
     @Bindable var monitor: HealthMonitor
     var store: DAMStore?
     var ingestor: AssetIngestor?
+    /// The app-level content gate — while it is closed this app is Rated-G,
+    /// and that includes the recent-renders strip (Todd 2026-09-18).
+    @Environment(AppContentGate.self) private var contentGate
 
     @State private var recent: [DAMAsset] = []
 
@@ -254,12 +257,30 @@ struct DashboardView: View {
     }
 
     // MARK: - Recent renders
+    //
+    // Todd 2026-09-18: "dashboard recents should honor NSFW on/off. Current
+    // behavior is recents are shown even if image display is off in galleries."
+    // This strip had no gate at all. It now asks the same question the gallery
+    // asks, from the same app-wide setting.
+
+    /// The recent renders this surface may draw.
+    private var visibleRecent: [DAMAsset] {
+        recent.filter { presentation(of: $0) != .omit }
+    }
+
+    private func presentation(of asset: DAMAsset) -> NSFWPresentation {
+        ContentRating.presentation(isNSFW: asset.isNSFW,
+                                   mode: DesktopSettings.load().resolvedNSFWFilterMode,
+                                   unlocked: false,
+                                   gateRevealed: contentGate.revealed)
+    }
+
 
     private var recentRenders: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Recent renders")
                 .font(.headline)
-            if recent.isEmpty {
+            if visibleRecent.isEmpty {
                 Text("No renders yet.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -267,11 +288,12 @@ struct DashboardView: View {
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 10) {
-                        ForEach(recent) { asset in
+                        ForEach(visibleRecent) { asset in
                             DashboardThumbnail(
                                 path: ingestor?.thumbnailPath(for: asset.id) ?? asset.absolutePath,
                                 caption: asset.prompt
                             )
+                            .blur(radius: presentation(of: asset) == .blur ? 22 : 0)
                         }
                     }
                 }

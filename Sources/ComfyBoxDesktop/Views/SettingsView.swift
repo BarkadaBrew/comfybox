@@ -95,6 +95,11 @@ struct DesktopSettings: Codable {
     /// an Immich server). nil = none configured. Credentials are not stored
     /// here; see RemoteGalleryConfig.keychainAccount (FDD-remote-galleries).
     var remoteGalleries: [RemoteGalleryConfig]?
+    /// How mature content is shown, app-wide ("Show All" | "Blur NSFW" |
+    /// "Hide NSFW"). nil = Blur. Set from the gallery's NSFW picker and read by
+    /// every surface that draws images, so they cannot disagree
+    /// (Todd 2026-09-18).
+    var nsfwFilterMode: String?
 
     /// The local Glimmer host (Todd 2026-09-16: "dashboard is monitoring
     /// lmstudio. we are no longer using and want to monitor mlx serve
@@ -140,6 +145,11 @@ struct DesktopSettings: Codable {
     )
 
     /// Directory scanned for .cbarchive bundles when `archiveRoots` is nil.
+    /// The app-wide NSFW filter mode, defaulting to Blur.
+    var resolvedNSFWFilterMode: NSFWFilterMode {
+        nsfwFilterMode.flatMap(NSFWFilterMode.init(rawValue:)) ?? .blur
+    }
+
     static var defaultArchiveRoot: String {
         (NSString(string: "~/.comfybox").expandingTildeInPath as NSString)
             .appendingPathComponent("archives")

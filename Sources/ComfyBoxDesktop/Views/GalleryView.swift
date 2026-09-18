@@ -130,7 +130,10 @@ struct GalleryView: View {
     @Environment(AppContentGate.self) private var contentGate
 
     // NSFW content gate (content-mode based, unlocked by a gallery password).
-    @State private var nsfwMode: NSFWFilterMode = .blur
+    /// App-wide (persisted): every surface that draws images reads the same
+    /// setting, so the Dashboard cannot disagree with the gallery
+    /// (Todd 2026-09-18).
+    @State private var nsfwMode: NSFWFilterMode = DesktopSettings.load().resolvedNSFWFilterMode
     @State private var nsfwUnlocked: Bool = false
     @State private var showNSFWPasswordSheet: Bool = false
     @State private var nsfwPasswordInput: String = ""
@@ -722,7 +725,14 @@ struct GalleryView: View {
 
             // NSFW filter: Show / Blur / Hide, with a password-gated unlock.
             Menu {
-                Picker("NSFW", selection: $nsfwMode) {
+                Picker("NSFW", selection: Binding(
+                    get: { nsfwMode },
+                    set: { mode in
+                        nsfwMode = mode
+                        var settings = DesktopSettings.load()
+                        settings.nsfwFilterMode = mode.rawValue
+                        settings.save()
+                    })) {
                     ForEach(NSFWFilterMode.allCases) { Label($0.rawValue, systemImage: $0.symbol).tag($0) }
                 }
                 Divider()
@@ -955,7 +965,8 @@ struct GalleryView: View {
 
     /// Blur NSFW cells when Blur mode is on and NSFW isn't unlocked.
     private func shouldBlurNSFW(_ asset: DAMAsset) -> Bool {
-        nsfwMode == .blur && !nsfwUnlocked && asset.isNSFW
+        ContentRating.presentation(isNSFW: asset.isNSFW, mode: nsfwMode,
+                                   unlocked: nsfwUnlocked, gateRevealed: contentGate.revealed) == .blur
     }
 
     @ViewBuilder
@@ -1671,9 +1682,11 @@ struct GalleryView: View {
             results = results.filter { !securedIds.contains($0.id) }
         }
 
-        // NSFW: hide entirely when mode is .hide and not unlocked.
-        if nsfwMode == .hide && !nsfwUnlocked {
-            results = results.filter { !$0.isNSFW }
+        // NSFW: one shared rule — omitted when the mode says hide, or whenever
+        // the app content gate is closed.
+        results = results.filter {
+            ContentRating.presentation(isNSFW: $0.isNSFW, mode: nsfwMode,
+                                       unlocked: nsfwUnlocked, gateRevealed: contentGate.revealed) != .omit
         }
 
         // Finder color-label filter.

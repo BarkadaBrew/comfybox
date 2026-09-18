@@ -45,6 +45,40 @@ public extension DAMAsset {
     var isNSFW: Bool { ContentRating.isNSFW(contentMode: contentMode) }
 }
 
+/// What a surface should do with one asset.
+public enum NSFWPresentation: Sendable, Equatable {
+    case show
+    case blur
+    /// Not drawn at all.
+    case omit
+}
+
+public extension ContentRating {
+    /// The ONE answer to "may this be on screen, and how", for every surface
+    /// that draws an image.
+    ///
+    /// Todd 2026-09-18: the Dashboard's recent renders had no gate of their
+    /// own, so mature thumbnails appeared there while the gallery was set to
+    /// hide them. Surfaces must not each invent this.
+    ///
+    /// The app-level content gate outranks everything: while it is closed the
+    /// app is Rated-G, and mature content is OMITTED rather than blurred —
+    /// a blurred tile still says "there is something here".
+    static func presentation(isNSFW: Bool,
+                             mode: NSFWFilterMode,
+                             unlocked: Bool,
+                             gateRevealed: Bool) -> NSFWPresentation {
+        guard isNSFW else { return .show }
+        guard gateRevealed else { return .omit }
+        if unlocked { return .show }
+        switch mode {
+        case .show: return .show
+        case .blur: return .blur
+        case .hide: return .omit
+        }
+    }
+}
+
 /// How the gallery treats NSFW assets.
 public enum NSFWFilterMode: String, CaseIterable, Identifiable, Sendable {
     case show = "Show All"       // no gating
