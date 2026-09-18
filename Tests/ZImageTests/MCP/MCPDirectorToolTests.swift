@@ -100,7 +100,7 @@ final class MCPDirectorToolTests: XCTestCase {
     XCTAssertEqual(validate.routes, [RouteRef(method: "POST", path: "/v1/video/director/validate")])
     XCTAssertEqual(validate.inputSchema["required"] as? [String], ["timeline"])
 
-    XCTAssertEqual(MCPToolRegistry.tools.count, 72)
+    XCTAssertEqual(MCPToolRegistry.tools.count, 75)
     let names = MCPToolRegistry.tools.map(\.name)
     XCTAssertTrue(names.contains("generate_director_video"))
     XCTAssertTrue(names.contains("validate_director_timeline"))

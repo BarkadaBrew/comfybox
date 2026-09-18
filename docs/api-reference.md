@@ -104,6 +104,9 @@ or carry a reasoned exemption (§3.5 assertion 3).
 | POST | `/v1/queue/resume` | resume_queue |  |
 | DELETE | `/v1/queue/{id}` | cancel_job |  |
 | POST | `/v1/queue/{id}/move` | move_queue_job |  |
+| GET | `/v1/sequences` | list_sequences |  |
+| POST | `/v1/sequences/check` | check_sequence |  |
+| POST | `/v1/sequences/read` | read_sequence |  |
 | POST | `/v1/shutdown` | shutdown_server |  |
 | GET | `/v1/stats` |  |  |
 | POST | `/v1/storyboard/render` | render_storyboard |  |

@@ -116,6 +116,16 @@ struct GenerationView: View {
     @State private var imageStrength: Double = 0.6
     @State private var isReferenceDropTargeted: Bool = false
     @State private var showReference: Bool = false
+    /// Creative Library row in Generate (PRD-creative-library L4).
+    @State private var showLibrary: Bool = false
+    @State private var libraryPromptModel = LibraryPromptModel()
+    @State private var libraryClientStorage: LibraryClient?
+    private var libraryClient: LibraryClient {
+        if let libraryClientStorage { return libraryClientStorage }
+        let client = LibraryClient(engine: engine)
+        Task { @MainActor in libraryClientStorage = client }
+        return client
+    }
 
     /// Output dimensions: the picked preset, or the custom fields.
     private var effectiveWidth: Int {
@@ -481,6 +491,15 @@ struct GenerationView: View {
 
                 // Prompt
                 promptSection
+
+                // Creative Library: assemble a prompt from material rather
+                // than typing it from nothing (PRD-creative-library L4).
+                LibraryPromptSection(
+                    model: libraryPromptModel,
+                    client: libraryClient,
+                    prompt: $prompt,
+                    negativePrompt: $negativePrompt,
+                    isExpanded: $showLibrary)
 
                 Divider()
 
