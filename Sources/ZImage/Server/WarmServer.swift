@@ -367,6 +367,8 @@ public final class WarmServer {
   let presetStore = PresetStore()
   /// The Creative Library (PRD docs/PRD-creative-library.md): reusable material.
   let libraryStore = LibraryStore()
+  /// Reusable Director parameters (FDD §4.9.3).
+  let sequencePresetStore = SequencePresetStore()
   /// Content-mode definitions (~/.comfybox/content-modes.json). Built-ins ship in-code.
   let contentModeStore = ContentModeStore.loadOrCreate()
   /// Append-only audit trail (~/.comfybox/audit-log.jsonl).
@@ -2028,6 +2030,20 @@ public final class WarmServer {
       return libraryUpsertResponse(body: request.body)
 
     // MARK: - Sequences (FDD-ltx-director-tab §4.9.2, WP13)
+
+    case ("GET", "/v1/sequences/presets"):
+      return .json(status: 200, payload: sequencePresetStore.all())
+
+    case ("POST", "/v1/sequences/presets"), ("PUT", "/v1/sequences/presets"):
+      return sequencePresetUpsertResponse(body: request.body)
+
+    case ("GET", _) where request.path.hasPrefix("/v1/sequences/presets/"):
+      return sequencePresetGetResponse(
+        rawId: String(request.path.dropFirst("/v1/sequences/presets/".count)))
+
+    case ("DELETE", _) where request.path.hasPrefix("/v1/sequences/presets/"):
+      return sequencePresetDeleteResponse(
+        rawId: String(request.path.dropFirst("/v1/sequences/presets/".count)))
 
     case ("POST", "/v1/sequences/read"):
       return Self.sequenceRead(body: request.body, allowedOutputDirectory: configuration.allowedOutputDirectory)
@@ -5055,6 +5071,88 @@ public final class WarmServer {
     }
     do {
       let deleted = try libraryStore.deleteCollection(id: id)
+      return .json(
+        status: deleted ? 200 : 404, payload: DeleteResult(success: deleted, id: id, deleted: deleted))
+    } catch {
+      return .error(.error(status: 500, message: error.localizedDescription))
+    }
+  }
+
+  // MARK: - Sequence preset routes (FDD §4.9.3, WP14)
+
+  /// The shape a preset implies, so a client (or a drafter) can see what it
+  /// will actually get before rendering: snapped frames, seconds, chunk count,
+  /// keyframe slots and prompt-segment spans.
+  struct SequencePresetShape: Encodable {
+    let preset: SequencePreset
+    let snappedFrames: Int
+    let snappedSeconds: Double
+    let chunks: Int
+    let keyframeFrames: [Int]
+    let segments: [[String: Int]]
+    let estimatedGpuMinutes: Int
+
+    init(_ preset: SequencePreset) {
+      self.preset = preset
+      snappedFrames = preset.snappedFrames
+      snappedSeconds = preset.snappedSeconds
+      chunks = preset.chunkCount
+      keyframeFrames = preset.keyframeFrames()
+      segments = preset.segmentSpans().map { ["start_frame": $0.start, "length_frames": $0.length] }
+      // ~25 min per chunk at the production recipe (measured 2026-09-17).
+      estimatedGpuMinutes = preset.chunkCount * 25
+    }
+
+    enum CodingKeys: String, CodingKey {
+      case preset, chunks, segments
+      case snappedFrames = "snapped_frames"
+      case snappedSeconds = "snapped_seconds"
+      case keyframeFrames = "keyframe_frames"
+      case estimatedGpuMinutes = "estimated_gpu_minutes"
+    }
+  }
+
+  private func sequencePresetGetResponse(rawId: String) -> RoutedResponse {
+    guard let id = Self.pathIdComponent(rawId) else {
+      return .error(.error(status: 400, message: "Invalid sequence preset id"))
+    }
+    guard let preset = sequencePresetStore.preset(id: id) else {
+      return .error(.error(status: 404, message: "Sequence preset not found: \(id)"))
+    }
+    return .json(status: 200, payload: SequencePresetShape(preset))
+  }
+
+  private func sequencePresetUpsertResponse(body: Data) -> RoutedResponse {
+    let (response, saved) = Self.upsertSequencePreset(store: sequencePresetStore, body: body)
+    if let saved {
+      auditLog.append(
+        kind: "sequence-preset.upsert", message: "Upserted sequence preset \(saved.id)",
+        metadata: ["id": saved.id])
+    }
+    return response
+  }
+
+  static func upsertSequencePreset(
+    store: SequencePresetStore, body: Data
+  ) -> (RoutedResponse, saved: SequencePreset?) {
+    do {
+      let preset = try JSONDecoder().decode(SequencePreset.self, from: body)
+      let saved = try store.upsert(preset)
+      return (.json(status: 200, payload: SequencePresetShape(saved)), saved)
+    } catch let error as SequencePresetError {
+      return (.error(.error(status: 400, message: error.localizedDescription)), nil)
+    } catch {
+      return (.error(.error(
+        status: 400, message: "Invalid sequence preset: \(error.localizedDescription)")), nil)
+    }
+  }
+
+  private func sequencePresetDeleteResponse(rawId: String) -> RoutedResponse {
+    guard let id = Self.pathIdComponent(rawId) else {
+      return .error(.error(status: 400, message: "Invalid sequence preset id"))
+    }
+    do {
+      let deleted = try sequencePresetStore.delete(id: id)
       return .json(
         status: deleted ? 200 : 404, payload: DeleteResult(success: deleted, id: id, deleted: deleted))
     } catch {
