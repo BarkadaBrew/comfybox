@@ -1243,7 +1243,10 @@ struct GalleryView: View {
     /// and ingest it — the one thing the retired Remote Gallery could do that
     /// browsing the catalog cannot.
     private func pullRemote(_ asset: DAMAsset) async {
-        guard let url = remoteURLs[asset.id] else { return }
+        guard let listed = remoteURLs[asset.id] else { return }
+        // An Immich row's grid URL is a rendered PREVIEW; saving it to this Mac
+        // would quietly save a downscaled copy in place of the render.
+        let url = ImmichThumbnailProtocol.originalURL(from: listed) ?? listed
         do {
             let (data, response) = try await URLSession.shared.data(from: url)
             if let http = response as? HTTPURLResponse, http.statusCode != 200 {

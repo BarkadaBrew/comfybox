@@ -377,7 +377,9 @@ public final class RemoteGalleryTransfer {
         var errorDescription: String? {
             switch self {
             case .localFileMissing(let name):
-                return "\(name) is not on this Mac any more"
+                // Almost always a stale catalog row whose file was deleted
+                // outside the app — the Gallery Health sheet clears those.
+                return "\(name) has no file on this Mac — clear stale rows in Gallery Health (stethoscope)"
             case .digestMismatch(let name):
                 return "\(name) did not arrive intact — the local copy was kept"
             case .notConfirmedOnServer(let name):
