@@ -815,8 +815,13 @@ priority lanes" (2026-09-17). Corrected here against what is already deployed.
 
 - **Carried by requests:** the Sequence, Program and multi-chunk Director requests.
   Interactive requests reject a `hold_until` field (400), so a lane cannot be misused.
-- **Persisted:** holds live in the durable job ledger (WP9), so a held job survives restarts
-  and still waits for its time.
+- **Persisted (WP9 — NOT TRUE TODAY).** A held job does **not** survive a restart as of
+  2026-09-18, and the two reasons interlock, so neither fix works alone:
+  `PersistedQueueJob` carries no schedule field, and `hold_until` is armed by an in-memory
+  `Task.sleep` that dies with the process; *and* a held job is always a video/Director job,
+  whose `rawBody` is nil, so `persistQueueState` drops it before the schedule would even
+  matter. Until WP9a+WP9b land together, a bounce releases every hold. There is no test
+  covering this — the missing test is the one WP9 should lead with.
 
 **Overnight window.**
 - **Config:** engine-side `batch_window` `{ start: "23:00", end: "07:00", tz: "America/New_York" }`,
@@ -937,7 +942,10 @@ Each rung must pass before the next starts, at the production recipe.
 | WP6 (Phase 2) | Retake: base-video decode → VAE encode → clean latent for frozen spans, time-range mask compiler, seam ladder; audio latent inpainting (mel encode parity + audio noise mask); reference-video guides + noise ramp | WP2c, WP2d | L |
 | WP7 (Phase 2) | Prompt relay residue: bias-strength dial, authoring preview, intra-chunk action-change ladder | WP2b | S |
 | WP8 (Phase 2b) | IC-LoRA weights + attention entries | WP6 | M |
-| WP9 (Phase 2) | Durable video/director jobs: serializable job state + crash recovery (today local video is non-persisted) | WP2c | M |
+| WP9a (Phase 2) | Local video durability: thread the request `Data` into `enqueueLocalVideo` as `rawBody`, add a `video` arm to the boot replay (re-prepare via `prepareLocalVideo`), drop `.video` from `QueueRecoveryGate.nonRecoverableKinds`. Contract: at-least-once, replayed from chunk 0 — the same contract `generate` already has | WP2c | S |
+| WP9b (Phase 2) | Schedule durability: `schedule` on `PersistedQueueJob`, re-arm `scheduleHeldJobWake()` after replay. Useless without WP9a (every held job today IS a video job), so they ship together. `QueueSpill.strict` persists as `distantFuture` and needs an explicit release route or it becomes an immortal ledger entry | WP9a | S |
+| WP9c (Phase 2) | Director sequence resume: `kind: "director"`, a `director-<session>-state.json` written after each chunk (chunk cursor, `toneTransforms`, `carryTarget`, chunk metadata), a `runDirector` entry point that skips completed chunks, `VideoJobTracker` re-registration so the client's polled job id survives, and a boot sweep for orphaned intermediates — the `defer` cleanup cannot run on a process kill, so a crash leaks every chunk mp4 and carry-over PNG today | WP9a | M |
+| WP9 note | Step/latent-level resume across restarts is explicitly OUT of scope. `LTX2ResumeState` is in-memory by design ("deliberately dies with the process") and persisting it would mean writing multi-GB `MLXArray` latents plus the decoded frame bank to disk. The durable granularity is the CHUNK boundary, which needs no tensors — only `(chunkIndex, seed, request JSON, previous chunk's last frame)`, all of which Director already puts on disk incidentally | — | — |
 | WP10 (Phase 2) | Regional prompting (§4.6): `regions` track in the timeline schema; spatiotemporal bias (per-frame interpolated box + soft edge) in `LTX2BeatSchedule`; compiler support incl. chunk-boundary split; wire-level ladder FIRST (two-person static + crossing), then the desktop Regions track | WP2b, WP7 | M (engine) + M (desktop) |
 | WP11 (Phase 2) | Audio-driven chunks (§4.7): `drives_video` flag, pause-snapped chunk boundaries, per-chunk `audio_condition` (mel → audio VAE encode under a keep mask), master-track-only assembly mux, `av_sync[]` probe + `av_sync_drift`; single-chunk ladder FIRST | WP6 (encode parity), WP2d | M (engine) + S (desktop flag + sync readout) |
 | WP12 (Phase 2) | Animated GIF export (§4.8): ImageIO encoder with frame-exact decimation + size-cap step-down, `POST /v1/video/export/gif` (sync ≤ 20 s, job beyond), desktop Export GIF sheet in result view + render strip, `export_gif` MCP tool | WP2d (decode path) | S (engine) + S (desktop) |
