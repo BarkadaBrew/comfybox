@@ -1085,6 +1085,28 @@ public actor CatalogStore {
         }
     }
 
+    /// Ids the catalog records on one host, newest first. How the Remote
+    /// Gallery tab lists a single remote's contents (FDD-remote-galleries §3.5).
+    public func assetIDs(onHost host: String, limit: Int = 2_000) throws -> [String] {
+        var stmt: OpaquePointer?
+        let sql = """
+            SELECT l.asset_id FROM asset_locations l
+            JOIN assets a ON a.id = l.asset_id
+            WHERE l.host = ?
+            ORDER BY a.created_at DESC
+            LIMIT ?
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (host as NSString).utf8String, -1, CatalogSchema.transient)
+        sqlite3_bind_int(stmt, 2, Int32(limit))
+        var ids: [String] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let c = sqlite3_column_text(stmt, 0) { ids.append(String(cString: c)) }
+        }
+        return ids
+    }
+
     public func storageState(of assetID: String) throws -> StorageState? {
         var stmt: OpaquePointer?
         let sql = "SELECT storage_state, primary_host FROM assets WHERE id = ?"

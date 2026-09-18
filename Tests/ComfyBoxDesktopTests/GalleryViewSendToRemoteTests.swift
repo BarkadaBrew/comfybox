@@ -41,3 +41,25 @@ struct GalleryViewSendToRemoteTests {
         #expect(none.contains("local copies kept"))
     }
 }
+
+@Suite("GalleryView: the Remote Gallery tab")
+@MainActor
+struct GalleryViewRemoteScopeTests {
+
+    @Test("each remote says whether it is here")
+    func statusLabels() {
+        #expect(GalleryView.remoteStatusLabel(.reachable) == "here")
+        #expect(GalleryView.remoteStatusLabel(.absent) == "not attached")
+        #expect(GalleryView.remoteStatusLabel(.disabled) == "off")
+    }
+
+    @Test("a failed send says why, on screen")
+    func failureReasonIsShown() {
+        // The result line is built from the outcome, then the first reason is
+        // appended — a silent failure reads as "nothing happened"
+        // (Todd 2026-09-17: "send is available but the asset did not move").
+        let line = GalleryView.sendResultLine(sent: 0, failed: 1, remoteName: "Vault SSD")
+        #expect(line.contains("Nothing moved"))
+        #expect(line.contains("local copies kept"))
+    }
+}

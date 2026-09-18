@@ -103,3 +103,60 @@ struct RemoteGalleryReadoptionTests {
                 "and the catalog is corrected, so it is not hidden again next time")
     }
 }
+
+@Suite("CatalogBrowser: scoped to one remote")
+@MainActor
+struct CatalogBrowserRemoteScopeTests {
+
+    @Test("the tab shows one remote's contents and nothing else")
+    func scopedToOneRemote() async throws {
+        let dbPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("sc-\(UUID().uuidString).sqlite3")
+        let store = try await CatalogStore.open(path: dbPath)
+        defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+        // One asset on the drive, one still local.
+        let driveRoot = (NSTemporaryDirectory() as NSString).appendingPathComponent("drv-\(UUID().uuidString)")
+        let mediaDir = (driveRoot as NSString).appendingPathComponent("media")
+        try FileManager.default.createDirectory(atPath: mediaDir, withIntermediateDirectories: true)
+        let onDrive = (mediaDir as NSString).appendingPathComponent("moved.png")
+        FileManager.default.createFile(atPath: onDrive, contents: Data("bytes".utf8))
+        defer { try? FileManager.default.removeItem(atPath: driveRoot) }
+
+        let localPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("still-\(UUID().uuidString).png")
+        FileManager.default.createFile(atPath: localPath, contents: Data("bytes".utf8))
+        defer { try? FileManager.default.removeItem(atPath: localPath) }
+
+        try await store.upsert(CatalogAsset(id: "moved", filename: "moved.png", absolutePath: "/gone/moved.png"),
+                               explicitCollectionIDs: [])
+        try await store.relocateAsset(id: "moved", host: "remote:r1", path: "media/moved.png")
+        try await store.upsert(CatalogAsset(id: "local", filename: "still.png", absolutePath: localPath),
+                               explicitCollectionIDs: [])
+
+        let browser = CatalogBrowser(store: store)
+        browser.remoteGalleryRoots = ["remote:r1": driveRoot]
+        browser.restrictToRemoteHost = "remote:r1"
+        await browser.apply(filter: CatalogQuery(limit: 50))
+
+        #expect(browser.items.map(\.id) == ["moved"], "only the drive's contents")
+        #expect(browser.remoteHostByAsset["moved"] == "remote:r1", "and the grid can label it")
+    }
+
+    @Test("ids on a host come back newest first, and a host with nothing is empty")
+    func idsOnHost() async throws {
+        let dbPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("ids-\(UUID().uuidString).sqlite3")
+        let store = try await CatalogStore.open(path: dbPath)
+        defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+        try await store.upsert(CatalogAsset(id: "a", filename: "a.png", absolutePath: "/tmp/a.png",
+                                            createdAt: Date(timeIntervalSince1970: 1_000)),
+                               explicitCollectionIDs: [])
+        try await store.upsert(CatalogAsset(id: "b", filename: "b.png", absolutePath: "/tmp/b.png",
+                                            createdAt: Date(timeIntervalSince1970: 2_000)),
+                               explicitCollectionIDs: [])
+        try await store.relocateAsset(id: "a", host: "remote:r1", path: "media/a.png")
+        try await store.relocateAsset(id: "b", host: "remote:r1", path: "media/b.png")
+
+        #expect(try await store.assetIDs(onHost: "remote:r1") == ["b", "a"])
+        #expect(try await store.assetIDs(onHost: "remote:nope").isEmpty)
+    }
+}

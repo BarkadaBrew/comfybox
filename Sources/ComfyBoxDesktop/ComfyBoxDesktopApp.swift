@@ -459,11 +459,12 @@ struct ComfyBoxDesktopApp: App {
     /// open it, because there is no longer a second reader for the second one
     /// to show.
     @ViewBuilder
-    private var galleryDetail: some View {
+    private func galleryDetail(remoteScope: Bool = false) -> some View {
         if let store = store, let ingestor = ingestor {
             GalleryView(
                 store: store,
                 ingestor: ingestor,
+                remoteScope: remoteScope,
                 archiver: archiver,
                 engine: engine,
                 onCompare: { assets in
@@ -521,9 +522,10 @@ struct ComfyBoxDesktopApp: App {
             // a second reader over /v1/gallery/list — a bare directory listing
             // with no metadata — which is half of why "the Mac gallery and the
             // server gallery are different". The Gallery now reads the catalog,
-            // which covers every host, so this is the same view. The tab and its
-            // ⌘R shortcut are kept so the habit still lands somewhere.
-            galleryDetail
+            // which covers every host. Since 2026-09-17 this tab is SCOPED to
+            // the configured remote galleries (a drive, an Immich server): a
+            // picker of the ones that are here, and that one's contents.
+            galleryDetail(remoteScope: true)
 
         case .characters:
             CharactersView(engine: engine)
@@ -611,7 +613,7 @@ struct ComfyBoxDesktopApp: App {
             ModelsView(engine: engine)
 
         case .gallery:
-            galleryDetail
+            galleryDetail()
 
         case .archives:
             if let store, let ingestor, let archiver {

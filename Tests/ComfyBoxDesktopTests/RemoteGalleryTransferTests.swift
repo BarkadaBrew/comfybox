@@ -411,8 +411,8 @@ struct RemoteGalleryImmichTransferTests {
         #expect(try await catalog.pendingTransfers().isEmpty)
     }
 
-    @Test("the upload carries the metadata field Immich requires")
-    func metadataFieldPresent() async throws {
+    @Test("the upload omits the fields the live server rejects")
+    func uploadShapeMatchesLiveServer() async throws {
         ImmichTransferStubProtocol.reset()
         nonisolated(unsafe) var uploadBody = ""
         ImmichTransferStubProtocol.handler = { request in
@@ -440,8 +440,11 @@ struct RemoteGalleryImmichTransferTests {
         defer { try? FileManager.default.removeItem(atPath: dbPath) }
         let asset = try await makeAsset(store, catalog, dir: dir, id: "a1")
         _ = await transfer.send(assets: [asset], to: remote)
-        #expect(uploadBody.contains("name=\"metadata\""),
-                "AssetMediaCreateDto requires it in Immich 2.3.1 — without it the upload is rejected")
+        // Learned live: an empty metadata list makes Immich fail its own
+        // insert with HTTP 500, and only the key "mobile-app" is legal, so the
+        // field is omitted entirely.
+        #expect(!uploadBody.contains("name=\"metadata\""))
+        #expect(!uploadBody.contains("name=\"sidecarData\""), "Immich rejects a JSON sidecar")
     }
 
     @Test("a checksum the server does not match keeps the local copy")
