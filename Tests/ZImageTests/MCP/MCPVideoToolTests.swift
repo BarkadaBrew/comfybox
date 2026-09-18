@@ -48,7 +48,7 @@ final class MCPVideoToolTests: XCTestCase {
     // + generate_director_video/validate_director_timeline (Director WP2c) = 61,
     // + 9 Creative Library tools (PRD-creative-library L2) = 70.
     XCTAssertEqual(
-      MCPToolRegistry.tools.count, 75, "Expected 75 registered MCP tools")
+      MCPToolRegistry.tools.count, 78, "Expected 78 registered MCP tools")
   }
 
   // MARK: - generate_video Schema (Story A1)

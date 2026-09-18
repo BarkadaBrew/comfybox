@@ -125,6 +125,23 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeLibraryMarkUsed(arguments)
       case "library_import_studio_packs":
         return try await executeLibraryImportStudioPacks(arguments)
+      case "list_sequence_presets":
+        return try await executeGet("/v1/sequences/presets")
+      case "upsert_sequence_preset":
+        guard let params = arguments, params.string("id")?.isEmpty == false,
+              params.string("name")?.isEmpty == false else {
+          return MCPToolResult(error: "Error: 'id' and 'name' are required")
+        }
+        let upsert = try await client.post(
+          "/v1/sequences/presets", body: try JSONEncoder().encode(params.raw))
+        return Self.mapHTTPResponse(status: upsert.0, data: upsert.1)
+      case "delete_sequence_preset":
+        guard let id = arguments?.string("id"), !id.isEmpty else {
+          return MCPToolResult(error: "Error: 'id' is required")
+        }
+        let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        let removed = try await client.delete("/v1/sequences/presets/\(encoded)")
+        return Self.mapHTTPResponse(status: removed.0, data: removed.1)
       case "list_sequences":
         if let limit = arguments?.integer("limit") {
           return try await executeGet("/v1/sequences?limit=\(limit)")

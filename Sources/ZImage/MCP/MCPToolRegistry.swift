@@ -62,6 +62,9 @@ public enum MCPToolRegistry {
     libraryCollectionDelete.annotated(.destructive),
     libraryImportPack.annotated(.additive),
     libraryImportStudioPacks.annotated(.additive),
+    listSequencePresets.annotated(.readOnly),
+    upsertSequencePreset.annotated(.additive),
+    deleteSequencePreset.annotated(.destructive),
     listSequences.annotated(.readOnly),
     readSequence.annotated(.readOnly),
     checkSequence.annotated(.readOnly),
@@ -1175,6 +1178,64 @@ public enum MCPToolRegistry {
   )
 
   // MARK: - Sequences (FDD-ltx-director-tab §4.9.2)
+
+  static let listSequencePresets = MCPToolDefinition(
+    name: "list_sequence_presets",
+    description: """
+      List Sequence presets: reusable Director shapes (length, fps, aspect, render recipe, \
+      keyframe policy, prompt cadence, audio mode). Start here before drafting a sequence.
+      """,
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any],
+    routes: [RouteRef(method: "GET", path: "/v1/sequences/presets")]
+  )
+
+  static let upsertSequencePreset = MCPToolDefinition(
+    name: "upsert_sequence_preset",
+    description: """
+      Create or replace a Sequence preset. Required: id, name. length_seconds (snapped to the \
+      engine's 1+8k grid), fps, width, height, video_preset_id, keyframe_policy \
+      (none|first_only|fflf|every_n_seconds:<n>), segment_cadence_seconds, audio \
+      (generated|imported|driven), seed_policy (random|fixed:<n>), author_notes.
+      """,
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string"],
+        "name": ["type": "string"],
+        "description": ["type": "string"],
+        "length_seconds": ["type": "number"],
+        "fps": ["type": "integer"],
+        "width": ["type": "integer"],
+        "height": ["type": "integer"],
+        "video_preset_id": ["type": "string"],
+        "keyframe_image_preset_id": ["type": "string"],
+        "steps": ["type": "integer"],
+        "negative_prompt": ["type": "string"],
+        "character": ["type": "string"],
+        "keyframe_policy": ["type": "string"],
+        "segment_cadence_seconds": ["type": "number"],
+        "audio": ["type": "string"],
+        "seed_policy": ["type": "string"],
+        "author_notes": ["type": "string"],
+      ] as [String: Any],
+      "required": ["id", "name"],
+    ] as [String: Any],
+    routes: [
+      RouteRef(method: "POST", path: "/v1/sequences/presets"),
+      RouteRef(method: "PUT", path: "/v1/sequences/presets"),
+    ]
+  )
+
+  static let deleteSequencePreset = MCPToolDefinition(
+    name: "delete_sequence_preset",
+    description: "Delete a Sequence preset by id.",
+    inputSchema: [
+      "type": "object",
+      "properties": ["id": ["type": "string"]] as [String: Any],
+      "required": ["id"],
+    ] as [String: Any],
+    routes: [RouteRef(method: "DELETE", path: "/v1/sequences/presets/{id}")]
+  )
 
   static let listSequences = MCPToolDefinition(
     name: "list_sequences",
