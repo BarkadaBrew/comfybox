@@ -47,7 +47,11 @@ public enum DirectorValidator {
   public static func validate(
     _ timeline: DirectorTimeline,
     fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
-    audioProbe: (String) -> AudioProbe? = DirectorValidator.defaultAudioProbe
+    audioProbe: (String) -> AudioProbe? = DirectorValidator.defaultAudioProbe,
+    // WP11: pauses in a driving voice, so joins can be placed inside one.
+    // Injected for the same reason `fileExists` and `audioProbe` are — a
+    // validator test must not need a real wav on disk.
+    pauseRuns: (String, Int, Int) -> [Range<Int>] = DirectorAudioIngest.pauseRuns(atPath:fps:frameCount:)
   ) -> DirectorValidation {
     var issues: [DirectorIssue] = []
     var snapped = timeline
@@ -76,8 +80,6 @@ public enum DirectorValidator {
     if length != requested {
       issues.append(.warning("length_snapped", "length_frames \(requested) snapped up to \(length) (1 + 8k)"))
     }
-    // An audio-driven timeline chunks shorter, which lowers how much timeline
-    // fits inside the 16-chunk budget.
     let driven = timeline.isAudioDriven
     // Same ceiling for both since the 145 revert — a driving flag must not
     // cost timeline length.
@@ -90,13 +92,28 @@ public enum DirectorValidator {
       issues.append(.error("timeline_too_short", "timeline must be at least \(DirectorMath.minTimelineFrames) frames after snapping (got \(length))"))
     } else if length > maxLength {
       lengthValid = false
-      // An audio-driven timeline chunks shorter (WP11), so it reaches the
-      // 16-chunk ceiling at a shorter DURATION. Say which limit was hit and
-      // why, rather than silently producing 17 chunks or truncating.
       issues.append(.error("timeline_too_long", "timeline must be at most \(maxLength) frames (\(DirectorMath.maxChunks) chunks; got \(length))"))
     }
-    let layout = lengthValid
+    var layout = lengthValid
       ? DirectorMath.chunkLayout(lengthFrames: length, maxFrames: ceiling) : []
+    // WP11, Todd 2026-09-18: "use thoughtful pauses to span the joins."
+    // A viewer forgives phonemes that do not match — LTX-2 does coarse
+    // audio-visual correspondence, not phoneme-to-viseme. What they cannot
+    // forgive is a mouth caught mid-word jumping at a seam, and a seam is the
+    // only discontinuity a sequence has. So move each join into the deepest
+    // silence within reach, leaving the pause spanning it.
+    var joinsInPauses = false
+    if driven, layout.count > 1,
+       let voice = timeline.audioClips.first(where: { $0.drivesVideo }) {
+      let fps = snapped.settings.fps ?? DirectorTimeline.Settings.defaultFps
+      let runs = pauseRuns(voice.audioPath, fps, length)
+      if !runs.isEmpty {
+        let before = layout.map(\.startFrame)
+        layout = DirectorMath.spanningPauses(
+          layout, lengthFrames: length, maxFrames: ceiling, pauses: runs)
+        joinsInPauses = before != layout.map(\.startFrame)
+      }
+    }
 
     // MARK: Ids
 
@@ -263,7 +280,11 @@ public enum DirectorValidator {
     }
 
     let ok = !issues.contains { $0.severity == .error }
-    let plan = ok ? DirectorCompiler.plan(for: snapped, warnings: issues.filter { $0.severity == .warning }) : nil
+    let plan = ok
+      ? DirectorCompiler.plan(
+          for: snapped, warnings: issues.filter { $0.severity == .warning },
+          layout: layout, joinsInPauses: joinsInPauses)
+      : nil
     return DirectorValidation(snapped: snapped, issues: issues, ok: ok, plan: plan)
   }
 }

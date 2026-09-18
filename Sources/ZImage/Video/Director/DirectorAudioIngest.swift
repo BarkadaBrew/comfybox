@@ -217,3 +217,74 @@ public enum DirectorAudioIngest {
   }
 }
 #endif
+
+
+// MARK: - Pauses (WP11: silent joins)
+
+extension DirectorAudioIngest {
+
+  /// Contiguous runs of near-silence in a voice track, as video-frame ranges.
+  ///
+  /// Todd's rule, 2026-09-18: **do not speak across a join.** A viewer reads
+  /// mouth movement plus speech as synced even when the phonemes do not match —
+  /// what breaks the illusion is a visible discontinuity, and the only place a
+  /// sequence has one is a chunk boundary. Land every boundary in silence and
+  /// there is nothing there to perceive as out of sync.
+  ///
+  /// Two details matter and both were got wrong first time:
+  ///
+  /// - The threshold is RELATIVE to the track's own peak. A quiet take and a
+  ///   hot one both have pauses; an absolute dBFS floor finds none in the first
+  ///   and everything in the second.
+  /// - A pause is a RUN, not a frame. At 15% of peak, 65% of a normal take
+  ///   reads as "quiet" because the dips between syllables qualify — which is
+  ///   how a first pass concluded every boundary was already safe when two of
+  ///   five were mid-word. Requiring `minRunFrames` of continuous quiet is what
+  ///   distinguishes a pause from a consonant.
+  public static func pauseRuns(
+    _ pcm: StereoPCM, fps: Int, frameCount: Int,
+    relativeThreshold: Float = 0.05, minRunFrames: Int = 8, floor: Float = 1e-4
+  ) -> [Range<Int>] {
+    guard fps > 0, frameCount > 0, pcm.frames > 0 else { return [] }
+    let perFrame = max(1, pcm.sampleRate / fps)
+    var energy: [Float] = []
+    energy.reserveCapacity(frameCount)
+    for frame in 0..<frameCount {
+      let start = frame * perFrame
+      guard start < pcm.frames else { energy.append(0); continue }
+      let end = min(pcm.frames, start + perFrame)
+      var sum: Float = 0
+      for i in start..<end {
+        let mono = (pcm.left[i] + pcm.right[i]) * 0.5
+        sum += mono * mono
+      }
+      energy.append((sum / Float(end - start)).squareRoot())
+    }
+    let peak = energy.max() ?? 0
+    guard peak > floor else { return [0..<frameCount] }
+    let threshold = peak * relativeThreshold
+
+    var runs: [Range<Int>] = []
+    var start: Int? = nil
+    for frame in 0..<frameCount {
+      if energy[frame] <= threshold {
+        if start == nil { start = frame }
+      } else if let began = start {
+        if frame - began >= minRunFrames { runs.append(began..<frame) }
+        start = nil
+      }
+    }
+    if let began = start, frameCount - began >= minRunFrames { runs.append(began..<frameCount) }
+    return runs
+  }
+
+  /// Read a clip and report its pauses. An unreadable file yields NO pauses,
+  /// so boundaries stay where the arithmetic put them — a worse join, never a
+  /// failed render.
+  public static func pauseRuns(
+    atPath path: String, fps: Int, frameCount: Int
+  ) -> [Range<Int>] {
+    guard let pcm = try? decode(path: path) else { return [] }
+    return pauseRuns(pcm, fps: fps, frameCount: frameCount)
+  }
+}
