@@ -106,6 +106,7 @@ or carry a reasoned exemption (§3.5 assertion 3).
 | POST | `/v1/queue/{id}/move` | move_queue_job |  |
 | GET | `/v1/sequences` | list_sequences |  |
 | POST | `/v1/sequences/check` | check_sequence |  |
+| POST | `/v1/sequences/draft` | draft_sequence |  |
 | GET | `/v1/sequences/presets` | list_sequence_presets |  |
 | POST | `/v1/sequences/presets` | upsert_sequence_preset |  |
 | PUT | `/v1/sequences/presets` | upsert_sequence_preset |  |

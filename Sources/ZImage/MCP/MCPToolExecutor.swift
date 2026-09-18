@@ -125,6 +125,14 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeLibraryMarkUsed(arguments)
       case "library_import_studio_packs":
         return try await executeLibraryImportStudioPacks(arguments)
+      case "draft_sequence":
+        guard let params = arguments, params.string("preset_id")?.isEmpty == false,
+              params.string("brief")?.isEmpty == false else {
+          return MCPToolResult(error: "Error: 'preset_id' and 'brief' are required")
+        }
+        let drafted = try await client.post(
+          "/v1/sequences/draft", body: try JSONEncoder().encode(params.raw))
+        return Self.mapHTTPResponse(status: drafted.0, data: drafted.1)
       case "list_sequence_presets":
         return try await executeGet("/v1/sequences/presets")
       case "upsert_sequence_preset":

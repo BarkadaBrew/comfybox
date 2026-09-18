@@ -62,6 +62,7 @@ public enum MCPToolRegistry {
     libraryCollectionDelete.annotated(.destructive),
     libraryImportPack.annotated(.additive),
     libraryImportStudioPacks.annotated(.additive),
+    draftSequence.annotated(.additive),
     listSequencePresets.annotated(.readOnly),
     upsertSequencePreset.annotated(.additive),
     deleteSequencePreset.annotated(.destructive),
@@ -1178,6 +1179,27 @@ public enum MCPToolRegistry {
   )
 
   // MARK: - Sequences (FDD-ltx-director-tab §4.9.2)
+
+  static let draftSequence = MCPToolDefinition(
+    name: "draft_sequence",
+    description: """
+      Draft a Director timeline from a brief and a Sequence preset. The preset owns every number \
+      (length, chunking, keyframe slots, segment boundaries); the assistant writes only prose. \
+      Returns the timeline, any validator issues that survived one repair, and a GPU estimate. \
+      DRAFTING NEVER RENDERS — call generate_director_video separately once Todd has seen it.
+      """,
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "preset_id": ["type": "string"],
+        "brief": ["type": "string", "description": "What the clip should be, in a sentence or two"],
+        "keyframe_paths": ["type": "array", "items": ["type": "string"]] as [String: Any],
+        "audio_path": ["type": "string", "description": "A voice track for imported or driven audio"],
+      ] as [String: Any],
+      "required": ["preset_id", "brief"],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/sequences/draft")]
+  )
 
   static let listSequencePresets = MCPToolDefinition(
     name: "list_sequence_presets",
