@@ -313,6 +313,16 @@ public struct DirectorTimeline: Codable, Sendable, Equatable {
   public var referenceClips: [ReferenceClip]
   public var retake: Retake
 
+  /// Does any clip drive the picture from its audio (WP11)? Such a timeline
+  /// chunks SHORTER — see `DirectorMath.audioDrivenChunkFrames` for the
+  /// measurement.
+  public var isAudioDriven: Bool { audioClips.contains { $0.drivesVideo } }
+
+  /// The chunk ceiling this timeline should be split at.
+  public var chunkCeilingFrames: Int {
+    isAudioDriven ? DirectorMath.audioDrivenChunkFrames : DirectorMath.maxChunkFrames
+  }
+
   public init(
     version: Int = DirectorTimeline.currentVersion,
     settings: Settings,

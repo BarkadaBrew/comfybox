@@ -37,8 +37,11 @@ final class DirectorAudioDrivenTests: XCTestCase {
 
   func testADrivingClipTurnsOnAudioAndNamesTheVoiceForEveryChunk() throws {
     let compilation = try compile(timeline())
-    XCTAssertEqual(compilation.chunks.count, 2, "577 frames is two chunks")
+    // A driving timeline chunks at the AUDIO ceiling, not the 289 default
+    // (WP11) — so assert the property, not a frame count that moves with it.
+    XCTAssertGreaterThan(compilation.chunks.count, 1)
     for chunk in compilation.chunks {
+      XCTAssertLessThanOrEqual(chunk.span.frames, DirectorMath.audioDrivenChunkFrames)
       XCTAssertEqual(chunk.body["audio"] as? Bool, true, "chunk \(chunk.index) must run its audio stream")
       XCTAssertEqual(chunk.body["audio_condition_path"] as? String, "/audio/voice.wav")
     }
@@ -46,25 +49,45 @@ final class DirectorAudioDrivenTests: XCTestCase {
 
   func testEachChunkGetsItsOwnSliceOfTheOneVoice() throws {
     let compilation = try compile(timeline())
-    let starts = compilation.chunks.map { $0.body["audio_condition_start_frame"] as? Int }
-    XCTAssertEqual(starts.first, 0, "chunk 0 starts at the top of the track")
+    // EVERY chunk reads the track at its own timeline position — the voice is
+    // continuous across the seams rather than restarting at each one.
+    for chunk in compilation.chunks {
+      XCTAssertEqual(
+        chunk.body["audio_condition_start_frame"] as? Int, chunk.span.startFrame,
+        "chunk \(chunk.index) must read the track where it sits on the timeline")
+    }
     XCTAssertEqual(
-      starts.last, compilation.chunks[1].span.startFrame,
-      "chunk 1 starts exactly where it sits on the timeline — the voice does not restart")
+      compilation.chunks.first?.body["audio_condition_start_frame"] as? Int, 0,
+      "chunk 0 starts at the top of the track")
   }
 
   func testAClipTrimAtTheHeadShiftsEveryChunkEqually() throws {
     let compilation = try compile(timeline(trim: 48))
-    let starts = compilation.chunks.compactMap { $0.body["audio_condition_start_frame"] as? Int }
-    XCTAssertEqual(starts.first, 48, "a trimmed head is an offset into the FILE, not the timeline")
-    XCTAssertEqual(starts.last, compilation.chunks[1].span.startFrame + 48)
+    for chunk in compilation.chunks {
+      XCTAssertEqual(
+        chunk.body["audio_condition_start_frame"] as? Int, chunk.span.startFrame + 48,
+        "a trimmed head is a constant offset into the FILE, not the timeline")
+    }
   }
 
   func testAChunkBeforeTheVoiceStartsIsNotConditioned() throws {
-    // The voice starts at frame 300, inside chunk 1 — chunk 0 has nothing to follow.
+    // The voice starts at frame 300: every chunk that ENDS before it has
+    // nothing to follow, and every chunk the clip covers is conditioned.
+    // Stated against the span so it survives a change of chunk ceiling.
     let compilation = try compile(timeline(clipStart: 300))
-    XCTAssertNil(compilation.chunks[0].body["audio_condition_path"])
-    XCTAssertEqual(compilation.chunks[1].body["audio_condition_path"] as? String, "/audio/voice.wav")
+    var sawUnconditioned = false
+    var sawConditioned = false
+    for chunk in compilation.chunks {
+      let path = chunk.body["audio_condition_path"] as? String
+      if chunk.span.startFrame + chunk.span.frames <= 300 {
+        XCTAssertNil(path, "chunk \(chunk.index) ends before the voice starts")
+        sawUnconditioned = true
+      } else {
+        XCTAssertEqual(path, "/audio/voice.wav", "chunk \(chunk.index) is covered by the clip")
+        sawConditioned = true
+      }
+    }
+    XCTAssertTrue(sawUnconditioned && sawConditioned, "the fixture must exercise both sides")
   }
 
   func testAnOrdinaryImportedClipChangesNothing() throws {
