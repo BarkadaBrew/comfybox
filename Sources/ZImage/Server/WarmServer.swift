@@ -2031,6 +2031,9 @@ public final class WarmServer {
 
     // MARK: - Sequences (FDD-ltx-director-tab §4.9.2, WP13)
 
+    case ("POST", "/v1/sequences/draft"):
+      return await sequenceDraftResponse(body: request.body)
+
     case ("GET", "/v1/sequences/presets"):
       return .json(status: 200, payload: sequencePresetStore.all())
 
@@ -5075,6 +5078,88 @@ public final class WarmServer {
         status: deleted ? 200 : 404, payload: DeleteResult(success: deleted, id: id, deleted: deleted))
     } catch {
       return .error(.error(status: 500, message: error.localizedDescription))
+    }
+  }
+
+  /// `POST /v1/sequences/draft` — `{preset_id, brief, keyframe_paths?,
+  /// audio_path?}`. The drafter (FDD §4.9.4, WP15): the preset owns every
+  /// number, the assistant writes only prose, the validator judges the result,
+  /// and ONE repair attempt carries the validator's own issues back.
+  /// Never renders: drafting and spending the GPU are separate decisions.
+  private func sequenceDraftResponse(body: Data) async -> RoutedResponse {
+    struct DraftRequest: Decodable {
+      let presetId: String
+      let brief: String
+      let keyframePaths: [String]?
+      let audioPath: String?
+      enum CodingKeys: String, CodingKey {
+        case brief
+        case presetId = "preset_id"
+        case keyframePaths = "keyframe_paths"
+        case audioPath = "audio_path"
+      }
+    }
+    guard let decoded = try? JSONDecoder().decode(DraftRequest.self, from: body) else {
+      return .error(.error(status: 400, message: "Invalid body: expected {preset_id, brief}"))
+    }
+    guard !decoded.brief.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return .error(.error(status: 400, message: SequenceDraftError.emptyBrief.localizedDescription))
+    }
+    guard let preset = sequencePresetStore.preset(id: decoded.presetId) else {
+      return .error(.error(
+        status: 404,
+        message: SequenceDraftError.unknownPreset(decoded.presetId).localizedDescription))
+    }
+    guard let endpoint = ServerConfigStore.shared.current().config.providers.assistant else {
+      return .error(.error(status: 503, message: SequenceDraftError.noAuthor.localizedDescription))
+    }
+
+    let request = SequenceDraftRequest(
+      presetId: decoded.presetId, brief: decoded.brief,
+      keyframePaths: decoded.keyframePaths ?? [], audioPath: decoded.audioPath)
+    let spans = preset.segmentSpans()
+    let keyframeSlots = max(0, preset.keyframeFrames().count - request.keyframePaths.count)
+    let system = SequenceDrafter.systemPrompt(
+      preset: preset, segmentCount: spans.count, keyframeSlots: keyframeSlots)
+    let user = SequenceDrafter.userPrompt(
+      brief: decoded.brief, preset: preset,
+      segmentSeconds: spans.map { Double($0.length) / Double(preset.fps) })
+
+    do {
+      var (prose, model) = try await SequenceDrafter.ask(
+        endpoint: endpoint, system: system, user: user)
+      var timeline = SequenceDrafter.assemble(prose: prose, preset: preset, request: request)
+      var validation = DirectorValidator.validate(timeline)
+
+      // One repair, carrying the validator's own words.
+      if !validation.ok {
+        let repair = user + "\n\n" + SequenceDrafter.repairPrompt(issues: validation.issues)
+        if let second = try? await SequenceDrafter.ask(
+          endpoint: endpoint, system: system, user: repair) {
+          prose = second.prose
+          model = second.model
+          timeline = SequenceDrafter.assemble(prose: prose, preset: preset, request: request)
+          validation = DirectorValidator.validate(timeline)
+        }
+      }
+
+      let draft = SequenceDraft(
+        timeline: timeline,
+        presetId: preset.id,
+        templateVersion: SequenceDrafter.templateVersion,
+        model: model,
+        issues: validation.issues,
+        keyframeDescriptions: prose.keyframeDescriptions ?? [],
+        estimatedGpuMinutes: preset.chunkCount * 25)
+      auditLog.append(
+        kind: "sequence.draft",
+        message: "Drafted a \(preset.chunkCount)-chunk sequence from preset \(preset.id)",
+        metadata: ["preset": preset.id])
+      return .json(status: 200, payload: draft)
+    } catch let error as SequenceDraftError {
+      return .error(.error(status: 502, message: error.localizedDescription))
+    } catch {
+      return .error(.error(status: 502, message: "Drafting failed: \(error.localizedDescription)"))
     }
   }
 
