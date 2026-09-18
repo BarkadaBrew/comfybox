@@ -79,7 +79,9 @@ public enum DirectorValidator {
     // An audio-driven timeline chunks shorter, which lowers how much timeline
     // fits inside the 16-chunk budget.
     let driven = timeline.isAudioDriven
-    let ceiling = driven ? DirectorMath.audioDrivenChunkFrames : DirectorMath.maxChunkFrames
+    // Same ceiling for both since the 145 revert — a driving flag must not
+    // cost timeline length.
+    let ceiling = DirectorMath.maxChunkFrames
     let maxLength = 1 + DirectorMath.latentStride * ((ceiling - 1) / DirectorMath.latentStride)
       * DirectorMath.maxChunks
     var lengthValid = true
@@ -91,10 +93,7 @@ public enum DirectorValidator {
       // An audio-driven timeline chunks shorter (WP11), so it reaches the
       // 16-chunk ceiling at a shorter DURATION. Say which limit was hit and
       // why, rather than silently producing 17 chunks or truncating.
-      let because = driven
-        ? " (audio-driven timelines chunk at \(DirectorMath.audioDrivenChunkFrames) frames so the mouth follows the voice)"
-        : ""
-      issues.append(.error("timeline_too_long", "timeline must be at most \(maxLength) frames (\(DirectorMath.maxChunks) chunks; got \(length))\(because)"))
+      issues.append(.error("timeline_too_long", "timeline must be at most \(maxLength) frames (\(DirectorMath.maxChunks) chunks; got \(length))"))
     }
     let layout = lengthValid
       ? DirectorMath.chunkLayout(lengthFrames: length, maxFrames: ceiling) : []
