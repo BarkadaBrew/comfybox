@@ -5426,15 +5426,19 @@ public final class WarmServer {
       var templateId: String?
       var values: [String: String]?
       var outfitId: String?
+      /// Per-slot placement (smart | token | append | prepend | off). A slot
+      /// with no entry is `smart`: substitute if the template has the marker,
+      /// otherwise append — so a component is usable against a template that
+      /// never declared it.
+      var placement: [String: String]?
+      /// Item ids per slot, so the response can say what made this prompt.
+      var itemIds: [String: String]?
       enum CodingKeys: String, CodingKey {
         case templateId = "template_id"
-        case values
+        case values, placement
         case outfitId = "outfit_id"
+        case itemIds = "item_ids"
       }
-    }
-    struct FillResult: Encodable {
-      let prompt: String
-      let unfilled: [String]
     }
     do {
       let req = try JSONDecoder().decode(FillRequest.self, from: body)
@@ -5449,9 +5453,15 @@ public final class WarmServer {
         let phrase = store.renderOutfit(outfit)
         if !phrase.isEmpty, values["OUTFIT"] == nil { values["OUTFIT"] = phrase }
       }
-      let prompt = LibraryStore.fill(template: template, values: values)
-      let unfilled = LibraryStore.slotMarkers(in: prompt).sorted()
-      return .json(status: 200, payload: FillResult(prompt: prompt, unfilled: unfilled))
+      let components = values.keys.sorted().map { slot in
+        LibraryComponentUse(
+          slot: slot,
+          value: values[slot] ?? "",
+          placement: req.placement?[slot].flatMap(LibraryPlacement.init(rawValue:)) ?? .smart,
+          itemId: req.itemIds?[slot])
+      }
+      let composition = LibraryComposer.compose(template: template, components: components)
+      return .json(status: 200, payload: composition)
     } catch {
       return .error(.error(status: 400, message: "Invalid fill payload: \(error.localizedDescription)"))
     }

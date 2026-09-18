@@ -1084,15 +1084,25 @@ public enum MCPToolRegistry {
   static let libraryFillTemplate = MCPToolDefinition(
     name: "library_fill_template",
     description: """
-      Fill a Creative Library template's slots and get the prompt back. An unfilled slot stays \
-      visible as {SLOT} and is listed in `unfilled`. Pass `outfit_id` to drop an outfit's phrase \
-      into the OUTFIT slot.
+      Fill a Creative Library template's slots and get the prompt back, with a per-slot report \
+      of what happened (substituted / appended / removed / missing marker). An unfilled slot \
+      stays visible as {SLOT} and is listed in `unfilled`. Pass `outfit_id` to drop an outfit's \
+      phrase into the OUTFIT slot, and `placement` to append a component the template never \
+      declared.
       """,
     inputSchema: [
       "type": "object",
       "properties": [
         "template_id": ["type": "string"],
         "values": ["type": "object", "description": "Slot id -> text"] as [String: Any],
+        "placement": [
+          "type": "object",
+          "description": "Slot id -> smart | token | append | prepend | off. smart substitutes when the template has the marker and appends when it does not; off removes the marker and its clause. Default smart.",
+        ] as [String: Any],
+        "item_ids": [
+          "type": "object",
+          "description": "Slot id -> library item id, so the response records what made the prompt.",
+        ] as [String: Any],
         "outfit_id": ["type": "string"],
       ] as [String: Any],
       "required": ["template_id"],
