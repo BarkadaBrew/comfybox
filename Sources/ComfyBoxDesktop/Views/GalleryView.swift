@@ -35,6 +35,10 @@ enum GallerySortOrder: String, CaseIterable {
 struct GalleryView: View {
     let store: DAMStore
     let ingestor: AssetIngestor
+    /// Show ONLY remote-gallery contents, with a picker of the configured
+    /// remotes — what the Remote Gallery tab asks for
+    /// (FDD-remote-galleries §3.5).
+    var remoteScope: Bool = false
     /// Archive engine (moves assets to a `.cbarchive` bundle). Optional so
     /// previews/tests can omit it.
     var archiver: GalleryArchiver?
@@ -90,6 +94,7 @@ struct GalleryView: View {
     @State private var pendingRemoteSend: (remote: RemoteGalleryConfig, assets: [DAMAsset])?
     @State private var remoteSendInFlight = false
     @State private var remoteSendResult: String?
+    @State private var remoteScopeSelection: String?
     @State private var isSelectMode: Bool = false
     // Grid page size. Select All raises it to the full scope for the rest of
     // the session so the selection is truthful, not capped at one page.
@@ -239,6 +244,26 @@ struct GalleryView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                     .background(Color(nsColor: .windowBackgroundColor))
+
+                if remoteScope {
+                    remoteScopeBar
+                        .background(Color(nsColor: .windowBackgroundColor))
+                    Divider()
+                }
+
+                if let remoteSendResult {
+                    HStack(spacing: 8) {
+                        Image(systemName: "externaldrive.badge.checkmark")
+                        Text(remoteSendResult).font(.callout)
+                        Spacer()
+                        Button("Dismiss") { self.remoteSendResult = nil }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color(nsColor: .controlBackgroundColor))
+                }
 
                 smartTabsRow
                     .background(Color(nsColor: .windowBackgroundColor))
@@ -429,6 +454,11 @@ struct GalleryView: View {
             // Assets on an attached drive read from that drive; assets on one
             // that is not attached are hidden (FDD-remote-galleries §3.5).
             b.remoteGalleryRoots = remoteGalleryRootsByHost()
+            if remoteScope {
+                // Default to the first remote that is here.
+                if remoteScopeSelection == nil { remoteScopeSelection = remoteRegistry.reachable.first?.id }
+                applyRemoteScope()
+            }
             if !remotes.isEmpty {
                 await RemoteGalleryTransfer(store: store, catalog: catalog, ingestor: ingestor)
                     .recoverPending(remotes: remotes)
@@ -937,6 +967,20 @@ struct GalleryView: View {
             aspectRatio: aspectRatio(asset),
             isComparisonSelected: isSelectMode ? isSelected : nil
         )
+                    // A moved asset says where it lives now, or a send looks
+                    // like it did nothing (Todd 2026-09-17).
+                    .overlay(alignment: .bottomLeading) {
+                        if let name = remoteGalleryName(for: asset.id) {
+                            HStack(spacing: 3) {
+                                Image(systemName: "externaldrive.fill").font(.caption2)
+                                Text(name).font(.caption2)
+                            }
+                            .padding(.horizontal, 5).padding(.vertical, 2)
+                            .background(.black.opacity(0.55), in: Capsule())
+                            .foregroundStyle(.white)
+                            .padding(6)
+                        }
+                    }
                     .blur(radius: blurNSFW ? 22 : 0)
                     .overlay {
                         if blurNSFW {
@@ -1820,6 +1864,71 @@ struct GalleryView: View {
         return "Moved \(sent) to \(remoteName); \(failed) failed and kept their local copies"
     }
 
+    /// The remote gallery this asset lives on, by name, or nil when it is on
+    /// this Mac.
+    private func remoteGalleryName(for assetID: String) -> String? {
+        guard let host = browser?.remoteHostByAsset[assetID] else { return nil }
+        let remotes = DesktopSettings.load().remoteGalleries ?? []
+        return remotes.first(where: { $0.locationHost == host })?.name
+    }
+
+    /// The Remote Gallery tab's header: one row per configured remote with its
+    /// status, and the contents of the selected one below.
+    @ViewBuilder
+    private var remoteScopeBar: some View {
+        let remotes = DesktopSettings.load().remoteGalleries ?? []
+        HStack(spacing: 8) {
+            if remotes.isEmpty {
+                Text("No remote galleries configured — add one in Settings → Gallery.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(remotes) { remote in
+                    let status = remoteRegistry.status(of: remote.id)
+                    Button {
+                        remoteScopeSelection = remote.id
+                        applyRemoteScope()
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: remote.kind == .immich ? "server.rack" : "externaldrive")
+                            Text(remote.name)
+                            Text(Self.remoteStatusLabel(status))
+                                .font(.caption2)
+                                .foregroundStyle(status == .reachable ? .green : .secondary)
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(remoteScopeSelection == remote.id ? .accentColor : .secondary)
+                    .disabled(status != .reachable)
+                }
+            }
+            Spacer()
+            if let count = browser?.items.count, remoteScopeSelection != nil {
+                Text("\(count) item\(count == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    /// What the tab shows next to a remote's name.
+    static func remoteStatusLabel(_ status: RemoteGalleryStatus) -> String {
+        switch status {
+        case .reachable: return "here"
+        case .absent: return "not attached"
+        case .disabled: return "off"
+        }
+    }
+
+    private func applyRemoteScope() {
+        guard remoteScope else { return }
+        let remotes = DesktopSettings.load().remoteGalleries ?? []
+        guard let id = remoteScopeSelection, let remote = remotes.first(where: { $0.id == id }) else {
+            browser?.restrictToRemoteHost = nil
+            return
+        }
+        browser?.restrictToRemoteHost = remote.locationHost
+    }
+
     /// Where each reachable remote gallery is, keyed by its location host.
     private func remoteGalleryRootsByHost() -> [String: String] {
         var roots: [String: String] = [:]
@@ -1838,12 +1947,15 @@ struct GalleryView: View {
         let transfer = RemoteGalleryTransfer(store: store, catalog: catalog, ingestor: ingestor)
         let outcome = await transfer.send(assets: assets, to: remote)
         browser?.remoteGalleryRoots = remoteGalleryRootsByHost()
-        remoteSendResult = Self.sendResultLine(sent: outcome.sent.count,
-                                               failed: outcome.failed.count,
-                                               remoteName: remote.name)
+        var line = Self.sendResultLine(sent: outcome.sent.count,
+                                       failed: outcome.failed.count,
+                                       remoteName: remote.name)
         if let first = outcome.failed.first {
+            // Say WHY on screen: a silent failure reads as "nothing happened".
+            line += " — \(first.reason)"
             print("[remote-gallery] send failed for \(first.assetID): \(first.reason)")
         }
+        remoteSendResult = line
         selectedIds.subtract(Set(outcome.sent))
         await loadAssets()
     }

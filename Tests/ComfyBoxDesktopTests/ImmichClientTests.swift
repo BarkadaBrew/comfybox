@@ -90,7 +90,7 @@ struct ImmichClientTests {
         let asset = try await client().upload(fileAt: path, assetID: "a1",
                                               createdAt: Date(timeIntervalSince1970: 1_700_000_000),
                                               modifiedAt: Date(timeIntervalSince1970: 1_700_000_000),
-                                              sidecar: Data(#"{"prompt":"a barista"}"#.utf8))
+                                              sidecar: nil)
         #expect(asset.id == "immich-1")
         #expect(asset.isPresent)
 
@@ -105,7 +105,24 @@ struct ImmichClientTests {
         #expect(body.contains("name=\"deviceAssetId\""))
         #expect(body.contains("a1"))
         #expect(body.contains("name=\"assetData\""))
-        #expect(body.contains("name=\"sidecarData\""), "the recipe travels with the file")
+        // Two shapes learned from the live server on 2026-09-17: an EMPTY
+        // metadata list makes Immich fail its own insert (HTTP 500), and a JSON
+        // sidecar is rejected outright ("Unsupported file type"). So neither is
+        // sent; the recipe goes on the description.
+        #expect(!body.contains("name=\"metadata\""))
+        #expect(!body.contains("name=\"sidecarData\""))
+    }
+
+    @Test("the recipe is put on the asset description")
+    func descriptionCarriesTheRecipe() async throws {
+        ImmichStubProtocol.reset()
+        ImmichStubProtocol.handler = { _ in (200, Data("{}".utf8)) }
+        try await client().setDescription(assetID: "immich-1", text: #"{"prompt":"a barista"}"#)
+        let request = try #require(ImmichStubProtocol.seen.last)
+        #expect(request.httpMethod == "PUT")
+        #expect(request.url?.path == "/api/assets/immich-1")
+        let body = String(decoding: try #require(request.httpBody), as: UTF8.self)
+        #expect(body.contains("description"))
         #expect(body.contains("a barista"))
     }
 

@@ -250,10 +250,8 @@ public final class RemoteGalleryTransfer {
 
         let uploaded: ImmichAsset
         do {
-            let sidecar = try? RemoteSidecar(asset: asset, sha256: digest, sentAt: sentAt, sensitive: secured).encoded()
             uploaded = try await client.upload(fileAt: asset.absolutePath, assetID: asset.id,
-                                               createdAt: asset.createdAt, modifiedAt: asset.modifiedAt,
-                                               sidecar: sidecar)
+                                               createdAt: asset.createdAt, modifiedAt: asset.modifiedAt)
             // Confirm by CHECKSUM, not merely by id: the local copy is about
             // to be deleted (Codex review of the implementation).
             let sha1 = try ImmichClient.sha1Base64(ofFileAt: asset.absolutePath)
@@ -261,6 +259,12 @@ public final class RemoteGalleryTransfer {
                 throw TransferError.notConfirmedOnServer(asset.filename)
             }
             if let albumID { try? await client.addToAlbum(albumID: albumID, assetIDs: [uploaded.id]) }
+            // The recipe travels in the description (Immich takes no JSON
+            // sidecar). Best effort: a send is not failed over it.
+            if let sidecar = try? RemoteSidecar(asset: asset, sha256: digest, sentAt: sentAt, sensitive: secured).encoded(),
+               let text = String(data: sidecar, encoding: .utf8) {
+                try? await client.setDescription(assetID: uploaded.id, text: text)
+            }
         } catch {
             try? await catalog.setTransferState(assetID: asset.id, state: .failed)
             throw error

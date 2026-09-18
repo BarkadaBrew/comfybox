@@ -48,6 +48,16 @@ public final class CatalogBrowser {
         didSet { if oldValue != remoteGalleryRoots { Task { await reload() } } }
     }
 
+    /// When set, the page shows ONLY assets on that remote gallery — what the
+    /// Remote Gallery tab asks for.
+    public var restrictToRemoteHost: String? {
+        didSet { if oldValue != restrictToRemoteHost { Task { await reload() } } }
+    }
+
+    /// Which remote gallery each asset on the current page lives on, keyed by
+    /// asset id. Used to mark a moved asset in the grid.
+    public private(set) var remoteHostByAsset: [String: String] = [:]
+
     private let store: CatalogStore
     private let engineBaseURL: String
 
@@ -98,6 +108,23 @@ public final class CatalogBrowser {
     /// as the caller set it — the desktop passes nil, because on the owner's own
     /// machine it is the CONTENT GATE, not the chat-mode clamp, that decides what
     /// is on screen.
+    /// Load one remote gallery's contents, newest first, instead of the
+    /// filtered catalog page.
+    private func loadRemoteScoped(host: String) async {
+        do {
+            let ids = try await store.assetIDs(onHost: host, limit: 2_000)
+            var rows: [CatalogAsset] = []
+            for id in ids {
+                if let row = try await store.asset(id: id, visibleTo: nil, ceiling: nil) { rows.append(row) }
+            }
+            await resolve(rows)
+            error = nil
+        } catch {
+            self.error = error.localizedDescription
+            items = []
+        }
+    }
+
     public func apply(filter: CatalogQuery) async {
         isLoading = true
         defer { isLoading = false }
@@ -105,6 +132,12 @@ public final class CatalogBrowser {
         var q = filter
         q.scope = nil
         activeFilter = q
+        // Scoped to one remote gallery: its contents, not a filtered page.
+        if let host = restrictToRemoteHost {
+            await loadRemoteScoped(host: host)
+            collections = (try? await store.collections(visibleTo: nil)) ?? collections
+            return
+        }
         do {
             let rows = try await store.search(q)
             collections = try await store.collections(visibleTo: nil)
@@ -178,6 +211,7 @@ public final class CatalogBrowser {
         var kept: [CatalogAsset] = []
         var local: [String: String] = [:]
         var remote: [String: String] = [:]
+        var remoteHosts: [String: String] = [:]
 
         for row in rows {
             guard !hiddenAssetIDs.contains(row.id) else { continue }
@@ -200,6 +234,7 @@ public final class CatalogBrowser {
                 let path = (root as NSString).appendingPathComponent(remoteLocation.path)
                 guard fm.fileExists(atPath: path) else { continue }
                 local[row.id] = path
+                remoteHosts[row.id] = remoteLocation.host
                 kept.append(row)
                 continue
             }
@@ -224,6 +259,7 @@ public final class CatalogBrowser {
         items = kept
         localPaths = local
         remotePaths = remote
+        remoteHostByAsset = remoteHosts
     }
 
     // MARK: - Where an asset's bytes are

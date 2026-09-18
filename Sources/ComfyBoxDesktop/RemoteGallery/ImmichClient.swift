@@ -76,12 +76,13 @@ public struct ImmichClient: Sendable {
 
     // MARK: - Upload
 
-    /// Upload one file. `sidecar`, when given, rides along as `sidecarData`.
+    /// Upload one file. ComfyBox's own metadata does NOT ride along here; see
+    /// `setDescription`.
     public func upload(fileAt path: String,
                        assetID: String,
                        createdAt: Date,
                        modifiedAt: Date,
-                       sidecar: Data?) async throws -> ImmichAsset {
+                       sidecar: Data? = nil) async throws -> ImmichAsset {
         let url = try endpoint("/api/assets")
         let fileURL = URL(fileURLWithPath: path)
         let filename = fileURL.lastPathComponent
@@ -103,17 +104,20 @@ public struct ImmichClient: Sendable {
         }
 
         let formatter = ISO8601DateFormatter()
-        // `metadata` is REQUIRED by AssetMediaCreateDto in Immich 2.3.1
-        // (verified against the server's own /api/spec.json). It is a list of
-        // upsert items; ComfyBox's own metadata rides in `sidecarData`, so an
-        // empty list is what this send means.
-        field("metadata", "[]")
+        // `metadata` is marked required by AssetMediaCreateDto in 2.3.1, but an
+        // EMPTY list makes the server fail the insert ("syntax error at or
+        // near )" from Postgres, HTTP 500 — observed live 2026-09-17 against
+        // 10.0.100.232). Omitting it entirely succeeds, and the only legal key
+        // is "mobile-app", which is not ours. So it is left out.
         field("deviceAssetId", assetID)
         field("deviceId", "comfybox-desktop")
         field("fileCreatedAt", formatter.string(from: createdAt))
         field("fileModifiedAt", formatter.string(from: modifiedAt))
         file("assetData", filename, data, "application/octet-stream")
-        if let sidecar { file("sidecarData", filename + ".json", sidecar, "application/json") }
+        // NOT sidecarData: Immich only accepts an XMP sidecar there and
+        // rejects JSON outright ("Unsupported file type", HTTP 400 — observed
+        // live). The recipe goes into the asset description instead, which is
+        // what `setDescription` is for.
         body.append("--\(boundary)--\r\n")
 
         var request = URLRequest(url: url)
@@ -159,6 +163,20 @@ public struct ImmichClient: Sendable {
 
     public func assetExists(id: String) async throws -> Bool {
         try await assetDetails(id: id) != nil
+    }
+
+    /// Put the ComfyBox recipe on the asset. Immich's description is a free
+    /// text field and is the only place arbitrary metadata survives: the
+    /// metadata upsert list takes one key ("mobile-app") and sidecars must be
+    /// XMP. Best effort — a send is not failed over a description.
+    public func setDescription(assetID: String, text: String) async throws {
+        let url = try endpoint("/api/assets/\(assetID)")
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["description": text])
+        _ = try await sendAllowingArray(request)
     }
 
     // MARK: - Albums
