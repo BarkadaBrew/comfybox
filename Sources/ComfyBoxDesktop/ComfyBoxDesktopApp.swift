@@ -35,6 +35,9 @@ struct ComfyBoxDesktopApp: App {
     @State private var pendingPromptInsert: String?
     @State private var pendingReferenceImage: String?
     @State private var pendingMotionReference: String?
+    /// A rendered clip the Director tab should reopen from its sequence
+    /// sidecar, set by the gallery's "Open in Director" (WP13).
+    @State private var pendingSequenceClip: String?
     @State private var pendingInpaintImage: String?
     @State private var pendingInpaintMask: MaskStrokes?
     @State private var pendingEdit: EditRequest?
@@ -489,6 +492,10 @@ struct ComfyBoxDesktopApp: App {
                     pendingMotionReference = asset.absolutePath
                     selectedTab = .motion
                 },
+                onOpenSequence: { asset in
+                    pendingSequenceClip = asset.absolutePath
+                    selectedTab = .director
+                },
                 onInpaint: { asset in
                     pendingInpaintImage = asset.absolutePath
                     selectedTab = .inpaint
@@ -571,7 +578,7 @@ struct ComfyBoxDesktopApp: App {
             MotionView(engine: engine, pendingMotionReference: $pendingMotionReference)
 
         case .director:
-            DirectorView(engine: engine)
+            DirectorView(engine: engine, pendingSequenceClip: $pendingSequenceClip)
 
         case .mflux:
             MfluxView(mflux: mfluxService, ingestor: ingestor)
