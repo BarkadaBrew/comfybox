@@ -1797,9 +1797,12 @@ struct GalleryView: View {
         rows.reserveCapacity(browser.items.count)
         for item in browser.items {
             rows.append(damByID[item.id] ?? browser.damAsset(for: item))
-            if browser.localPath(forID: item.id) == nil,
-               let url = browser.resolvedStreamURL(forID: item.id) {
-                urls[item.id] = url
+            if browser.localPath(forID: item.id) == nil {
+                if let immich = Self.immichThumbnailURL(assetID: item.id, browser: browser) {
+                    urls[item.id] = immich
+                } else if let url = browser.resolvedStreamURL(forID: item.id) {
+                    urls[item.id] = url
+                }
             }
         }
         assets = rows
@@ -1864,6 +1867,16 @@ struct GalleryView: View {
         return "Moved \(sent) to \(remoteName); \(failed) failed and kept their local copies"
     }
 
+    /// The authenticated thumbnail URL for an asset that lives on an Immich
+    /// server. `ImmichThumbnailProtocol` handles the scheme and adds the key.
+    static func immichThumbnailURL(assetID: String, browser: CatalogBrowser) -> URL? {
+        guard let host = browser.remoteHostByAsset[assetID],
+              let path = browser.remotePaths[assetID], path.hasPrefix("immich://") else { return nil }
+        let immichID = String(path.dropFirst("immich://".count))
+        let remoteID = String(host.dropFirst(CatalogBrowser.remoteHostPrefix.count))
+        return ImmichThumbnailProtocol.url(remoteID: remoteID, immichAssetID: immichID)
+    }
+
     /// The remote gallery this asset lives on, by name, or nil when it is on
     /// this Mac.
     private func remoteGalleryName(for assetID: String) -> String? {
@@ -1874,16 +1887,21 @@ struct GalleryView: View {
 
     /// The Remote Gallery tab's header: one row per configured remote with its
     /// status, and the contents of the selected one below.
+    /// The configured remotes, read fresh so a change in Settings shows up.
+    private var configuredRemotes: [RemoteGalleryConfig] {
+        DesktopSettings.load().remoteGalleries ?? []
+    }
+
     @ViewBuilder
     private var remoteScopeBar: some View {
-        let remotes = DesktopSettings.load().remoteGalleries ?? []
+        let remotes: [RemoteGalleryConfig] = configuredRemotes
         HStack(spacing: 8) {
             if remotes.isEmpty {
                 Text("No remote galleries configured — add one in Settings → Gallery.")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
-                ForEach(remotes) { remote in
-                    let status = remoteRegistry.status(of: remote.id)
+                ForEach(remotes) { (remote: RemoteGalleryConfig) in
+                    let status: RemoteGalleryStatus = remoteRegistry.status(of: remote.id)
                     Button {
                         remoteScopeSelection = remote.id
                         applyRemoteScope()
@@ -1897,13 +1915,20 @@ struct GalleryView: View {
                         }
                     }
                     .buttonStyle(.bordered)
-                    .tint(remoteScopeSelection == remote.id ? .accentColor : .secondary)
-                    .disabled(status != .reachable)
+                    .tint(remoteScopeSelection == remote.id ? Color.accentColor : Color.secondary)
+                    .disabled(status == .disabled)
                 }
             }
             Spacer()
-            if let count = browser?.items.count, remoteScopeSelection != nil {
-                Text("\(count) item\(count == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
+            if let id = remoteScopeSelection {
+                let status = remoteRegistry.status(of: id)
+                if status == .absent {
+                    Text("not attached — plug it in to see its contents")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    let count = assets.count
+                    Text("\(count) item\(count == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
+                }
             }
         }
         .padding(.horizontal, 12)
@@ -1922,11 +1947,19 @@ struct GalleryView: View {
     private func applyRemoteScope() {
         guard remoteScope else { return }
         let remotes = DesktopSettings.load().remoteGalleries ?? []
-        guard let id = remoteScopeSelection, let remote = remotes.first(where: { $0.id == id }) else {
-            browser?.restrictToRemoteHost = nil
-            return
-        }
-        browser?.restrictToRemoteHost = remote.locationHost
+        // No selection on the Remote tab means "no remote chosen", NOT "show
+        // the whole Mac gallery" (Todd 2026-09-17: "remote gallery is showing
+        // main gallery on mac"). A host that matches nothing gives an empty grid.
+        let host = remoteScopeSelection.flatMap { id in remotes.first(where: { $0.id == id })?.locationHost }
+            ?? "remote:none-selected"
+        browser?.restrictToRemoteHost = host
+        browser?.immichRemoteHosts = Set(remotes.filter { $0.kind == .immich }
+            .filter { remoteRegistry.status(of: $0.id) == .reachable }
+            .map(\.locationHost))
+        // The grid is filled by loadAssets() → loadFromCatalog(), so setting
+        // the scope on the browser alone changes nothing on screen (Todd
+        // 2026-09-17: "neither button changes the view").
+        Task { await loadAssets() }
     }
 
     /// Where each reachable remote gallery is, keyed by its location host.

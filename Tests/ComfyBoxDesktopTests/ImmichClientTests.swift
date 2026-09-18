@@ -191,3 +191,24 @@ struct ImmichClientTests {
         #expect(ImmichStubProtocol.seen.isEmpty)
     }
 }
+
+@Suite("ImmichThumbnailProtocol")
+struct ImmichThumbnailProtocolTests {
+
+    @Test("the grid's URL carries the remote and the asset")
+    func urlShape() throws {
+        let url = try #require(ImmichThumbnailProtocol.url(remoteID: "R1", immichAssetID: "A2"))
+        #expect(url.scheme == "immich-thumb")
+        #expect(url.host == "R1")
+        #expect(url.path == "/A2")
+        #expect(url.query?.contains("size=preview") == true)
+    }
+
+    @Test("it claims only its own scheme")
+    func claimsOnlyItsScheme() throws {
+        let mine = try #require(ImmichThumbnailProtocol.url(remoteID: "R1", immichAssetID: "A2"))
+        #expect(ImmichThumbnailProtocol.canInit(with: URLRequest(url: mine)))
+        let other = try #require(URL(string: "http://10.0.100.232:2283/api/assets/A2/thumbnail"))
+        #expect(!ImmichThumbnailProtocol.canInit(with: URLRequest(url: other)))
+    }
+}
