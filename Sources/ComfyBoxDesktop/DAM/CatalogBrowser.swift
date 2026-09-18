@@ -50,9 +50,13 @@ public final class CatalogBrowser {
 
     /// When set, the page shows ONLY assets on that remote gallery — what the
     /// Remote Gallery tab asks for.
-    public var restrictToRemoteHost: String? {
-        didSet { if oldValue != restrictToRemoteHost { Task { await reload() } } }
-    }
+    /// The view drives the reload (its grid is filled through its own loader),
+    /// so this is a plain property.
+    public var restrictToRemoteHost: String?
+
+    /// Hosts that are reachable Immich remotes. Their assets have no file on
+    /// any disk here, so they are kept with a stream URL instead of a path.
+    public var immichRemoteHosts: Set<String> = []
 
     /// Which remote gallery each asset on the current page lives on, keyed by
     /// asset id. Used to mark a moved asset in the grid.
@@ -89,7 +93,9 @@ public final class CatalogBrowser {
     /// Rows whose bytes are readable on this Mac: asset id -> the path to open.
     private var localPaths: [String: String] = [:]
     /// Rows with no copy here: asset id -> the path to ask the engine for.
-    private var remotePaths: [String: String] = [:]
+    /// Where a non-local row's bytes are, as the catalog spells it: a server
+    /// path, or "immich://<id>" for an Immich remote.
+    public private(set) var remotePaths: [String: String] = [:]
 
     public init(store: CatalogStore, engineBaseURL: String = "http://127.0.0.1:7870") {
         self.store = store
@@ -228,6 +234,15 @@ public final class CatalogBrowser {
                     local[row.id] = row.absolutePath
                     kept.append(row)
                     try? await store.relocateAsset(id: row.id, host: Self.localHost, path: row.absolutePath)
+                    continue
+                }
+                if immichRemoteHosts.contains(remoteLocation.host) {
+                    // Lives on an Immich server: no local bytes, but the row is
+                    // real and the grid shows it through an authenticated
+                    // thumbnail URL (ImmichThumbnailProtocol).
+                    remote[row.id] = remoteLocation.path      // "immich://<id>"
+                    remoteHosts[row.id] = remoteLocation.host
+                    kept.append(row)
                     continue
                 }
                 guard let root = remoteGalleryRoots[remoteLocation.host] else { continue }

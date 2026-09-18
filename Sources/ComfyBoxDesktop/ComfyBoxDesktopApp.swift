@@ -41,6 +41,10 @@ struct ComfyBoxDesktopApp: App {
     @State private var pendingContentMode: ContentMode?
 
     init() {
+        // Immich needs its key as a request header, which SwiftUI image loading
+        // cannot send; this serves the grid's immich-thumb:// URLs instead
+        // (FDD-remote-galleries §3.5).
+        ImmichThumbnailProtocol.register()
         let engine = EngineService()
         _engine = State(initialValue: engine)
         _agentService = State(initialValue: AgentService(engine: engine))
