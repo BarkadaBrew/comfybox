@@ -181,10 +181,15 @@ public struct DirectorTimeline: Codable, Sendable, Equatable {
     public var trimStartFrames: Int
     /// Linear gain, >= 0.
     public var gain: Float
+    /// AUDIO-DRIVEN (FDD §4.7, WP11): this clip is the VOICE, and every chunk
+    /// it covers renders against its own slice of it, so lips follow real
+    /// words. The final assembly still muxes this track untouched, so splices
+    /// cannot click or drift. At most one clip on a timeline may set it.
+    public var drivesVideo: Bool
 
     public init(
       id: String, audioPath: String, startFrame: Int, lengthFrames: Int,
-      trimStartFrames: Int = 0, gain: Float = 1.0
+      trimStartFrames: Int = 0, gain: Float = 1.0, drivesVideo: Bool = false
     ) {
       self.id = id
       self.audioPath = audioPath
@@ -192,6 +197,7 @@ public struct DirectorTimeline: Codable, Sendable, Equatable {
       self.lengthFrames = lengthFrames
       self.trimStartFrames = trimStartFrames
       self.gain = gain
+      self.drivesVideo = drivesVideo
     }
 
     public init(from decoder: Decoder) throws {
@@ -202,6 +208,7 @@ public struct DirectorTimeline: Codable, Sendable, Equatable {
       lengthFrames = try c.decodeIfPresent(Int.self, forKey: .lengthFrames) ?? 0
       trimStartFrames = try c.decodeIfPresent(Int.self, forKey: .trimStartFrames) ?? 0
       gain = try c.decodeIfPresent(Float.self, forKey: .gain) ?? 1.0
+      drivesVideo = try c.decodeIfPresent(Bool.self, forKey: .drivesVideo) ?? false
     }
   }
 

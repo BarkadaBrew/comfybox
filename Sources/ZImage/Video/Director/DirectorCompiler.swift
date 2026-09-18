@@ -150,6 +150,21 @@ public enum DirectorCompiler {
       if cond.segments.count >= 2 {
         body["tuning"] = Self.promptSwitchTuning
       }
+      // AUDIO-DRIVEN (FDD §4.7, WP11): a clip marked `drives_video` conditions
+      // every chunk it covers on ITS OWN SLICE of the voice, so lips follow
+      // real words. The chunk renders its audio stream (that is what the video
+      // attends to); the stitcher still muxes the untouched master track, so
+      // splices cannot click or drift.
+      if let driving = snapped.audioClips.first(where: \.drivesVideo),
+         span.startFrame < driving.startFrame + driving.lengthFrames,
+         span.startFrame + span.frames > driving.startFrame {
+        body["audio"] = true
+        body["audio_condition_path"] = driving.audioPath
+        // Where this chunk starts inside the FILE: the timeline offset plus
+        // whatever the clip trimmed off its head.
+        body["audio_condition_start_frame"] =
+          max(0, span.startFrame - driving.startFrame) + driving.trimStartFrames
+      }
       if !cond.keyframes.isEmpty {
         body["keyframes"] = cond.keyframes.map { kf -> [String: Any] in
           ["image_path": kf.keyframe.imagePath ?? "", "frame": kf.localFrame, "strength": jsonNumber(kf.keyframe.strength)]
