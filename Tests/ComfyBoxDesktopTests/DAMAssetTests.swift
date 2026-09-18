@@ -288,7 +288,10 @@ struct DAMAssetTests {
             favorite: true,
             contentMode: "banana",
             characterName: "Fixture",
-            source: "kira"
+            source: "kira",
+            sequenceID: "seq-fixture",
+            sequenceName: "fixture sequence",
+            sequenceChunks: 3
         )
     }
 

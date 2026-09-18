@@ -32,6 +32,12 @@ public struct DAMAsset: Identifiable, Sendable, Equatable {
     /// Which app/persona generated this image (desktop / bree / kira / api…).
     /// Used to place persona renders (Kira, Bree) in their own gallery sections.
     public let source: String?
+    /// A Director render carries a `.sequence.json` beside the clip: the
+    /// timeline that made it. Non-nil means "this can be reopened in Director"
+    /// (FDD-ltx-director-tab §4.9.2, WP13). `kind` stays "video".
+    public let sequenceID: String?
+    public let sequenceName: String?
+    public let sequenceChunks: Int?
 
     public init(
         id: String = UUID().uuidString,
@@ -56,7 +62,10 @@ public struct DAMAsset: Identifiable, Sendable, Equatable {
         favorite: Bool = false,
         contentMode: String? = nil,
         characterName: String? = nil,
-        source: String? = nil
+        source: String? = nil,
+        sequenceID: String? = nil,
+        sequenceName: String? = nil,
+        sequenceChunks: Int? = nil
     ) {
         self.source = source
         self.id = id
@@ -81,7 +90,13 @@ public struct DAMAsset: Identifiable, Sendable, Equatable {
         self.favorite = favorite
         self.contentMode = contentMode
         self.characterName = characterName
+        self.sequenceID = sequenceID
+        self.sequenceName = sequenceName
+        self.sequenceChunks = sequenceChunks
     }
+
+    /// Can this clip be reopened in Director and replayed?
+    public var isSequence: Bool { sequenceID != nil }
 
     /// A copy of this asset pointing at a new file location (secure/unsecure
     /// moves); filename follows the path.
@@ -157,6 +172,9 @@ public struct DAMAsset: Identifiable, Sendable, Equatable {
         public var contentMode: Override<String?> = .unchanged
         public var characterName: Override<String?> = .unchanged
         public var source: Override<String?> = .unchanged
+        public var sequenceID: Override<String?> = .unchanged
+        public var sequenceName: Override<String?> = .unchanged
+        public var sequenceChunks: Override<Int?> = .unchanged
 
         public init(
             id: Override<String> = .unchanged,
@@ -181,7 +199,10 @@ public struct DAMAsset: Identifiable, Sendable, Equatable {
             favorite: Override<Bool> = .unchanged,
             contentMode: Override<String?> = .unchanged,
             characterName: Override<String?> = .unchanged,
-            source: Override<String?> = .unchanged
+            source: Override<String?> = .unchanged,
+            sequenceID: Override<String?> = .unchanged,
+            sequenceName: Override<String?> = .unchanged,
+            sequenceChunks: Override<Int?> = .unchanged
         ) {
             self.id = id
             self.kind = kind
@@ -206,6 +227,9 @@ public struct DAMAsset: Identifiable, Sendable, Equatable {
             self.contentMode = contentMode
             self.characterName = characterName
             self.source = source
+            self.sequenceID = sequenceID
+            self.sequenceName = sequenceName
+            self.sequenceChunks = sequenceChunks
         }
     }
 
@@ -239,7 +263,10 @@ public struct DAMAsset: Identifiable, Sendable, Equatable {
             favorite: mutation.favorite.applied(to: favorite),
             contentMode: mutation.contentMode.applied(to: contentMode),
             characterName: mutation.characterName.applied(to: characterName),
-            source: mutation.source.applied(to: source)
+            source: mutation.source.applied(to: source),
+            sequenceID: mutation.sequenceID.applied(to: sequenceID),
+            sequenceName: mutation.sequenceName.applied(to: sequenceName),
+            sequenceChunks: mutation.sequenceChunks.applied(to: sequenceChunks)
         )
     }
 

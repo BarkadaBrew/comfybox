@@ -558,6 +558,10 @@ public final class AssetIngestor {
 
         // Read JSON sidecar metadata if present.
         let sidecar = readSidecar(for: path)
+        // A Director render also carries `<base>.sequence.json` — the timeline
+        // that made it (WP13). This poller, not the backfill CLI, is what sees
+        // fresh renders, so a sequence becomes reopenable the moment it lands.
+        let sequence = isVideo ? Self.readSequenceSidecar(for: path) : nil
 
         return DAMAsset(
             kind: isVideo ? "video" : "image",
@@ -577,8 +581,32 @@ public final class AssetIngestor {
             modelFamily: sidecar?.modelFamily,
             contentMode: sidecar?.contentMode,
             characterName: sidecar?.characterName,
-            source: sidecar?.source
+            source: sidecar?.source,
+            sequenceID: sequence?.id,
+            sequenceName: sequence?.name,
+            sequenceChunks: sequence?.chunks
         )
+    }
+
+    /// The three facts that make a Director render reopenable. Parsed
+    /// structurally rather than decoded: the ingestor does not need the
+    /// timeline, and the `schema` check keeps another tool's `.sequence.json`
+    /// from turning a clip into something the app offers to open in Director.
+    /// A broken sidecar leaves the clip the plain video it still is.
+    /// `nonisolated`: this reads a file and parses it, touching no ingestor
+    /// state, so it does not need the main actor and callers (including tests)
+    /// should not have to hop onto it.
+    nonisolated static func readSequenceSidecar(
+        for path: String
+    ) -> (id: String, name: String?, chunks: Int?)? {
+        let sidecar = (path as NSString).deletingPathExtension + ".sequence.json"
+        guard let data = FileManager.default.contents(atPath: sidecar), !data.isEmpty,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (root["schema"] as? String) == "comfybox.sequence",
+              let id = root["id"] as? String, !id.isEmpty
+        else { return nil }
+        let name = (root["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        return (id, name, (root["chunks"] as? [Any])?.count)
     }
 
     // MARK: - Sidecar Metadata
