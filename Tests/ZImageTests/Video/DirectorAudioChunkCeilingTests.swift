@@ -3,20 +3,18 @@ import XCTest
 
 @testable import ZImage
 
-/// An audio-driven timeline chunks SHORTER (WP11, FDD §4.7).
+/// The audio chunk ceiling was REVERTED 2026-09-18 (see
+/// `DirectorTimeline.chunkCeilingFrames`). These tests now pin the revert: a
+/// driving timeline chunks exactly like any other.
 ///
-/// Measured 2026-09-18 on one seed/keyframe/prompt, as the ratio of mouth
-/// motion during speech to mouth motion during silence — "does the mouth go
-/// still when the voice stops", which unlike a correlation does not depend on
-/// how much of the track is actually speech:
-///
-///     145-frame chunks   1.92 (one voice), 1.73 (another)
-///     273-frame chunks   1.03, 1.27, 1.30  (the three chunks of a 34 s take)
-///
-/// Chunk 0's 1.03 is no response at all. The voice barely matters; the chunk
-/// length is the lever, so `drives_video` buys shorter chunks — more seams,
-/// which tone-match and exact-last-frame have made invisible, for a mouth that
-/// follows the words.
+/// Why: the 145-frame ceiling rested on a loud-vs-quiet mouth-motion metric
+/// that counted the one-time transient of the subject raising her head from
+/// the opening keyframe as the voice starts. That transient is ~40 frames, so
+/// it is a much larger FRACTION of a short chunk — enough on its own to
+/// produce the "1.03 -> 3.05" that justified the change. Excluding the first
+/// 48 frames collapses it (2.45 -> 1.05), and the clean comparison
+/// (continuation chunks, which have no onset) runs the other way: 273-frame
+/// chunks 1.31, 137-frame chunks 1.10.
 final class DirectorAudioChunkCeilingTests: XCTestCase {
 
   private func timeline(lengthFrames: Int, driving: Bool) -> DirectorTimeline {
@@ -34,19 +32,17 @@ final class DirectorAudioChunkCeilingTests: XCTestCase {
 
   // MARK: the ceiling
 
-  func testADrivingTimelineChunksAtTheAudioCeiling() {
+  func testADrivingTimelineChunksLikeANYOtherNow() {
+    // The revert: `drives_video` still marks the timeline, but it no longer
+    // changes how it is split.
     let driven = timeline(lengthFrames: 817, driving: true)
-    XCTAssertTrue(driven.isAudioDriven)
-    XCTAssertEqual(driven.chunkCeilingFrames, DirectorMath.audioDrivenChunkFrames)
-
-    let layout = DirectorMath.chunkLayout(
-      lengthFrames: 817, maxFrames: driven.chunkCeilingFrames)
-    XCTAssertGreaterThan(layout.count, 3, "817 frames is 3 chunks at 289, more at 145")
-    for span in layout {
-      XCTAssertLessThanOrEqual(
-        span.frames, DirectorMath.audioDrivenChunkFrames,
-        "no chunk may exceed the ceiling — 273 frames scored 1.03, no response at all")
-    }
+    XCTAssertTrue(driven.isAudioDriven, "the flag still means what it meant")
+    XCTAssertEqual(
+      driven.chunkCeilingFrames, DirectorMath.maxChunkFrames,
+      "the 145 ceiling was reverted — its evidence was an onset artifact")
+    XCTAssertEqual(
+      DirectorMath.chunkLayout(lengthFrames: 817, maxFrames: driven.chunkCeilingFrames).map(\.frames),
+      DirectorMath.chunkLayout(lengthFrames: 817).map(\.frames))
   }
 
   func testAnOrdinaryTimelineIsUnCHANGED() {
@@ -84,33 +80,36 @@ final class DirectorAudioChunkCeilingTests: XCTestCase {
 
   // MARK: the compiler and validator agree
 
-  func testTheCompilerEmitsTheShorterChunks() throws {
+  func testTheCompilerEmitsTheSAMEChunksForDrivenAndPlain() throws {
+    // The revert in one assertion: conditioning is still wired to every
+    // chunk, but the SPANS are the ordinary ones.
     let driven = timeline(lengthFrames: 817, driving: true)
     let validation = DirectorValidator.validate(driven, fileExists: { _ in true })
     XCTAssertTrue(validation.ok, "\(validation.issues)")
     let compilation = try DirectorCompiler.compile(validation, session: "T", source: "test")
-    XCTAssertGreaterThan(compilation.chunks.count, 3)
+    XCTAssertEqual(
+      compilation.chunks.map(\.span.frames),
+      DirectorMath.chunkLayout(lengthFrames: 817).map(\.frames))
     for chunk in compilation.chunks {
-      XCTAssertLessThanOrEqual(chunk.span.frames, DirectorMath.audioDrivenChunkFrames)
       XCTAssertEqual(chunk.body["audio_condition_path"] as? String, "/audio/v.wav")
     }
   }
 
-  func testADrivenTimelineHitsTheChunkBudgetSoonerAndSaysWhy() {
+  func testADrivenTimelineNoLongerHitsTheBudgetSooner() {
     // 16 chunks x 144 steps of timeline: a driven timeline runs out of chunk
     // budget at a shorter DURATION, and must say so rather than silently
     // producing a 17th chunk.
-    let tooLong = timeline(lengthFrames: DirectorMath.maxTimelineFrames, driving: true)
-    let validation = DirectorValidator.validate(tooLong, fileExists: { _ in true })
-    XCTAssertFalse(validation.ok)
-    let issue = validation.issues.first { $0.code == "timeline_too_long" }
-    XCTAssertNotNil(issue, "\(validation.issues)")
-    XCTAssertTrue(
-      issue?.message.contains("audio-driven") == true,
-      "the message must name the reason: \(issue?.message ?? "-")")
-
-    // The same length WITHOUT driving is still fine.
-    let plain = timeline(lengthFrames: DirectorMath.maxTimelineFrames, driving: false)
-    XCTAssertTrue(DirectorValidator.validate(plain, fileExists: { _ in true }).ok)
+    // Both reach the same limit again, because both chunk the same way: a
+    // driving flag no longer costs timeline length.
+    let atLimit = DirectorMath.maxTimelineFrames
+    let driven = DirectorValidator.validate(
+      timeline(lengthFrames: atLimit, driving: true), fileExists: { _ in true })
+    let plain = DirectorValidator.validate(
+      timeline(lengthFrames: atLimit, driving: false), fileExists: { _ in true })
+    XCTAssertEqual(
+      driven.issues.contains { $0.code == "timeline_too_long" },
+      plain.issues.contains { $0.code == "timeline_too_long" },
+      "driving must not change whether the length is accepted")
+    XCTAssertEqual(driven.plan?.chunks.count, plain.plan?.chunks.count)
   }
 }

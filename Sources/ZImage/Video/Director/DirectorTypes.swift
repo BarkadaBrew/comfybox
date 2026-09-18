@@ -319,9 +319,21 @@ public struct DirectorTimeline: Codable, Sendable, Equatable {
   public var isAudioDriven: Bool { audioClips.contains { $0.drivesVideo } }
 
   /// The chunk ceiling this timeline should be split at.
-  public var chunkCeilingFrames: Int {
-    isAudioDriven ? DirectorMath.audioDrivenChunkFrames : DirectorMath.maxChunkFrames
-  }
+  ///
+  /// REVERTED to the default 2026-09-18: the 145-frame audio ceiling (#493)
+  /// rested on a measurement that turned out to be an artifact. The metric —
+  /// mouth motion during speech vs during silence — counted the ONE-TIME
+  /// transient of the subject raising her head from the opening keyframe as
+  /// the voice starts. That transient is a roughly fixed ~40 frames, so it is
+  /// 29% of a 137-frame chunk and 15% of a 273-frame one, which alone
+  /// produced the "1.03 -> 3.05" that justified the ceiling. Excluding the
+  /// first 48 frames collapses the effect (2.45 -> 1.05).
+  ///
+  /// The clean comparison is CONTINUATION chunks, which have no such onset:
+  /// 273-frame chunks pooled 1.31, 137-frame chunks pooled 1.10 — longer
+  /// scored BETTER. So the evidence now points the other way, and the trained
+  /// 289 default stands until something measures otherwise.
+  public var chunkCeilingFrames: Int { DirectorMath.maxChunkFrames }
 
   public init(
     version: Int = DirectorTimeline.currentVersion,

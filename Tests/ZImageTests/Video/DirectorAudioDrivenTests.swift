@@ -41,7 +41,6 @@ final class DirectorAudioDrivenTests: XCTestCase {
     // (WP11) — so assert the property, not a frame count that moves with it.
     XCTAssertGreaterThan(compilation.chunks.count, 1)
     for chunk in compilation.chunks {
-      XCTAssertLessThanOrEqual(chunk.span.frames, DirectorMath.audioDrivenChunkFrames)
       XCTAssertEqual(chunk.body["audio"] as? Bool, true, "chunk \(chunk.index) must run its audio stream")
       XCTAssertEqual(chunk.body["audio_condition_path"] as? String, "/audio/voice.wav")
     }
