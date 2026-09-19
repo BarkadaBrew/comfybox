@@ -8712,6 +8712,9 @@ public final class WarmServer {
     _ health: HealthResponse,
     videoAvailable: Bool,
     activeVideoJobs: Int,
+    activeSequences: Int = 0,
+    sequenceStage: Int? = nil,
+    sequenceStages: Int? = nil,
     localVideoReadiness: LocalVideoReadiness = .unchecked,
     admission: AdmissionSnapshot? = nil,
     inferenceSlots: Int = 0
@@ -8735,6 +8738,13 @@ public final class WarmServer {
       "available": videoAvailable,
       "backend": videoAvailable ? "replicate" : "none",
       "active_jobs": activeVideoJobs,
+      // A sequence holds the GPU for HOURS, not minutes. Published separately
+      // so a periodic producer (Kira's 24/7 cycle) can suspend itself for the
+      // duration rather than queueing behind it.
+      "sequence_active": activeSequences > 0,
+      "active_sequences": activeSequences,
+      "sequence_stage": sequenceStage as Any? ?? NSNull(),
+      "sequence_stages": sequenceStages as Any? ?? NSNull(),
       "local_ready": localVideoReadiness.ready,
       "local_reason": (localVideoReadiness.reason as Any?) ?? NSNull(),
       "local_checked_at": localVideoReadiness.checkedAt.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
@@ -8771,6 +8781,9 @@ public final class WarmServer {
     if let data = Self.healthJSON(
       health, videoAvailable: replicateVideoProxy != nil,
       activeVideoJobs: videoJobTracker.activeJobCount + (replicateVideoProxy?.activeJobCount ?? 0),
+      activeSequences: videoJobTracker.activeSequenceCount,
+      sequenceStage: videoJobTracker.activeSequenceProgress?.stage,
+      sequenceStages: videoJobTracker.activeSequenceProgress?.of,
       localVideoReadiness: localVideoReadinessMonitor.current(),
       admission: admission.snapshot(),
       inferenceSlots: inferenceSlots.activeSlots().count) {
@@ -10297,6 +10310,35 @@ final class VideoJobTracker: @unchecked Sendable {
   var activeJobCount: Int {
     lock.lock(); defer { lock.unlock() }
     return jobs.values.filter { $0.completedAt == nil }.count
+  }
+
+  /// In-flight SEQUENCES — jobs carrying a Director plan of more than one
+  /// chunk. Distinct from `activeJobCount` because the two mean different
+  /// things to a caller: a clip is minutes, a sequence is hours (the 30 s demo
+  /// ran 38-42 min per chunk), and it holds the GPU for all of them.
+  ///
+  /// Kira's 24/7 content cycle reads this and suspends its ticks while one
+  /// runs. Without that, the periodic producer keeps booking work behind a
+  /// two-hour job and the queue fills faster than it drains — which is how the
+  /// 2026-08 backlog happened (20/hr in against 3.9/hr out).
+  var activeSequenceCount: Int {
+    lock.lock(); defer { lock.unlock() }
+    return jobs.values.filter { $0.completedAt == nil && ($0.plan?.chunks.count ?? 0) > 1 }.count
+  }
+
+  /// The chunk cursor of the longest-running in-flight sequence, so a caller
+  /// can say "2 of 3" rather than only "busy".
+  ///
+  /// `jobs` is a dictionary, so picking `.first` would report a different
+  /// sequence run to run once two overlap. Oldest `startTime` wins: it is the
+  /// one closest to finishing, so a watcher's ETA only ever shortens.
+  var activeSequenceProgress: (stage: Int, of: Int)? {
+    lock.lock(); defer { lock.unlock() }
+    let running = jobs.values
+      .filter { $0.completedAt == nil && ($0.plan?.chunks.count ?? 0) > 1 }
+      .sorted { $0.startTime < $1.startTime }
+    guard let job = running.first else { return nil }
+    return (job.stageIndex ?? 0, job.plan?.chunks.count ?? 0)
   }
 
   /// Create a tracked job in `.queued` and return (jobId, its status). Testable
