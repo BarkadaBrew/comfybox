@@ -32,7 +32,18 @@ mouth, and because nobody looked at the frames until late.
    frames of a chunk is measuring the model settling into the shot.
 3. **Always score a control.** An unconditioned clip against the same voice is
    the noise floor. On aperture that floor is r ~ 0.3 — higher than any
-   conditioned clip has scored, which is why "there is a correlation" is not
-   the same as "there is lip sync".
+   conditioned clip scored, which is why "there is a correlation" is not the
+   same as "there is lip sync".
+
+5. **This tool CANNOT grade lip sync, and a low score is not evidence against
+   it.** Aperture is correlated here against voice ENERGY, and aperture tracks
+   PHONEMES, not loudness: "ooh" is loud and nearly closed, "ah" is open, a
+   quiet vowel is open. Perfect sync scores badly on that correlation. A
+   conclusion of "LTX-2 cannot lip-sync" was published from exactly this
+   mistake and retracted on 2026-09-19 when Todd — who was watching the clips
+   — said sync is fine on a single clip.
+
+   Use this tool for one thing: detecting a mouth that does not move AT ALL.
+   For anything finer, use a learned audio-visual sync model, or watch it.
 4. **Report sample counts.** Most of these clips yield ~20 loud frames. Two
    numbers 0.1 apart on n=20 are the same number.
