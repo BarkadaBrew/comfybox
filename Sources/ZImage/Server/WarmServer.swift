@@ -3247,6 +3247,9 @@ public final class WarmServer {
       outputPath: resolvedOutput,
       tuning: resolvedTuning,
       presetTuning: videoPreset?.videoTuning,
+      // The preset's IDENTITY, not its settings — the sidecar records what the
+      // filename already says.
+      presetId: req.preset ?? videoPreset?.id,
       resolvedConfigSnapshot: resolvedConfigSnapshot,
       audio: req.audio ?? false,
       audioConditionPath: req.audioConditionPath,
@@ -14021,7 +14024,9 @@ private actor WarmServerCoordinator {
         // can be REFUSED (`loraReadBacks == nil` writes `"applied": null`) and
         // the file would then carry no trace of a look that was applied to
         // its pixels.
-        style: appliedStyle
+        style: appliedStyle,
+        // The preset the caller named — the same value the filename carries.
+        preset: payload.preset
       )
       try QwenImageIO.saveImage(array: image.transposed(2, 0, 1), to: outputURL, metadata: metadata)
 
@@ -14298,7 +14303,8 @@ private actor WarmServerCoordinator {
       metadata: .generation(prompt: payload.prompt,
         negativePrompt: QwenImageIO.ImageMetadata.requestNegative(payload.negativePrompt),
         seed: seed, steps: steps, guidance: guidance, width: width, height: height,
-        generatedBy: payload.source, contentMode: payload.contentMode, loras: loras))
+        generatedBy: payload.source, contentMode: payload.contentMode, loras: loras,
+        preset: payload.preset))
   }
 
   private func runControlGenerate(_ request: ZImageControlGenerationRequest, continuation: ContinuationBox<GenerateResponse>) async {

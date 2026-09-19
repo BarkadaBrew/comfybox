@@ -95,6 +95,11 @@ public struct LTX2VideoRequest: Sendable {
     /// the full five-level resolution.
     public var tuning: LTX2VideoTuning?
     public var presetTuning: LTX2VideoTuning?
+    /// The preset the CALLER named, carried so the sidecar can record it.
+    /// `presetTuning` above is the preset's resolved settings — the recipe;
+    /// this is its identity, which the filename already uses and the sidecar
+    /// did not have.
+    public var presetId: String?
     /// Immutable resolution captured when the server accepts the request.
     /// The generator consumes this instead of consulting mutable process/env
     /// defaults again after the job has waited in the queue.
@@ -187,6 +192,7 @@ public struct LTX2VideoRequest: Sendable {
         outputPath: String,
         tuning: LTX2VideoTuning? = nil,
         presetTuning: LTX2VideoTuning? = nil,
+        presetId: String? = nil,
         resolvedConfigSnapshot: LTX2ResolvedVideoConfig? = nil,
         recipeHash: String? = nil,
         audio: Bool = false,
@@ -231,6 +237,7 @@ public struct LTX2VideoRequest: Sendable {
         self.outputPath = outputPath
         self.tuning = tuning
         self.presetTuning = presetTuning
+        self.presetId = presetId
         self.resolvedConfigSnapshot = resolvedConfigSnapshot
         self.recipeHash = recipeHash
     }
