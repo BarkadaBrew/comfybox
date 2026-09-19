@@ -28,6 +28,100 @@ struct AssetIngestorTests {
         return path
     }
 
+    /// Backdate a file so `isFileStable` accepts it without the test sleeping.
+    private func backdate(_ path: String) {
+        try? FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: -60)], ofItemAtPath: path)
+    }
+
+    /// THE regression. `startWatching` used to mark every file already in the
+    /// watch directory as known, so anything that arrived while the app was
+    /// closed was never ingested — on the live gallery that was 160 of 288
+    /// files, invisible and unmanageable.
+    @Test("a file that was already there when watching started is still ingested")
+    @MainActor
+    func preexistingFileIsIngested() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("arrived-while-closed.png", in: env.watchDir)
+        backdate(path)
+
+        await env.ingestor.startWatching()
+        env.ingestor.stopWatching()
+        await env.ingestor.scanForNewFiles()
+
+        #expect(try await env.store.fetchAsset(byPath: path) != nil)
+    }
+
+    /// A row that IS in the database must not be ingested a second time — the
+    /// flood guard the old seeding was really reaching for.
+    @Test("a file already in the catalog is left alone")
+    @MainActor
+    func alreadyCatalogedFileIsNotReingested() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("known.png", in: env.watchDir)
+        backdate(path)
+        let first = try await env.ingestor.ingestFile(at: path)
+
+        await env.ingestor.startWatching()
+        env.ingestor.stopWatching()
+        await env.ingestor.scanForNewFiles()
+
+        let rows = try await env.store.fetchAssets(limit: 100)
+        #expect(rows.filter { $0.absolutePath == path }.count == 1)
+        #expect(try await env.store.fetchAsset(byPath: path)?.id == first.id)
+    }
+
+    @Test("a file in a subfolder is found")
+    @MainActor
+    func subfolderFileIsIngested() async throws {
+        let env = try await makeEnvironment()
+        let sub = (env.watchDir as NSString).appendingPathComponent("Telegram")
+        try FileManager.default.createDirectory(atPath: sub, withIntermediateDirectories: true)
+        let path = writeFile("nested.png", in: sub)
+        backdate(path)
+
+        await env.ingestor.scanForNewFiles()
+
+        #expect(try await env.store.fetchAsset(byPath: path) != nil)
+    }
+
+    @Test("the watcher accepts every still format the catalog indexes")
+    @MainActor
+    func modernStillFormatsAreIngested() async throws {
+        let env = try await makeEnvironment()
+        var paths: [String] = []
+        for name in ["a.webp", "b.heic", "c.tiff"] {
+            let p = writeFile(name, in: env.watchDir)
+            backdate(p)
+            paths.append(p)
+        }
+
+        await env.ingestor.scanForNewFiles()
+
+        for p in paths {
+            #expect(try await env.store.fetchAsset(byPath: p) != nil, "not ingested: \(p)")
+        }
+    }
+
+    /// A backlog is worked through over several passes rather than in one
+    /// blocking burst.
+    @Test("a single pass ingests at most the catch-up budget")
+    @MainActor
+    func catchUpIsBounded() async throws {
+        let env = try await makeEnvironment()
+        for i in 0..<(AssetIngestor.catchUpBudget + 10) {
+            backdate(writeFile("burst-\(i).png", in: env.watchDir))
+        }
+
+        await env.ingestor.scanForNewFiles()
+        let afterOne = try await env.store.fetchAssets(limit: 500).count
+        #expect(afterOne == AssetIngestor.catchUpBudget)
+
+        await env.ingestor.scanForNewFiles()
+        let afterTwo = try await env.store.fetchAssets(limit: 500).count
+        #expect(afterTwo == AssetIngestor.catchUpBudget + 10, "the rest arrive on later passes")
+    }
+
     @Test("deleteAsset removes file, sidecar, thumbnail, and database row")
     @MainActor
     func deleteRemovesEverything() async throws {

@@ -563,3 +563,46 @@ extension VideoGenerationRecordTests {
     }
   }
 }
+
+/// The preset the caller named belongs in the sidecar, not only in the
+/// filename. `ComfyBoxOutputNaming.defaultFilename(presetId:)` has always put
+/// it in the NAME while the record dropped it, so the catalog's `preset`
+/// column was empty for every clip ever rendered.
+final class VideoGenerationRecordPresetTests: XCTestCase {
+    private func record(presetId: String?) -> VideoGenerationRecord {
+        let request = LTX2VideoRequest(
+            prompt: "she turns to the window",
+            width: 512, height: 320, framesPerChunk: 97, steps: 8, seed: 1, guidance: 1,
+            outputPath: "/tmp/out.mp4",
+            presetId: presetId)
+        return VideoGenerationRecord.build(
+            request: request,
+            transformerFile: "transformer-distilled.safetensors",
+            frameCount: 97, resolvedWidth: 512, resolvedHeight: 320,
+            twoStageRequested: false, refineSkippedReason: nil,
+            audioWritten: false, configGuidance: 1)
+    }
+
+    private func json(_ r: VideoGenerationRecord) throws -> [String: Any] {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try encoder.encode(r)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    func testTheRecordCarriesThePresetTheRequestNamed() throws {
+        XCTAssertEqual(record(presetId: "krea-kira").preset, "krea-kira")
+        XCTAssertEqual(try json(record(presetId: "krea-kira"))["preset"] as? String, "krea-kira")
+    }
+
+    /// The live preset store keys by UUID, so the value is often not a slug.
+    func testAPresetUUIDIsRecordedVerbatim() throws {
+        let id = "5F2973F3-DB57-48F7-991F-65C5A843C54C"
+        XCTAssertEqual(try json(record(presetId: id))["preset"] as? String, id)
+    }
+
+    func testAPresetlessRenderWritesNoPresetKey() throws {
+        XCTAssertNil(record(presetId: nil).preset)
+        XCTAssertNil(try json(record(presetId: nil))["preset"])
+    }
+}

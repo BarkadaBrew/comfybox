@@ -66,13 +66,15 @@ public final class AssetIngestor {
             knownPaths = []
         }
 
-        // Also add any files already in the directory to avoid initial flood.
-        if let contents = try? fm.contentsOfDirectory(atPath: watchDirectory) {
-            for filename in contents where isImageFile(filename) {
-                let path = (watchDirectory as NSString).appendingPathComponent(filename)
-                knownPaths.insert(path)
-            }
-        }
+        // NOTHING ELSE is seeded. This used to also mark every file already in
+        // the directory as known "to avoid initial flood" — which meant any
+        // asset that arrived while the app was closed (a CLI render, an mflux
+        // run, a clip copied in, a file synced down) was stamped known on the
+        // next launch and never ingested, permanently. Measured on the live
+        // gallery: 160 of 288 files on disk had no catalog row and could not
+        // be managed. The flood it guarded against is handled where it belongs
+        // — `catchUpBudget` per pass, below — so a backlog is worked through
+        // over a few seconds instead of being discarded.
 
         isWatching = true
         lastError = nil
@@ -499,17 +501,17 @@ public final class AssetIngestor {
 
     // internal (not private) so tests can drive a poll pass directly via
     // `@testable import` without waiting on the real 5s poll interval.
+    /// Most files a single pass will ingest. A first run after this fix has a
+    /// whole backlog to work through; the poll runs every few seconds, so a
+    /// bounded pass catches up quickly without blocking the actor on hundreds
+    /// of thumbnail generations at once.
+    static let catchUpBudget = 50
+
     func scanForNewFiles() async {
-        let fm = FileManager.default
-        guard let contents = try? fm.contentsOfDirectory(atPath: watchDirectory) else {
-            return
-        }
+        var ingestedThisPass = 0
 
-        let imageFiles = contents.filter { isImageFile($0) }
-
-        for filename in imageFiles {
-            let path = (watchDirectory as NSString).appendingPathComponent(filename)
-
+        for path in mediaFilesInWatchDirectory() {
+            guard ingestedThisPass < Self.catchUpBudget else { break }
             guard !knownPaths.contains(path) else { continue }
             // A transfer owns this path right now — do not ingest it mid-move.
             guard !reservedPaths.contains(path) else { continue }
@@ -519,10 +521,39 @@ public final class AssetIngestor {
 
             do {
                 try await ingestFile(at: path)
+                ingestedThisPass += 1
             } catch {
-                lastError = "Failed to ingest \(filename): \(error.localizedDescription)"
+                lastError = "Failed to ingest \((path as NSString).lastPathComponent): "
+                    + error.localizedDescription
             }
         }
+    }
+
+    /// Every media file under the watch directory, at any depth.
+    ///
+    /// The old scan read only the top level, so anything filed into a subfolder
+    /// — the Telegram bot's own output directory among them — was invisible to
+    /// the gallery no matter how long the app ran. Hidden files and anything
+    /// inside a dot-directory are skipped, the same rule the catalog backfill
+    /// applies.
+    private func mediaFilesInWatchDirectory() -> [String] {
+        let fm = FileManager.default
+        guard let walker = fm.enumerator(atPath: watchDirectory) else { return [] }
+        var out: [String] = []
+        for case let relative as String in walker {
+            // Path-based enumeration on purpose: a URL enumerator RESOLVES
+            // symlinks, so a media root that is a symlink (~/Pictures/ComfyBox
+            // was one, pointing at an external volume) would be recorded under
+            // its resolved spelling while every existing row, the settings and
+            // the engine all use the configured one — two rows for one file.
+            // Building the path from `watchDirectory` keeps one spelling.
+            let name = (relative as NSString).lastPathComponent
+            if name.hasPrefix(".") { continue }
+            if relative.split(separator: "/").contains(where: { $0.hasPrefix(".") }) { continue }
+            guard isImageFile(name) else { continue }
+            out.append((watchDirectory as NSString).appendingPathComponent(relative))
+        }
+        return out
     }
 
     // MARK: - Asset Building
@@ -808,9 +839,16 @@ public final class AssetIngestor {
 
     // MARK: - Helpers
 
+    /// The still formats the catalog backfill already indexes. The watcher used
+    /// to accept only png/jpg/jpeg, so a webp or a heic dropped into the
+    /// gallery folder was never ingested by the running app even though a
+    /// later backfill would pick it up — two paths disagreeing about what an
+    /// image is.
+    static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "webp", "heic", "tiff"]
+
     private func isImageFile(_ filename: String) -> Bool {
         let ext = (filename as NSString).pathExtension.lowercased()
-        return ext == "png" || ext == "jpg" || ext == "jpeg" || Self.videoExtensions.contains(ext)
+        return Self.imageExtensions.contains(ext) || Self.videoExtensions.contains(ext)
     }
 
     private func isFileStable(at path: String) -> Bool {

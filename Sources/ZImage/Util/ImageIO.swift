@@ -235,7 +235,16 @@ public enum QwenImageIO {
       /// can be refused (`"applied": null`), and the file must still say
       /// which look its pixels carry. Absent when nil, so an unstyled
       /// render's metadata is byte-identical to the pre-#399 one.
-      style: String? = nil
+      style: String? = nil,
+      /// The preset that produced this render, as the caller named it.
+      ///
+      /// The engine already puts this in the FILENAME
+      /// (`ComfyBoxOutputNaming.defaultFilename(presetId:)`) and then dropped
+      /// it from the metadata, so the catalog's `preset` column was empty for
+      /// every asset ever rendered — the file was named after the one thing it
+      /// refused to record. `MetadataReader` already reads a `preset` key, so
+      /// writing it here is all that was missing.
+      preset: String? = nil
     ) -> ImageMetadata {
       var params: [String: Any] = ["prompt": prompt]
       // WP-E10 sink 2: the provenance record rides in the PNG under `applied`
@@ -289,6 +298,7 @@ public enum QwenImageIO {
       if let engine, !engine.isEmpty { params["engine"] = engine }
       if let kind, !kind.isEmpty { params["kind"] = kind }
       if let style, !style.isEmpty { params["style"] = style }
+      if let preset, !preset.isEmpty { params["preset"] = preset }
       if !loras.isEmpty {
         params["loras"] = loras.map { c -> [String: Any] in
           ["name": (c.source.displayName as NSString).deletingPathExtension,

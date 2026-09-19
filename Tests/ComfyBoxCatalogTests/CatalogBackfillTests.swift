@@ -80,6 +80,45 @@ final class CatalogBackfillTests: XCTestCase {
         XCTAssertEqual(shared.count, 1, "a Mac asset with no twin defaults to shared")
     }
 
+    /// The home tree has no metadata mirror, but it is NOT sidecar-less: the
+    /// desktop app writes `{basename}.json` beside every render it finishes
+    /// (`writeSidecarIfMissing`), and so do the CLI render paths. Gating the
+    /// sidecar read on a metadata root meant the recipe sitting right next to
+    /// the file was never opened — measured on the live gallery, 75 of 160
+    /// newly indexed assets came in with no prompt, model or loras.
+    func testSiblingSidecarIsReadWhenTheTreeHasNoMetadataRoot() async throws {
+        try write("solo.png", bytes: "S", tree: "home")
+        try writeSidecar("solo.json", json: """
+            {"prompt":"a lighthouse at dusk","model":"kroma-v0.3-base","preset":"krea-kira","seed":42}
+            """, tree: "home")
+
+        let report = try await CatalogBackfill.run(store: store, trees: trees())
+        XCTAssertEqual(report.sidecarsRead, 1, "the sibling sidecar must be counted")
+
+        let rows = try await store.search(CatalogQuery(scope: nil))
+        let solo = rows.first { $0.filename == "solo.png" }
+        XCTAssertEqual(solo?.prompt, "a lighthouse at dusk")
+        XCTAssertEqual(solo?.preset, "krea-kira")
+        XCTAssertEqual(solo?.seed, 42)
+    }
+
+    /// A tree that DOES mirror keeps using the mirror: the sibling lookup is a
+    /// fallback, never a replacement, so a studio tree is unaffected.
+    func testMirrorSidecarStillWinsForATreeThatHasOne() async throws {
+        try write("Kira/generated/mirrored.png", bytes: "M", tree: "kira/gallery")
+        try writeSidecar("Kira/generated/mirrored.json", json: """
+            {"prompt":"from the mirror","character":"kira"}
+            """, tree: "kira/metadata")
+        // A decoy beside the media file — the mirror is stronger.
+        try writeSidecar("Kira/generated/mirrored.json", json: """
+            {"prompt":"from the sibling"}
+            """, tree: "kira/gallery")
+
+        _ = try await CatalogBackfill.run(store: store, trees: trees())
+        let rows = try await store.search(CatalogQuery(scope: .kira))
+        XCTAssertEqual(rows.first { $0.filename == "mirrored.png" }?.prompt, "from the mirror")
+    }
+
     func testSidecarSuppliesFacetsAndFilesIntoACollection() async throws {
         try write("Kira/generated/tile1.png", bytes: "T", tree: "kira/gallery")
         try writeSidecar("Kira/generated/tile1.json", json: """

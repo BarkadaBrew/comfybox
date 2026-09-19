@@ -79,6 +79,22 @@ struct GalleryViewIsMainSourceTests {
     func personaSourceExcluded() {
         #expect(!GalleryView.isMainSource("kira"))
         #expect(!GalleryView.isMainSource("bree"))
+        #expect(!GalleryView.isMainSource("Kira"))   // the filter lowercases
+    }
+
+    /// The regression. `source` is whatever label the producing path stamped,
+    /// and the engine stamps RUN labels — on the live library the 125 local
+    /// videos carried `api` (87), `ladder` (13), `detail-matrix`, `invest-stg03`,
+    /// `temporal-ab`, `demo`. Under the old allowlist every one of those was a
+    /// "persona", so each got its own sidebar section and none could appear in
+    /// the main grid. The gallery looked empty.
+    @Test("an engine run label is the main gallery, not a persona section")
+    func engineRunLabelsAreMain() {
+        for label in ["api", "ladder", "detail-matrix", "temporal-ab", "demo",
+                      "invest-stg03-flat", "apple-bf16-arm", "winner-rerender"] {
+            #expect(GalleryView.isMainSource(label), "\(label) should be in the main gallery")
+            #expect(GalleryView.personaFilterKey(for: label) == nil)
+        }
     }
 }
 
@@ -298,5 +314,34 @@ struct GalleryViewArchiveAllowedTests {
     @Test("no EngineService attached (previews, tests) defaults to allowed")
     func defaultsToAllowedWithNoEngine() {
         #expect(GalleryView.archiveAllowed(engineIsLocal: nil))
+    }
+}
+
+/// The grid's page size used to be 500 with no way to reach past it — Select
+/// All was the only thing that ever raised the limit, so once the library grew
+/// past a page, the rest of it simply did not exist as far as the UI was
+/// concerned. It failed silently, which is the one thing this gallery's
+/// truncation handling is supposed never to do (see `selectAll`).
+@Suite("GalleryView.gridFooterNote")
+struct GalleryViewGridFooterTests {
+    @Test("a partial page is the whole library and says nothing")
+    func partialPageIsSilent() {
+        #expect(GalleryView.gridFooterNote(loaded: 517, limit: 2_000) == nil)
+        #expect(GalleryView.gridFooterNote(loaded: 0, limit: 2_000) == nil)
+    }
+
+    @Test("a page that ends exactly on the limit never claims to be complete")
+    func fullPageWarns() {
+        let note = GalleryView.gridFooterNote(loaded: 2_000, limit: 2_000)
+        #expect(note != nil)
+        #expect(note?.contains("2000") == true || note?.contains("2,000") == true)
+        #expect(note?.contains("may hold more") == true)
+    }
+
+    @Test("the default page holds a realistic library outright")
+    func defaultPageCoversTheLibrary() {
+        // The live catalog was 517 rows when the 500-row page hid the tail.
+        #expect(GalleryView.defaultPageSize > 517)
+        #expect(GalleryView.gridFooterNote(loaded: 517, limit: GalleryView.defaultPageSize) == nil)
     }
 }

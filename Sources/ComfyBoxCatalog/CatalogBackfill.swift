@@ -180,20 +180,26 @@ public enum CatalogBackfill {
                 // before it left unknown, so precedence is the array's order and
                 // nothing else.
                 var sources: [FileMetadata] = []
+                // The metadata tree mirrors the media tree EXCEPT for the
+                // content-tier directory, so try the mirror first and the
+                // tier-flattened spelling second. A tree with no mirror at all
+                // — the Mac home gallery — still has a sidecar BESIDE the
+                // media, which is what the desktop app writes; it goes last so
+                // a mirrored tree behaves exactly as before. First readable one
+                // wins; one sidecar is still counted at most once.
+                var sidecarCandidates: [String] = []
                 if let mroot = tree.metadataRoot {
-                    // The metadata tree mirrors the media tree EXCEPT for the
-                    // content-tier directory, so try the mirror first and the
-                    // tier-flattened spelling second. First readable one wins;
-                    // one sidecar is still counted at most once.
-                    for sidecar in MetadataReader.sidecarCandidates(
-                        forMedia: path, galleryRoot: tree.mediaRoot, metadataRoot: mroot) {
-                        guard !isVaultPath(sidecar),
-                              let sdata = FileManager.default.contents(atPath: sidecar),
-                              let smeta = MetadataReader.readSidecar(jsonData: sdata) else { continue }
-                        report.sidecarsRead += 1
-                        sources.append(smeta)
-                        break
-                    }
+                    sidecarCandidates = MetadataReader.sidecarCandidates(
+                        forMedia: path, galleryRoot: tree.mediaRoot, metadataRoot: mroot)
+                }
+                sidecarCandidates.append(MetadataReader.siblingSidecarPath(forMedia: path))
+                for sidecar in sidecarCandidates {
+                    guard !isVaultPath(sidecar),
+                          let sdata = FileManager.default.contents(atPath: sidecar),
+                          let smeta = MetadataReader.readSidecar(jsonData: sdata) else { continue }
+                    report.sidecarsRead += 1
+                    sources.append(smeta)
+                    break
                 }
                 // A Director render's sequence sidecar sits BESIDE the clip,
                 // not in the metadata mirror, so it is found by name rather

@@ -147,6 +147,15 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
   /// when none were skipped and on every non-director record.
   public let audioSkippedChunks: [Int]?
 
+  /// The preset that produced this clip, as the caller named it.
+  ///
+  /// The engine already puts this in the FILENAME
+  /// (`ComfyBoxOutputNaming.defaultFilename(presetId:)`) and then dropped it
+  /// from the sidecar, so the catalog's `preset` column was empty for every
+  /// clip ever rendered — the file was named after the one thing it refused to
+  /// record. `MetadataReader` already reads a `preset` key.
+  public let preset: String?
+
   public struct LoRAEntry: Codable, Sendable, Equatable {
     public let name: String
     public let scale: Float
@@ -171,7 +180,8 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     kind: String, source: String? = nil, contentMode: String? = nil, truncated: Bool = false,
     loras: [LoRAEntry] = [],
     audioSource: String? = nil, chunkCount: Int? = nil, stitchPath: String? = nil,
-    audioSkippedChunks: [Int]? = nil
+    audioSkippedChunks: [Int]? = nil,
+    preset: String? = nil
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -216,6 +226,7 @@ public struct VideoGenerationRecord: Codable, Sendable, Equatable {
     self.chunkCount = chunkCount
     self.stitchPath = stitchPath
     self.audioSkippedChunks = audioSkippedChunks
+    self.preset = preset
   }
 }
 
@@ -330,7 +341,8 @@ extension VideoGenerationRecord {
         outputPath: request.outputPath),
       source: request.source,
       contentMode: request.contentMode,
-      loras: request.effectiveLoRAs.map { LoRAEntry(name: basename($0.path), scale: $0.scale) }
+      loras: request.effectiveLoRAs.map { LoRAEntry(name: basename($0.path), scale: $0.scale) },
+      preset: request.presetId
     )
   }
 }

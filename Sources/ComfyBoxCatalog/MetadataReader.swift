@@ -250,6 +250,15 @@ public enum MetadataReader {
         return out
     }
 
+    /// `clip.mp4` -> `clip.json`, the sidecar sitting BESIDE the media.
+    ///
+    /// This is the spelling the desktop app writes after every render
+    /// (`writeSidecarIfMissing`) and the only one the home tree has — it
+    /// carries no metadata mirror, so `sidecarPath` cannot reach it.
+    public static func siblingSidecarPath(forMedia media: String) -> String {
+        (media as NSString).deletingPathExtension + ".json"
+    }
+
     // MARK: - Sequences (the Director sidecar)
 
     /// `clip.mp4` -> `clip.sequence.json`, the same rule `SequenceSidecar.path`

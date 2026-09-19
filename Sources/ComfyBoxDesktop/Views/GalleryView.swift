@@ -101,7 +101,15 @@ struct GalleryView: View {
     @State private var isSelectMode: Bool = false
     // Grid page size. Select All raises it to the full scope for the rest of
     // the session so the selection is truthful, not capped at one page.
-    @State private var loadLimit = 500
+    //
+    // 500 was chosen when the catalog held a few hundred rows. Once the library
+    // passed it, page one WAS the gallery: nothing in the UI could reach the
+    // rest, and the only thing that ever raised the limit was Select All. The
+    // page is now large enough to hold a realistic library outright, and when
+    // it does fill, `gridFooterNote` says so instead of the grid just ending —
+    // the same rule Select All follows, one layer up.
+    @State private var loadLimit = Self.defaultPageSize
+    static let defaultPageSize = 2_000
     private static let fullScopeLimit = 20_000
     @State private var mediaTools = MediaToolsService()
     @State private var sidecar = SidecarService()
@@ -158,9 +166,26 @@ struct GalleryView: View {
     /// the catalog backfill stamps it on 2,907 of the 2,994 rows in the live
     /// database, so leaving it out filed almost the whole library into a
     /// "Comfybox" persona section and left the main gallery showing 87 images.
-    static let mainSources: Set<String> = ["", "desktop", "desktop-edit", "comfyui", "comfybox"]
+    /// The sources that get their own sidebar section. Everything else is the
+    /// main gallery.
+    ///
+    /// This used to be the inverse — an ALLOWLIST of five "main" sources, with
+    /// every other value treated as a persona. But `source` is whatever label
+    /// the producing path stamped, and the engine stamps run labels: `api`,
+    /// `ladder`, `detail-matrix`, `invest-stg03`, `temporal-ab`. Each one
+    /// became its own persona section, and the main grid could never show the
+    /// asset. On the live library that was all 125 local videos, split across
+    /// 21 junk sections, with an empty main gallery — the symptom read as
+    /// "the gallery doesn't display videos".
+    ///
+    /// The set of personas is short and knowable; the set of labels a render
+    /// can carry is not. So the list names the personas and everything else
+    /// falls through to the main gallery, which is also what the engine's own
+    /// naming code already assumes (`uninformativeSources` treats "", "api"
+    /// and "manual" as saying nothing).
+    static let personaSourceNames: Set<String> = ["kira", "bree"]
     static func isMainSource(_ source: String?) -> Bool {
-        mainSources.contains((source ?? "").lowercased())
+        !personaSourceNames.contains((source ?? "").lowercased())
     }
     /// The `personaFilter` value that makes an asset with this `source` visible —
     /// nil (main gallery) for a main source, else the lowercased persona key
@@ -926,16 +951,31 @@ struct GalleryView: View {
             let cols = masonryColumns(filteredAssets, columnCount: columnCount, cellWidth: cellWidth)
 
             ScrollView {
-                HStack(alignment: .top, spacing: Self.gridSpacing) {
-                    ForEach(Array(cols.enumerated()), id: \.offset) { _, column in
-                        LazyVStack(spacing: Self.gridSpacing) {
-                            ForEach(column) { asset in
-                                decoratedCell(for: asset, width: cellWidth)
+                VStack(spacing: 0) {
+                    HStack(alignment: .top, spacing: Self.gridSpacing) {
+                        ForEach(Array(cols.enumerated()), id: \.offset) { _, column in
+                            LazyVStack(spacing: Self.gridSpacing) {
+                                ForEach(column) { asset in
+                                    decoratedCell(for: asset, width: cellWidth)
+                                }
                             }
                         }
                     }
+                    .padding(Self.gridSpacing)
+
+                    if let note = Self.gridFooterNote(loaded: assets.count, limit: loadLimit) {
+                        HStack(spacing: 10) {
+                            Text(note).foregroundStyle(.secondary)
+                            Button("Load all") {
+                                loadLimit = Self.fullScopeLimit
+                                Task { await loadAssets() }
+                            }
+                            .disabled(loadLimit == Self.fullScopeLimit)
+                        }
+                        .font(.callout)
+                        .padding(.vertical, 14)
+                    }
                 }
-                .padding(Self.gridSpacing)
             }
         }
     }
@@ -1237,7 +1277,7 @@ struct GalleryView: View {
         if !filteredAssets.contains(where: { $0.id == match.id }) {
             searchText = ""
             // Not just "clear to main" — a persona-section original (source is
-            // Kira/Bree/etc., not one of `mainSources`) needs `personaFilter` SET
+            // Kira/Bree, one of `personaSourceNames`) needs `personaFilter` SET
             // to its own section, or it stays hidden behind the main-gallery view
             // `personaFilter = nil` switches to.
             personaFilter = Self.personaFilterKey(for: match.source)
@@ -2539,6 +2579,20 @@ struct GalleryView: View {
     /// membership filter from the store fetch above it.
     static func folderMembers(ids: Set<String>, from allAssets: [DAMAsset]) -> [DAMAsset] {
         allAssets.filter { ids.contains($0.id) }
+    }
+
+    /// What to tell the user underneath the last row, or nil when the grid is
+    /// the whole library.
+    ///
+    /// A page that ends exactly ON the limit is indistinguishable from one that
+    /// ends because the library does, so this never claims the grid is
+    /// complete — it reports the uncertainty and lets the footer offer to load
+    /// the rest. `loaded` is the unfiltered page size (what the query returned),
+    /// not `filteredAssets`: a face filter that hides most of a full page has
+    /// not made the library smaller.
+    static func gridFooterNote(loaded: Int, limit: Int) -> String? {
+        guard loaded >= limit else { return nil }
+        return "Showing the first \(loaded) assets — the library may hold more."
     }
 
     /// Maps a `pruneOrphans()` failure to `pruneWarning` banner text.
