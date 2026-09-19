@@ -5109,6 +5109,21 @@ public final class WarmServer {
   /// number, the assistant writes only prose, the validator judges the result,
   /// and ONE repair attempt carries the validator's own issues back.
   /// Never renders: drafting and spending the GPU are separate decisions.
+  ///
+  /// Measured 2026-09-19: Glimmer (30B) drafts in ~83 s on an idle GPU. The
+  /// old 120 s default left almost no margin once a render was competing, and
+  /// a draft that times out is worse than a slow one — the caller has nothing.
+  /// The CPU fallback is NOT an answer here: dolphin 8B returns a VALID
+  /// timeline in 6 s and a wrong film (0/3 segments had the subject speaking
+  /// on a talking-to-camera brief, against 3/3 for Glimmer), which nothing
+  /// downstream would catch before ~75 GPU-minutes were spent.
+  /// Two Glimmer calls plus assembly and validation, with headroom for a
+  /// render that yields slowly. Renewed between the calls.
+  static let sequenceDraftSlotTTL: TimeInterval = 420
+  /// Per call. Glimmer is ~83 s idle; this survives contention without
+  /// hanging a client for the rest of a chunk.
+  static let sequenceDraftTimeout: TimeInterval = 300
+
   private func sequenceDraftResponse(body: Data) async -> RoutedResponse {
     struct DraftRequest: Decodable {
       let presetId: String
@@ -5148,17 +5163,44 @@ public final class WarmServer {
       brief: decoded.brief, preset: preset,
       segmentSeconds: spans.map { Double($0.length) / Double(preset.fps) })
 
+    // Drafting is Glimmer work on the GPU this Mac also renders with, so it
+    // takes a top-priority slot exactly as Kira's other thinking does (Todd
+    // 2026-09-17: "any glimmer action requires a scheduled GPU lease slot with
+    // top priority"). Without it the drafter competed with an in-flight render
+    // and could blow its 120 s timeout — Glimmer takes ~83 s on an IDLE GPU,
+    // so contention is not a small margin, it is the whole margin.
+    //
+    // The lease covers BOTH calls (the draft and its one repair) and is
+    // released on every path out, including a throw: a leaked slot would stop
+    // the queue starting renders until its TTL expired.
+    let draftSlot = inferenceSlots.acquire(
+      holder: "comfybox:sequence-draft", ttl: Self.sequenceDraftSlotTTL)
+    let slotContext = inferenceSlotContext()
+    if slotContext.videoRendering(), !slotContext.hold.isParked, !slotContext.hold.isRequested {
+      slotContext.raiseHold()
+    }
+    defer {
+      _ = inferenceSlots.release(id: draftSlot.id)
+      logger.info("sequence draft: released the inference slot")
+    }
+
     do {
       var (prose, model) = try await SequenceDrafter.ask(
-        endpoint: endpoint, system: system, user: user)
+        endpoint: endpoint, system: system, user: user,
+        timeout: Self.sequenceDraftTimeout)
       var timeline = SequenceDrafter.assemble(prose: prose, preset: preset, request: request)
       var validation = DirectorValidator.validate(timeline)
 
       // One repair, carrying the validator's own words.
       if !validation.ok {
         let repair = user + "\n\n" + SequenceDrafter.repairPrompt(issues: validation.issues)
+        // Renew before the repair: the first call may have used most of the
+        // lease, and losing the slot mid-draft hands the GPU back to a render
+        // in the middle of the job the slot exists to protect.
+        _ = inferenceSlots.renew(id: draftSlot.id, ttl: Self.sequenceDraftSlotTTL)
         if let second = try? await SequenceDrafter.ask(
-          endpoint: endpoint, system: system, user: repair) {
+          endpoint: endpoint, system: system, user: repair,
+          timeout: Self.sequenceDraftTimeout) {
           prose = second.prose
           model = second.model
           timeline = SequenceDrafter.assemble(prose: prose, preset: preset, request: request)
