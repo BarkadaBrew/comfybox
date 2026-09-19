@@ -96,12 +96,12 @@ public enum DirectorValidator {
     }
     var layout = lengthValid
       ? DirectorMath.chunkLayout(lengthFrames: length, maxFrames: ceiling) : []
-    // WP11, Todd 2026-09-18: "use thoughtful pauses to span the joins."
-    // A viewer forgives phonemes that do not match — LTX-2 does coarse
-    // audio-visual correspondence, not phoneme-to-viseme. What they cannot
-    // forgive is a mouth caught mid-word jumping at a seam, and a seam is the
-    // only discontinuity a sequence has. So move each join into the deepest
-    // silence within reach, leaving the pause spanning it.
+    // WP11, Todd: "use thoughtful pauses to span the joins" (2026-09-18) and
+    // "lip sync works well on a single clip — joining them intelligently
+    // should avoid issues" (2026-09-19). Sync inside a chunk is not the
+    // problem; a seam is the only discontinuity a sequence has, and a mouth
+    // caught mid-word jumping across one is what a viewer notices. So move
+    // each join into the deepest silence within reach.
     var joinsInPauses = false
     if driven, layout.count > 1,
        let voice = timeline.audioClips.first(where: { $0.drivesVideo }) {

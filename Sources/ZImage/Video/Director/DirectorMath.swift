@@ -165,13 +165,17 @@ public enum DirectorMath {
   /// Move chunk boundaries so a pause SPANS each join (WP11, Todd 2026-09-18:
   /// "use thoughtful pauses to span the joins").
   ///
-  /// A viewer reads mouth movement plus speech as synced even when the
-  /// phonemes do not match — LTX-2 does coarse audio-visual correspondence,
-  /// not phoneme-to-viseme, and its own ceiling measures ~1.23. What breaks the
-  /// illusion is a visible DISCONTINUITY, and the only place a sequence has one
-  /// is a chunk boundary. So do not speak across a join: put the join inside a
-  /// pause, with silence on BOTH sides, and there is nothing there to perceive
-  /// as out of sync.
+  /// Lip sync WITHIN a chunk is fine (Todd, watching the clips, 2026-09-19).
+  /// The risk is at the boundaries: a chunk seam is the only discontinuity a
+  /// sequence has, and a mouth caught mid-word jumping across one is what a
+  /// viewer notices. So do not speak across a join — put the join inside a
+  /// pause, silence on BOTH sides, and there is nothing there to break.
+  ///
+  /// (An earlier version of this comment claimed LTX-2 cannot lip-sync at all,
+  /// citing a "~1.23 ceiling". That was a bad MEASUREMENT, not a finding: it
+  /// correlated mouth aperture against voice ENERGY, and aperture tracks
+  /// phonemes rather than loudness — "ooh" is loud and nearly closed. Perfect
+  /// sync would score badly on it. Retracted.)
   ///
   /// "Span" is the operative word and it is why this maximises the MARGIN —
   /// the smaller of the distances to the two ends of the pause — rather than
