@@ -166,9 +166,26 @@ struct GalleryView: View {
     /// the catalog backfill stamps it on 2,907 of the 2,994 rows in the live
     /// database, so leaving it out filed almost the whole library into a
     /// "Comfybox" persona section and left the main gallery showing 87 images.
-    static let mainSources: Set<String> = ["", "desktop", "desktop-edit", "comfyui", "comfybox"]
+    /// The sources that get their own sidebar section. Everything else is the
+    /// main gallery.
+    ///
+    /// This used to be the inverse — an ALLOWLIST of five "main" sources, with
+    /// every other value treated as a persona. But `source` is whatever label
+    /// the producing path stamped, and the engine stamps run labels: `api`,
+    /// `ladder`, `detail-matrix`, `invest-stg03`, `temporal-ab`. Each one
+    /// became its own persona section, and the main grid could never show the
+    /// asset. On the live library that was all 125 local videos, split across
+    /// 21 junk sections, with an empty main gallery — the symptom read as
+    /// "the gallery doesn't display videos".
+    ///
+    /// The set of personas is short and knowable; the set of labels a render
+    /// can carry is not. So the list names the personas and everything else
+    /// falls through to the main gallery, which is also what the engine's own
+    /// naming code already assumes (`uninformativeSources` treats "", "api"
+    /// and "manual" as saying nothing).
+    static let personaSourceNames: Set<String> = ["kira", "bree"]
     static func isMainSource(_ source: String?) -> Bool {
-        mainSources.contains((source ?? "").lowercased())
+        !personaSourceNames.contains((source ?? "").lowercased())
     }
     /// The `personaFilter` value that makes an asset with this `source` visible —
     /// nil (main gallery) for a main source, else the lowercased persona key
@@ -1260,7 +1277,7 @@ struct GalleryView: View {
         if !filteredAssets.contains(where: { $0.id == match.id }) {
             searchText = ""
             // Not just "clear to main" — a persona-section original (source is
-            // Kira/Bree/etc., not one of `mainSources`) needs `personaFilter` SET
+            // Kira/Bree, one of `personaSourceNames`) needs `personaFilter` SET
             // to its own section, or it stays hidden behind the main-gallery view
             // `personaFilter = nil` switches to.
             personaFilter = Self.personaFilterKey(for: match.source)

@@ -79,6 +79,22 @@ struct GalleryViewIsMainSourceTests {
     func personaSourceExcluded() {
         #expect(!GalleryView.isMainSource("kira"))
         #expect(!GalleryView.isMainSource("bree"))
+        #expect(!GalleryView.isMainSource("Kira"))   // the filter lowercases
+    }
+
+    /// The regression. `source` is whatever label the producing path stamped,
+    /// and the engine stamps RUN labels — on the live library the 125 local
+    /// videos carried `api` (87), `ladder` (13), `detail-matrix`, `invest-stg03`,
+    /// `temporal-ab`, `demo`. Under the old allowlist every one of those was a
+    /// "persona", so each got its own sidebar section and none could appear in
+    /// the main grid. The gallery looked empty.
+    @Test("an engine run label is the main gallery, not a persona section")
+    func engineRunLabelsAreMain() {
+        for label in ["api", "ladder", "detail-matrix", "temporal-ab", "demo",
+                      "invest-stg03-flat", "apple-bf16-arm", "winner-rerender"] {
+            #expect(GalleryView.isMainSource(label), "\(label) should be in the main gallery")
+            #expect(GalleryView.personaFilterKey(for: label) == nil)
+        }
     }
 }
 
